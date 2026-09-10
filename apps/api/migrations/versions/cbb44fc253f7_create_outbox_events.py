@@ -29,9 +29,14 @@ def upgrade() -> None:
         sa.Column('status', sa.String(length=20), nullable=False),
         sa.Column('attempts', sa.Integer(), nullable=False),
         sa.Column('last_error', sa.String(length=2000), nullable=True),
-        sa.Column('next_attempt_at', sa.DateTime(), nullable=True),
-        sa.Column('created_at', sa.DateTime(), server_default=sa.text('now()'), nullable=False),
-        sa.Column('processed_at', sa.DateTime(), nullable=True),
+        sa.Column('next_attempt_at', sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            'created_at',
+            sa.DateTime(timezone=True),
+            server_default=sa.text('now()'),
+            nullable=False,
+        ),
+        sa.Column('processed_at', sa.DateTime(timezone=True), nullable=True),
         sa.PrimaryKeyConstraint('id'),
     )
     op.create_index(

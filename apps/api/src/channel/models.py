@@ -13,6 +13,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from core.database import Base
 
+# All datetime columns store timezone-aware values (TIMESTAMP WITH TIME ZONE).
+TZDateTime = DateTime(timezone=True)
+
 
 class OutboxEvent(Base):
     """One row per pending external action (send message, run AI, etc.)."""
@@ -26,8 +29,8 @@ class OutboxEvent(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
-    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), nullable=False
+        TZDateTime, server_default=func.now(), nullable=False
     )
-    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
