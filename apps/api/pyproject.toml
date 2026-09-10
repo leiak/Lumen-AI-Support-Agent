@@ -22,6 +22,7 @@ dependencies = [
     "prometheus-client>=0.20",
     "arq>=0.25",
     "ulid-py>=1.1.0",
+    "bcrypt>=4.0,<5.0",
 ]
 
 [project.optional-dependencies]
@@ -66,3 +67,8 @@ strict = true
 files = ["src"]
 mypy_path = "src"
 explicit_package_bases = true
+
+[dependency-groups]
+dev = [
+    "types-passlib>=1.7.7.20260211",
+]
