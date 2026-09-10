@@ -8,9 +8,10 @@ external system with retry + backoff.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Integer, String, func
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
+from channel.enums import ChannelStatus, ChannelType
 from core.database import Base
 
 # All datetime columns store timezone-aware values (TIMESTAMP WITH TIME ZONE).
@@ -34,3 +35,35 @@ class OutboxEvent(Base):
         TZDateTime, server_default=func.now(), nullable=False
     )
     processed_at: Mapped[datetime | None] = mapped_column(TZDateTime, nullable=True)
+
+
+class Channel(Base):
+    """A messaging channel configuration for a tenant.
+
+    Holds credentials (encrypted in M2, plaintext JSON for M1) and per-channel config.
+    """
+
+    __tablename__ = "channels"
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    type: Mapped[ChannelType] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    credentials_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[ChannelStatus] = mapped_column(
+        String(20), nullable=False, default=ChannelStatus.ACTIVE
+    )
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TZDateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TZDateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
