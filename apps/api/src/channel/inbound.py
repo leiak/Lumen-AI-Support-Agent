@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import logging
 
+from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
-from conversation.enums import MessageRole
+from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,30 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
             role=MessageRole.CUSTOMER,
             content_text=envelope.text,
         )
+        # Trigger AI auto-response when the conversation is still in
+        # AI-handling state. Transferred / closed conversations fall
+        # through silently. Inline call is intentional for M1 demo
+        # volume; Stage 7+ should move this to a background worker.
+        if conversation.ai_handling and conversation.status == ConversationStatus.OPEN:
+            responder = SimpleResponder()
+            ai_response = await responder.respond(
+                tenant_id=envelope.tenant_id,
+                conversation_id=conversation.id,
+            )
+            if ai_response is not None:
+                await conv_service.record_message(
+                    tenant_id=envelope.tenant_id,
+                    conversation_id=conversation.id,
+                    role=ai_response.role,
+                    content_text=ai_response.content_text,
+                )
+                logger.info(
+                    "channel inbound: AI auto-response recorded",
+                    extra={
+                        "conversation_id": conversation.id,
+                        "channel_id": envelope.channel_id,
+                    },
+                )
         logger.info(
             "channel inbound: message recorded",
             extra={

@@ -6,10 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.simple_responder import AgentResponse
 from channel.enums import ChannelType
 from channel.inbound import process_inbound_envelope
 from channel.messages import MessageEnvelope
-from conversation.enums import MessageRole
+from conversation.enums import ConversationStatus, MessageRole
 
 
 def _envelope(**overrides) -> MessageEnvelope:
@@ -113,3 +114,108 @@ async def test_process_inbound_does_not_log_message_content() -> None:
             assert secret_text not in str(extra), (
                 f"text leaked into log extra: {extra}"
             )
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_triggers_ai_response_when_open_and_ai_handling() -> None:
+    """When conv is OPEN + ai_handling, SimpleResponder is called and AI msg recorded."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock()
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(
+            return_value=AgentResponse(content_text="AI says hi", role=MessageRole.AI)
+        )
+
+        await process_inbound_envelope(_envelope())
+
+        mock_responder.respond.assert_awaited_once_with(
+            tenant_id="t1", conversation_id="c1"
+        )
+        # record_message called twice: customer, then AI.
+        assert mock_service.record_message.await_count == 2
+        second_call = mock_service.record_message.await_args_list[1]
+        assert second_call.kwargs["role"] == MessageRole.AI
+        assert second_call.kwargs["content_text"] == "AI says hi"
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_skips_ai_response_when_human_handling() -> None:
+    """When ai_handling=False, SimpleResponder must not be called."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=False,
+            status=ConversationStatus.PENDING,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock()
+
+        mock_responder = mock_resp_cls.return_value
+
+        await process_inbound_envelope(_envelope())
+
+        mock_responder.respond.assert_not_called()
+        # Only customer message recorded, no AI.
+        assert mock_service.record_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_skips_ai_response_when_responder_returns_none() -> None:
+    """When SimpleResponder returns None, inbound still completes cleanly."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock()
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(return_value=None)
+
+        await process_inbound_envelope(_envelope())
+
+        # Only customer message recorded.
+        assert mock_service.record_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_swallows_ai_responder_exception() -> None:
+    """If the AI responder raises, the inbound pipeline must not propagate."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock()
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(side_effect=RuntimeError("boom"))
+
+        # Must not raise.
+        await process_inbound_envelope(_envelope())
+
+        # Only the customer message was recorded; AI attempt failed.
+        assert mock_service.record_message.await_count == 1

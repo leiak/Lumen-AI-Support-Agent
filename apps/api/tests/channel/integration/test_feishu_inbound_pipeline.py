@@ -124,9 +124,14 @@ async def test_feishu_webhook_creates_conversation_and_message(feishu_app: FastA
 
         msg_repo = MessageRepository()
         msgs = await msg_repo.list_by_conversation(conversation_id=conv.id)
-        assert len(msgs) == 1
-        assert msgs[0].role == MessageRole.CUSTOMER
-        assert msgs[0].content_text == "hello pipeline"
+        # Task 5.3: with ai_handling=True the inbound pipeline also records
+        # an AI auto-reply (real LLM in production, fallback in CI without
+        # a live ANTHROPIC_API_KEY). The CUSTOMER row must still be first.
+        roles = [m.role for m in msgs]
+        assert MessageRole.CUSTOMER in roles
+        customer_msgs = [m for m in msgs if m.role == MessageRole.CUSTOMER]
+        assert len(customer_msgs) == 1
+        assert customer_msgs[0].content_text == "hello pipeline"
     finally:
         # Cascade-delete via tenant cleanup.
         from core.database import get_session
@@ -191,8 +196,12 @@ async def test_feishu_webhook_repeated_message_reuses_conversation(
 
         msg_repo = MessageRepository()
         msgs = await msg_repo.list_by_conversation(conversation_id=conv.id)
-        assert len(msgs) == 2
-        texts = sorted(m.content_text for m in msgs)
+        # Task 5.3: each inbound also triggers an AI auto-reply, so we see
+        # 2 customer messages + 2 AI rows (fallback or real, depending on
+        # whether ANTHROPIC_API_KEY is valid in this test env).
+        customer_msgs = [m for m in msgs if m.role == MessageRole.CUSTOMER]
+        assert len(customer_msgs) == 2
+        texts = sorted(m.content_text for m in customer_msgs)
         assert texts == ["first", "second"]
     finally:
         from core.database import get_session
