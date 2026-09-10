@@ -25,6 +25,10 @@ class ChannelAdapter(Protocol):
 
         ``raw`` is the parsed JSON body from the channel's webhook.
         ``channel`` is the Channel ORM row (carries tenant_id, credentials, etc.).
+
+        Implementations are responsible for populating ``envelope_id`` (a fresh
+        ULID/UUID for the in-app message) and ``external_message_id`` (the
+        provider's own message identifier) on the returned envelope.
         """
 
     async def send_outbound(

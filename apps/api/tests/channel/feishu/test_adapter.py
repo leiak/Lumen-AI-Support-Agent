@@ -129,3 +129,14 @@ async def test_send_outbound_raises_not_implemented() -> None:
 
 def test_adapter_channel_type() -> None:
     assert FeishuAdapter().channel_type is ChannelType.FEISHU
+
+
+@pytest.mark.asyncio
+async def test_parse_minimally_empty_raw_does_not_crash() -> None:
+    """An empty raw={} should not crash; fields default to empty strings."""
+    channel = _channel()
+    envelope = await FeishuAdapter().parse_inbound(raw={}, channel=channel)
+    assert envelope.external_conversation_id == ""
+    assert envelope.external_user_id == ""
+    assert envelope.external_message_id == ""
+    assert envelope.text == ""

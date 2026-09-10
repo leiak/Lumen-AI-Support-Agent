@@ -6,7 +6,6 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
-from channel.feishu.adapter import FeishuAdapter
 from channel.feishu.signature import (
     decrypt_feishu_event,
     verify_feishu_signature,
@@ -17,11 +16,15 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/channel/feishu", tags=["channel-feishu"])
 
-_adapter = FeishuAdapter()
+# Adapter wiring deferred to Task 4.13 (persistence layer).
 
-# M1 stub — Task 4.13 wires up real credential lookup. Tests sign with this
-# same stub key so signature verification passes during M1. Production must NOT
-# rely on this constant; the encryption key is per-tenant.
+# M1 stub key — Task 4.13 wires up real per-tenant credential lookup. Tests sign
+# with this same stub key so signature verification passes during M1.
+#
+# WARNING: M1 deployments MUST NOT be public-internet-facing. The stub encrypt_key
+# is a known constant; anyone can forge signatures against it. Restrict network
+# exposure to a trusted test environment (e.g. local tunnel or internal staging)
+# until Task 4.13 ships real per-tenant credential storage and lookup.
 M1_STUB_ENCRYPT_KEY = "M1_STUB_ENCRYPT_KEY_REPLACE_IN_TASK_4_13"
 
 
@@ -108,10 +111,6 @@ async def receive_webhook(
         return JSONResponse(
             status_code=200, content={"challenge": payload["challenge"]}
         )
-
-    # Touch the adapter so its presence is type-checked at import time and
-    # so that subsequent wiring (Task 4.13+) has a single integration point.
-    _ = _adapter
 
     # For M1 we just ACK; persistence happens in Stage 5 (会话 + 消息).
     return JSONResponse(status_code=200, content={"ok": True})

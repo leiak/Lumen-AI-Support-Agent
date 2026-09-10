@@ -109,10 +109,8 @@ def decrypt_feishu_event(
     """Decrypt a Feishu-encrypted event body. AES-256-CBC + PKCS#7 padding.
 
     Feishu's encrypted event wraps the inner JSON in this envelope:
-    {"encrypt": "<base64-ciphertext>"}
-    The `iv` is sent as a separate header (X-Lark-Request-Nonce) in some
-    integrations, but per Feishu docs the IV is also sent as part of the
-    envelope. Here we accept both as kwargs.
+    {"encrypt": "<base64-ciphertext>", "iv": "<base64-iv>"}
+    Both `encrypted` and `iv` are passed in as kwargs.
     """
     key_bytes = _derive_aes_key(encrypt_key)
     ciphertext = base64.b64decode(encrypted)

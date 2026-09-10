@@ -42,5 +42,8 @@ async def health() -> JSONResponse:
 
 
 from auth.api import router as auth_router  # noqa: E402
+from channel.feishu.webhook import router as feishu_webhook_router  # noqa: E402
 
 app.include_router(auth_router)
+# TODO(Task 4.13): wire unified channel CRUD endpoints here.
+app.include_router(feishu_webhook_router)
