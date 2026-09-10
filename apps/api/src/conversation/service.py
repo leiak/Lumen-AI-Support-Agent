@@ -53,19 +53,27 @@ class ConversationService:
         tenant_id: str,
         channel_id: str,
         customer_external_id: str,
-    ) -> Conversation:
+    ) -> Conversation | None:
         """Return the open conversation for (channel, customer), or create one.
 
         The caller (channel adapter) is expected to have already validated
         that the channel belongs to ``tenant_id``. We touch
         ``last_activity_at`` on a hit because the customer just sent
         another message.
+
+        Defence-in-depth: if an existing open conversation row happens to
+        belong to a different tenant (which should be unreachable since
+        channel_id is a globally-unique ULID), we return ``None`` rather
+        than touch it or surface it to the caller. Returns ``None`` in
+        that cross-tenant case only.
         """
         existing = await self._repo.find_open_by_channel_customer(
             channel_id=channel_id,
             customer_external_id=customer_external_id,
         )
         if existing is not None:
+            if existing.tenant_id != tenant_id:
+                return None
             await self._repo.touch_last_activity(
                 conversation_id=existing.id, at=self._clock()
             )
@@ -242,6 +250,7 @@ class ConversationService:
                 f"conversation {conversation_id} not found for tenant {tenant_id}"
             )
 
+        now = self._clock()
         msg = Message(
             id=new_id(),
             conversation_id=conversation_id,
@@ -250,11 +259,11 @@ class ConversationService:
             sender_id=sender_id,
             content_blocks_json=content_blocks,
             tool_calls_json=tool_calls,
-            created_at=self._clock(),
+            created_at=now,
         )
         persisted = await self._message_repo.create(message=msg)
         await self._repo.touch_last_activity(
-            conversation_id=conversation_id, at=self._clock()
+            conversation_id=conversation_id, at=now
         )
         return persisted
 

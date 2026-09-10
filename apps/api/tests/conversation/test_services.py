@@ -142,6 +142,28 @@ async def test_find_or_create_creates_new_when_no_open() -> None:
     assert create_kwargs["conversation"] is result
 
 
+@pytest.mark.asyncio
+async def test_find_or_create_for_inbound_returns_none_when_existing_is_other_tenant() -> None:
+    """Defence-in-depth: an existing row from another tenant must not be returned."""
+    existing = _conv(tenant_id="t_other")
+    conv_repo = MagicMock()
+    conv_repo.find_open_by_channel_customer = AsyncMock(return_value=existing)
+    conv_repo.touch_last_activity = AsyncMock()
+    conv_repo.create = AsyncMock()
+
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    result = await svc.find_or_create_for_inbound(
+        tenant_id="t_self",
+        channel_id=existing.channel_id,
+        customer_external_id=existing.customer_external_id,
+    )
+    assert result is None
+    # And we did NOT touch it or create a new one
+    conv_repo.touch_last_activity.assert_not_called()
+    conv_repo.create.assert_not_called()
+
+
 # ---- list_for_tenant ----
 
 
@@ -419,6 +441,40 @@ async def test_record_message_raises_value_error_for_wrong_tenant() -> None:
         )
     msg_repo.create.assert_not_called()
     conv_repo.touch_last_activity.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_record_message_uses_same_timestamp_for_message_and_touch() -> None:
+    """The message created_at and the touch must use the SAME timestamp from clock()."""
+    conv = _conv(tenant_id="t1")
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.touch_last_activity = AsyncMock()
+
+    captured_message: Message | None = None
+
+    async def capture_create(*, message: Message) -> Message:
+        nonlocal captured_message
+        captured_message = message
+        return message
+
+    msg_repo = MagicMock()
+    msg_repo.create = AsyncMock(side_effect=capture_create)
+
+    svc, _, _ = _service_with_repos(
+        conversation_repo=conv_repo, message_repo=msg_repo
+    )
+
+    await svc.record_message(
+        tenant_id="t1",
+        conversation_id=conv.id,
+        role=MessageRole.CUSTOMER,
+        content_text="hi",
+    )
+    assert captured_message is not None
+    assert captured_message.created_at == FROZEN_NOW
+    touch_call = conv_repo.touch_last_activity.await_args.kwargs
+    assert touch_call["at"] == FROZEN_NOW
 
 
 # ---- list_messages ----

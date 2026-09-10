@@ -164,20 +164,32 @@ class MessageRepository:
     ) -> list[Message]:
         """List Messages for a conversation in chronological order.
 
-        If ``before`` is supplied, only messages strictly older than that
-        timestamp are returned (for pagination).
+        Default (no ``before``): return the latest ``limit`` messages in
+        ASCENDING chronological order, so the consumer can render them as
+        a timeline without re-sorting.
+
+        With ``before``: return the ``limit`` messages immediately
+        preceding the cursor in ASCENDING chronological order, enabling
+        backward cursor pagination.
         """
         async with get_session() as session:
-            stmt = (
-                select(Message)
-                .where(Message.conversation_id == conversation_id)
-                .order_by(Message.created_at.asc())
-                .limit(limit)
-            )
             if before is not None:
-                stmt = stmt.where(Message.created_at < before)
+                stmt = (
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .where(Message.created_at < before)
+                    .order_by(Message.created_at.desc())
+                    .limit(limit)
+                )
+            else:
+                stmt = (
+                    select(Message)
+                    .where(Message.conversation_id == conversation_id)
+                    .order_by(Message.created_at.desc())
+                    .limit(limit)
+                )
             result = await session.execute(stmt)
-            return list(result.scalars().all())
+            return list(reversed(result.scalars().all()))
 
     async def count_by_conversation(self, *, conversation_id: str) -> int:
         """Return the total number of Messages attached to a conversation."""

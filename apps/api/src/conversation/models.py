@@ -11,7 +11,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -48,10 +48,12 @@ class Conversation(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_conversations_channel_customer_open",
             "channel_id",
             "customer_external_id",
-            name="uq_conversations_channel_customer",
+            unique=True,
+            postgresql_where=text("status != 'closed'"),
         ),
         Index("ix_conversations_tenant_status", "tenant_id", "status"),
     )
