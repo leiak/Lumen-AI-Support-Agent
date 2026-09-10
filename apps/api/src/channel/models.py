@@ -8,7 +8,16 @@ external system with retry + backoff.
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from channel.enums import ChannelStatus, ChannelType
@@ -58,6 +67,43 @@ class Channel(Base):
         String(20), nullable=False, default=ChannelStatus.ACTIVE
     )
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        TZDateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TZDateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ChannelBinding(Base):
+    """Maps an external conversation (e.g., Feishu chat, Web Widget session)
+    to an internal Conversation.
+
+    `internal_conversation_id` references `conversations.id` which is created
+    in Stage 5. For now, no FK constraint — Stage 5 will add the FK when
+    that table exists.
+    """
+
+    __tablename__ = "channel_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel_id", "external_conversation_id", name="uq_channel_external_conv"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    channel_id: Mapped[str] = mapped_column(
+        ForeignKey("channels.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    external_conversation_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    external_user_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    internal_conversation_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         TZDateTime, server_default=func.now(), nullable=False
     )
