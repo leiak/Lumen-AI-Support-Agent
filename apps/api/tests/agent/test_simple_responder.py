@@ -309,3 +309,168 @@ async def test_responder_handles_list_messages_returning_none() -> None:
     assert result.content_text == "hello"
     # Only the system message is sent.
     assert len(fake_client.chat.await_args.args[0].messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_responder_summarizes_overflow_messages() -> None:
+    """When conversation has > MAX_HISTORY_BEFORE_SUMMARY messages, oldest are summarized."""
+    from agent.simple_responder import MAX_HISTORY_BEFORE_SUMMARY
+
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    # 60 messages — well above MAX_HISTORY_BEFORE_SUMMARY (50)
+    many = [
+        _msg(MessageRole.CUSTOMER if i % 2 == 0 else MessageRole.AI, f"msg {i}")
+        for i in range(MAX_HISTORY_BEFORE_SUMMARY + 10)
+    ]
+    conv_service.list_messages = AsyncMock(return_value=many)
+
+    fake_client = MagicMock()
+    # First call (summary) returns a summary, second call (real chat) returns ok
+    fake_client.chat = AsyncMock(side_effect=[
+        ChatResponse(
+            content="customer asked about password reset, agent provided instructions",
+            model=DEFAULT_MODEL,
+            prompt_tokens=200,
+            completion_tokens=30,
+            finish_reason="stop",
+        ),
+        ChatResponse(
+            content="ok",
+            model=DEFAULT_MODEL,
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+        ),
+    ])
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    # The LLM should have been called TWICE: once for summary, once for the real response
+    assert fake_client.chat.await_count == 2
+
+    # The second call (the real chat) should have a system message with the summary.
+    # respond() prepends M1_SYSTEM_PROMPT, then the summary from _build_history,
+    # then the kept messages.
+    real_call_args = fake_client.chat.await_args_list[1].args[0]
+    summary_msg = real_call_args.messages[1]
+    assert summary_msg.role == "system"
+    assert "password reset" in summary_msg.content
+
+
+@pytest.mark.asyncio
+async def test_responder_does_not_summarize_below_threshold() -> None:
+    """When conversation is <= MAX_HISTORY_BEFORE_SUMMARY, no summary call."""
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    # 30 messages — below MAX_HISTORY_BEFORE_SUMMARY (50)
+    many = [_msg(MessageRole.CUSTOMER, f"msg {i}") for i in range(30)]
+    conv_service.list_messages = AsyncMock(return_value=many)
+
+    fake_client = MagicMock()
+    fake_client.chat = AsyncMock(return_value=ChatResponse(
+        content="ok", model=DEFAULT_MODEL,
+        prompt_tokens=10, completion_tokens=5, finish_reason="stop",
+    ))
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    # LLM called only ONCE (the real chat, no summary)
+    assert fake_client.chat.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_responder_summary_failure_uses_truncated_transcript() -> None:
+    """If summary LLM call fails, fallback is a truncated transcript."""
+    from agent.simple_responder import MAX_HISTORY_BEFORE_SUMMARY
+
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    many = [
+        _msg(MessageRole.CUSTOMER if i % 2 == 0 else MessageRole.AI, f"msg {i}")
+        for i in range(MAX_HISTORY_BEFORE_SUMMARY + 10)
+    ]
+    conv_service.list_messages = AsyncMock(return_value=many)
+
+    fake_client = MagicMock()
+    # First call (summary) fails, second call (real chat) succeeds
+    fake_client.chat = AsyncMock(side_effect=[
+        RuntimeError("summary failed"),
+        ChatResponse(
+            content="ok", model=DEFAULT_MODEL,
+            prompt_tokens=10, completion_tokens=5, finish_reason="stop",
+        ),
+    ])
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    # Real chat still got a system message with a truncated transcript.
+    # respond() prepends M1_SYSTEM_PROMPT, then the summary from _build_history.
+    real_call_args = fake_client.chat.await_args_list[1].args[0]
+    summary_msg = real_call_args.messages[1]
+    assert summary_msg.role == "system"
+    assert "msg 0" in summary_msg.content  # transcript includes oldest messages
+    assert (
+        "Earlier conversation" in summary_msg.content
+        or "summary" in summary_msg.content.lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_responder_summary_keeps_latest_unchanged() -> None:
+    """When summarizing, the latest MAX_HISTORY_MESSAGES are passed as-is (not summarized)."""
+    from agent.simple_responder import (
+        MAX_HISTORY_BEFORE_SUMMARY,
+        MAX_HISTORY_MESSAGES,
+    )
+
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    # 60 messages with distinctive content for indices 40-59
+    msgs = []
+    for i in range(MAX_HISTORY_BEFORE_SUMMARY + 10):
+        msgs.append(
+            _msg(MessageRole.CUSTOMER if i % 2 == 0 else MessageRole.AI, f"msg {i}")
+        )
+    conv_service.list_messages = AsyncMock(return_value=msgs)
+
+    fake_client = MagicMock()
+    fake_client.chat = AsyncMock(side_effect=[
+        ChatResponse(
+            content="summary text", model=DEFAULT_MODEL,
+            prompt_tokens=10, completion_tokens=5, finish_reason="stop",
+        ),
+        ChatResponse(
+            content="ok", model=DEFAULT_MODEL,
+            prompt_tokens=10, completion_tokens=5, finish_reason="stop",
+        ),
+    ])
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    real_call_args = fake_client.chat.await_args_list[1].args[0]
+    # After the summary system msg, the next MAX_HISTORY_MESSAGES messages are the latest 20
+    non_system = [m for m in real_call_args.messages if m.role != "system"]
+    assert len(non_system) == MAX_HISTORY_MESSAGES
+    assert "msg 59" in non_system[-1].content
+    assert "msg 40" in non_system[0].content

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from agent.llm_factory import _default_llm_client_factory
 from conversation.enums import MessageRole
+from conversation.models import Message
 from conversation.service import ConversationService
 from llm_client.client import LLMClient
 from llm_client.types import ChatMessage as LLMChatMessage
@@ -31,10 +32,23 @@ logger = logging.getLogger(__name__)
 # per-tenant configurable.
 DEFAULT_MODEL = "claude-haiku-4-5"
 MAX_HISTORY_MESSAGES = 20  # keep prompts bounded
+# Only summarize when the conversation has more than this many messages.
+# Below this threshold, the kept window already covers all context. Above it,
+# the overflowing oldest messages get collapsed into a single summary message
+# prepended to the chat. Stage 7+ should persist summaries on the conversation
+# rather than regenerating each turn.
+MAX_HISTORY_BEFORE_SUMMARY = 50
 
 M1_SYSTEM_PROMPT = """You are a friendly customer-service agent for an AI-customer platform.
 Answer the customer's question concisely. If you don't know, say so honestly
 and suggest escalating to a human agent. Reply in the customer's language."""
+
+_SUMMARIZE_SYSTEM_PROMPT = (
+    "You are a helpful assistant. Summarize the following customer service "
+    "conversation in 2-3 sentences. Preserve customer questions, key facts "
+    "(order numbers, products, etc.), and the current state of the issue. "
+    "Be concise."
+)
 
 FALLBACK_MESSAGE = "抱歉,AI 助手暂时无法回复,请稍后再试或联系人工客服。"
 
@@ -151,33 +165,114 @@ class SimpleResponder:
         payloads are skipped because the simple responder does not
         consume them.
 
-        The history is defensively capped at ``MAX_HISTORY_MESSAGES``
-        so a misbehaving repository (e.g. one that ignores ``limit``)
-        cannot blow up the prompt.
+        When the conversation has more than ``MAX_HISTORY_BEFORE_SUMMARY``
+        messages, the oldest overflowing messages are summarized via a
+        separate LLM call and the summary is prepended as a ``system``
+        message. The latest ``MAX_HISTORY_MESSAGES`` are kept verbatim.
+        Stage 7+ should persist the summary on the conversation rather
+        than regenerating it every turn.
+
+        The history is defensively capped at ``MAX_HISTORY_MESSAGES +
+        MAX_HISTORY_BEFORE_SUMMARY + 1`` so a misbehaving repository
+        (e.g. one that ignores ``limit``) cannot blow up the prompt.
         """
+        fetch_limit = MAX_HISTORY_MESSAGES + MAX_HISTORY_BEFORE_SUMMARY + 1
         msgs = await self._conv_service.list_messages(
             tenant_id=tenant_id,
             conversation_id=conversation_id,
-            limit=MAX_HISTORY_MESSAGES,
+            limit=fetch_limit,
         )
-        # Defensive slice in case the repository ignored `limit` and returned more —
-        # keep the LATEST MAX_HISTORY_MESSAGES, since recency matters most for the LLM context.
-        msgs = (msgs or [])[-MAX_HISTORY_MESSAGES:]
-        out: list[LLMChatMessage] = []
-        for m in msgs:
-            if m.role == MessageRole.CUSTOMER:
-                out.append(
-                    LLMChatMessage(role=LLMMessageRole.USER, content=m.content_text)
+        msgs = msgs or []
+
+        if len(msgs) > MAX_HISTORY_BEFORE_SUMMARY:
+            # Conversation is longer than the LLM context window.
+            # Summarize the oldest, keep the latest MAX_HISTORY_MESSAGES verbatim.
+            to_summarize = msgs[:-MAX_HISTORY_MESSAGES]
+            to_keep = msgs[-MAX_HISTORY_MESSAGES:]
+            try:
+                summary_text = await self._summarize_history(
+                    tenant_id=tenant_id, messages=to_summarize
                 )
-            elif m.role in (MessageRole.AGENT, MessageRole.AI):
-                out.append(
-                    LLMChatMessage(
-                        role=LLMMessageRole.ASSISTANT, content=m.content_text
-                    )
+                summary_message = LLMChatMessage(
+                    role=LLMMessageRole.SYSTEM,
+                    content=f"Previous conversation summary:\n{summary_text}",
                 )
-            elif m.role == MessageRole.SYSTEM:
-                out.append(
-                    LLMChatMessage(role=LLMMessageRole.SYSTEM, content=m.content_text)
+            except Exception:
+                logger.warning(
+                    "agent: history summary failed, using truncated transcript",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "tenant_id": tenant_id,
+                    },
+                    exc_info=True,
                 )
-            # TOOL — skipped; not consumed by the simple responder
-        return out
+                transcript = "\n".join(
+                    f"{m.role.value}: {m.content_text}" for m in to_summarize
+                )[:1000]
+                summary_message = LLMChatMessage(
+                    role=LLMMessageRole.SYSTEM,
+                    content=f"Earlier conversation (truncated):\n{transcript}",
+                )
+            mapped = [
+                mapped_msg
+                for mapped_msg in (self._map_message(m) for m in to_keep)
+                if mapped_msg is not None
+            ]
+            return [summary_message, *mapped]
+
+        # Short conversation: keep the LATEST MAX_HISTORY_MESSAGES verbatim.
+        # (Defensive slice in case the repository ignored `limit`.)
+        kept = msgs[-MAX_HISTORY_MESSAGES:]
+        return [
+            mapped_msg
+            for mapped_msg in (self._map_message(x) for x in kept)
+            if mapped_msg is not None
+        ]
+
+    def _map_message(self, m: Message) -> LLMChatMessage | None:
+        """Map our ``Message`` ORM to an LLM ``ChatMessage``.
+
+        Returns ``None`` for roles we do not forward to the LLM
+        (currently only ``TOOL``).
+        """
+        if m.role == MessageRole.CUSTOMER:
+            return LLMChatMessage(role=LLMMessageRole.USER, content=m.content_text)
+        if m.role in (MessageRole.AGENT, MessageRole.AI):
+            return LLMChatMessage(
+                role=LLMMessageRole.ASSISTANT, content=m.content_text
+            )
+        if m.role == MessageRole.SYSTEM:
+            return LLMChatMessage(
+                role=LLMMessageRole.SYSTEM, content=m.content_text
+            )
+        # TOOL — skipped; not consumed by the simple responder
+        return None
+
+    async def _summarize_history(
+        self, *, tenant_id: str, messages: list[Message]
+    ) -> str:
+        """Use the LLM to summarize the oldest messages into 2-3 sentences.
+
+        On LLM failure, returns a truncated transcript as a fallback so
+        the caller still has *some* context to work with.
+        """
+        transcript = "\n".join(
+            f"{m.role.value}: {m.content_text}" for m in messages
+        )
+        client = self._llm_client_factory(tenant_id)
+        request = ChatRequest(
+            model=self._model,
+            messages=[
+                LLMChatMessage(
+                    role=LLMMessageRole.SYSTEM, content=_SUMMARIZE_SYSTEM_PROMPT
+                ),
+                LLMChatMessage(role=LLMMessageRole.USER, content=transcript),
+            ],
+            temperature=0.3,
+            max_tokens=200,
+        )
+        response = await client.chat(request)
+        summary = response.content.strip()
+        if not summary:
+            return transcript[:500]
+        return summary
