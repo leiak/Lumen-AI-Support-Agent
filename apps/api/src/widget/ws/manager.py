@@ -96,6 +96,31 @@ class ConnectionManager:
                 delivered += 1
         return delivered
 
+    async def broadcast_to_tenant(
+        self,
+        tenant_id: str,
+        payload: dict[str, Any],
+        *,
+        exclude: str | None = None,
+    ) -> int:
+        """Fan out a payload to every connection belonging to ``tenant_id``.
+
+        Used for tenant-wide server-initiated events (e.g. maintenance
+        notices, channel-level fanout aggregated by tenant). Like
+        :meth:`broadcast_to_channel`, this is an M1 single-process in-memory
+        fanout — multi-worker delivery via Redis pub/sub is Stage 5+.
+        """
+        targets = [
+            cid for cid, state in self._states.items()
+            if state.tenant_id == tenant_id and cid != exclude
+        ]
+        delivered = 0
+        for cid in targets:
+            ok = await self.send_to_connection(cid, payload)
+            if ok:
+                delivered += 1
+        return delivered
+
 
 # Process-wide singleton — single-process M1 deployment.
 #
