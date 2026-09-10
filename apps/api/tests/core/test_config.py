@@ -43,7 +43,8 @@ def test_settings_uses_defaults_for_optional_fields(monkeypatch: pytest.MonkeyPa
     for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OLLAMA_BASE_URL", "QDRANT_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
-    s = Settings()
+    # _env_file=None bypasses .env reading for test isolation
+    s = Settings(_env_file=None)
     assert s.qdrant_url == "http://localhost:6333"
     assert s.qdrant_api_key is None
     assert s.jwt_algorithm == "HS256"

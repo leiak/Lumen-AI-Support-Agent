@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -56,8 +56,14 @@ async def get_session() -> AsyncIterator[AsyncSession]:
             raise
 
 
-def set_tenant_contextvar(tenant_id: str) -> None:
-    _current_tenant_id.set(tenant_id)
+def set_tenant_contextvar(tenant_id: str) -> Token[str | None]:
+    """Set the current request's tenant_id. Returns a Token for reset."""
+    return _current_tenant_id.set(tenant_id)
+
+
+def reset_tenant_contextvar(token: Token[str | None]) -> None:
+    """Reset the tenant_id ContextVar to its prior value. Use in a finally block."""
+    _current_tenant_id.reset(token)
 
 
 def get_tenant_contextvar() -> str | None:
