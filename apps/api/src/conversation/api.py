@@ -98,12 +98,9 @@ class MessageOut(BaseModel):
 
 
 class ConversationListOut(BaseModel):
-    """Paginated list response."""
+    """List response. No total — list endpoints don't run a separate count query."""
 
     items: list[ConversationOut]
-    total: int
-    limit: int
-    offset: int
 
 
 class MessageListOut(BaseModel):
@@ -162,12 +159,7 @@ async def list_conversations(
     # NOTE: For M1 we don't paginate by total count. The service returns at
     # most `limit` rows. Frontend can paginate by adjusting offset. If a
     # `total` is required, add a separate count query.
-    return ConversationListOut(
-        items=[_conv_out(c) for c in items],
-        total=len(items),  # number in the current page, not total in DB
-        limit=limit,
-        offset=offset,
-    )
+    return ConversationListOut(items=[_conv_out(c) for c in items])
 
 
 @router.get("/inbox", response_model=ConversationListOut)
@@ -185,12 +177,7 @@ async def list_inbox(
         agent_id=claims["sub"],
         status=status_filter,
     )
-    return ConversationListOut(
-        items=[_conv_out(c) for c in items],
-        total=len(items),
-        limit=len(items),
-        offset=0,
-    )
+    return ConversationListOut(items=[_conv_out(c) for c in items])
 
 
 @router.get("/{conversation_id}", response_model=ConversationOut)

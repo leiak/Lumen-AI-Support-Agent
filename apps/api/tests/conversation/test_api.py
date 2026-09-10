@@ -139,9 +139,6 @@ async def test_list_conversations_uses_tenant_from_jwt(
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["total"] == 2
-    assert body["limit"] == 10
-    assert body["offset"] == 5
     assert len(body["items"]) == 2
     assert captured["tenant_id"] == "tenant_X"
     assert captured["status"] is None
