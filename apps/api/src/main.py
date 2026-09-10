@@ -9,6 +9,7 @@ from core.health import aggregate_health
 from core.logging import configure_logging, get_logger
 from core.qdrant import close_qdrant_client
 from core.redis import close_redis, get_redis
+from knowledge.startup import ensure_qdrant_collection
 
 
 @asynccontextmanager
@@ -20,6 +21,11 @@ async def lifespan(app: FastAPI) -> Any:
     # Eagerly create the redis client pool so the first request doesn't pay
     # connection-setup latency. (The pool itself connects lazily on first command.)
     get_redis()
+    # Ensure the Qdrant collection used for RAG exists. Failures are
+    # logged and swallowed by the hook itself so the API still boots
+    # when Qdrant is briefly unavailable; /health will surface the
+    # degraded state.
+    await ensure_qdrant_collection()
     yield
     await close_redis()
     await close_qdrant_client()
