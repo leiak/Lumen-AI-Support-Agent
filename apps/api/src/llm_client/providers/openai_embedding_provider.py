@@ -2,22 +2,20 @@
 
 Wraps `openai.AsyncOpenAI` for batch embedding generation. Retries on
 `openai.RateLimitError` (up to `max_retries` attempts with exponential
-backoff). Other errors propagate as `EmbeddingError` immediately.
+backoff + jitter). Other errors propagate as `EmbeddingError` immediately.
 
-`EmbeddingResult` / `EmbeddingError` are imported lazily to avoid a
+`EmbeddingResult` / `EmbeddingError` live in `llm_client.types` to avoid a
 circular import with `llm_client.embeddings` (the public module).
 """
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import random
 
 import openai
 
 from core.logging import get_logger
-
-if TYPE_CHECKING:
-    from llm_client.embeddings import EmbeddingResult
+from llm_client.types import EmbeddingError, EmbeddingResult
 
 
 class OpenAIEmbeddingProvider:
@@ -32,8 +30,6 @@ class OpenAIEmbeddingProvider:
         base_backoff_seconds: Base for exponential backoff (1s, 2s, 4s, ...
             by default). Set to 0 in tests to keep them fast.
     """
-
-    name = "openai-embedding"
 
     def __init__(
         self,
@@ -54,11 +50,9 @@ class OpenAIEmbeddingProvider:
         """Embed a single batch (≤ 2048 texts) and return vectors in input order.
 
         Raises `EmbeddingError` on permanent failure. Retries `RateLimitError`
-        up to `max_retries` times with exponential backoff (1s, 2s, 4s, ...).
+        up to `max_retries` times with exponential backoff + jitter
+        (1s, 2s, 4s, ... + 0..0.5s).
         """
-        # Lazy import to break circular dependency with llm_client.embeddings.
-        from llm_client.embeddings import EmbeddingError, EmbeddingResult
-
         log = get_logger("llm.embedding")
         attempt = 0
         last_exc: Exception | None = None
@@ -76,7 +70,7 @@ class OpenAIEmbeddingProvider:
                 total_tokens = usage.total_tokens if usage else 0
                 return EmbeddingResult(
                     vectors=vectors,
-                    model=resp.model,
+                    model=model,  # trust the caller's requested alias
                     prompt_tokens=prompt_tokens,
                     total_tokens=total_tokens,
                 )
@@ -84,7 +78,9 @@ class OpenAIEmbeddingProvider:
                 last_exc = e
                 if attempt == self._max_retries:
                     break
-                backoff = self._base_backoff * (2**attempt)
+                # Exponential backoff with jitter (matches LLMClient.chat):
+                # 2^attempt + uniform(0, 0.5).
+                backoff = self._base_backoff * (2**attempt) + random.uniform(0, 0.5)  # noqa: S311
                 log.warning(
                     "embedding_rate_limit",
                     model=model,
@@ -94,16 +90,21 @@ class OpenAIEmbeddingProvider:
                 )
                 await asyncio.sleep(backoff)
                 attempt += 1
-            except openai.APIError as e:
-                # Includes BadRequestError, AuthenticationError, etc.
+            except Exception as e:
+                # Includes APIError, BadRequestError, AuthenticationError, etc.
                 # Do NOT retry — propagate immediately as EmbeddingError.
+                # Use repr(e) (not str(e)) because OpenAI AuthenticationError
+                # __str__ may include the failing API-key prefix.
                 log.warning(
                     "embedding_api_error",
                     error_type=type(e).__name__,
+                    error_repr=repr(e),
                     model=model,
                     text_count=len(texts),
                 )
-                raise EmbeddingError(f"OpenAI embedding error: {e}") from e
+                raise EmbeddingError(
+                    f"OpenAI embedding error ({type(e).__name__})"
+                ) from e
 
         # Exhausted retries on rate limit.
         assert last_exc is not None

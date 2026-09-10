@@ -3,6 +3,7 @@
 These are provider-agnostic — adapters translate to/from each provider's
 native format.
 """
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -57,3 +58,24 @@ class ChatResponse(BaseModel):
     def total_tokens(self) -> int:
         """Total tokens consumed by this request (prompt + completion)."""
         return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """Result of an embedding batch call.
+
+    `vectors[i]` corresponds to `texts[i]` (OpenAI preserves input order).
+    Token counts are aggregated across all batches in the original call.
+    """
+
+    vectors: list[list[float]]
+    model: str
+    prompt_tokens: int
+    total_tokens: int
+
+
+class EmbeddingError(Exception):
+    """Raised when embedding generation fails after retries.
+
+    Wraps rate-limit exhaustion and non-retryable API errors (4xx, auth, etc.).
+    """

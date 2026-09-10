@@ -10,6 +10,7 @@ from core.logging import configure_logging, get_logger
 from core.qdrant import close_qdrant_client
 from core.redis import close_redis, get_redis
 from knowledge.startup import ensure_qdrant_collection
+from llm_client.embeddings import aclose_default_client
 
 
 @asynccontextmanager
@@ -27,6 +28,9 @@ async def lifespan(app: FastAPI) -> Any:
     # degraded state.
     await ensure_qdrant_collection()
     yield
+    # Close the embedding client's singleton AsyncOpenAI so its HTTPX pool
+    # is released; safe even if embed_texts was never called (no-op).
+    await aclose_default_client()
     await close_redis()
     await close_qdrant_client()
     log.info("api.shutdown")

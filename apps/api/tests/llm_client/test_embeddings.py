@@ -8,7 +8,21 @@ from unittest.mock import AsyncMock, MagicMock
 import openai
 import pytest
 
+from llm_client import embeddings as embeddings_module
 from llm_client.embeddings import EmbeddingError, EmbeddingResult, embed_texts
+
+
+@pytest.fixture(autouse=True)
+def _reset_singleton() -> None:
+    """Reset the module-level AsyncOpenAI singleton around each test.
+
+    The DI path (``client=``) is the only thing under test here, but a stray
+    earlier test could have lazily initialized the singleton. Drop the
+    reference so cross-test pollution can't leak an HTTPX pool.
+    """
+    embeddings_module._reset_default_client_for_tests()
+    yield
+    embeddings_module._reset_default_client_for_tests()
 
 
 def _make_embedding_item(embedding: list[float]) -> MagicMock:
@@ -133,7 +147,7 @@ async def test_embed_texts_uses_configured_model() -> None:
         ),
     )
 
-    await embed_texts(
+    result = await embed_texts(
         texts=["x"],
         model="text-embedding-3-large",
         client=client,  # type: ignore[arg-type]
@@ -141,6 +155,52 @@ async def test_embed_texts_uses_configured_model() -> None:
 
     call_kwargs = client.embeddings.create.await_args.kwargs
     assert call_kwargs["model"] == "text-embedding-3-large"
+    # EmbeddingResult.model reflects the requested model, not whatever the
+    # SDK happened to return (defensive against alias drift).
+    assert result.model == "text-embedding-3-large"
+
+
+async def test_embed_texts_preserves_input_order_across_batches() -> None:
+    """Concurrent batch processing must preserve the input ordering of vectors.
+
+    The SDK is invoked in parallel for > 2048 inputs; the returned vectors
+    must still line up 1:1 with the original `texts` even though batches may
+    complete out of order.
+    """
+    batch_size = 2048
+    n_batches = 4
+    texts = [f"t-{i}" for i in range(batch_size * n_batches)]
+
+    # Each batch returns vectors tagged with their starting index so we can
+    # verify post-gather ordering. `asyncio.gather` is supposed to keep input
+    # order; if a regression breaks that, vectors will be misaligned.
+    def make_batch_response(call_index_callable: object) -> MagicMock:
+        # The AsyncMock will call side_effect with the next index via a
+        # counter we close over.
+        idx = next(_call_counter)
+        resp = MagicMock()
+        resp.data = [
+            _make_embedding_item([float(idx * batch_size + i)])
+            for i in range(batch_size)
+        ]
+        resp.model = "text-embedding-3-small"
+        resp.usage = MagicMock(prompt_tokens=10, total_tokens=20)
+        return resp
+
+    _call_counter = iter(range(n_batches))
+    side_effects = [make_batch_response(None) for _ in range(n_batches)]
+    client = _mock_client(side_effect=side_effects)
+
+    result = await embed_texts(
+        texts=texts,
+        client=client,  # type: ignore[arg-type]
+    )
+
+    assert len(result.vectors) == batch_size * n_batches
+    expected = [
+        [float(i)] for i in range(batch_size * n_batches)
+    ]
+    assert result.vectors == expected
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +256,31 @@ async def test_embed_texts_does_not_retry_on_other_errors() -> None:
         )
 
     assert client.embeddings.create.await_count == 1
+
+
+async def test_embed_texts_embedding_error_message_is_sanitized() -> None:
+    """APIError → EmbeddingError message must NOT include the raw SDK str.
+
+    OpenAI's AuthenticationError __str__ can leak the failing API-key prefix.
+    We log repr(e) separately for debugging and only expose the type name to
+    callers.
+    """
+    api_error = openai.APIError(
+        "sk-abc123...something-secret",
+        request=MagicMock(),
+        body=None,
+    )
+    client = _mock_client(side_effect=api_error)
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        await embed_texts(
+            texts=["a"],
+            client=client,  # type: ignore[arg-type]
+        )
+
+    msg = str(excinfo.value)
+    assert "sk-abc123" not in msg
+    assert "APIError" in msg
 
 
 async def test_embed_texts_raises_embedding_error_on_rate_limit_exhausted() -> None:
