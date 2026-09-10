@@ -1,5 +1,7 @@
 """Smoke test: alembic env loads without crashing and reads DATABASE_URL from settings."""
 
+import pytest
+
 
 def test_alembic_ini_exists() -> None:
     from pathlib import Path
@@ -24,8 +26,17 @@ def test_migrations_env_imports() -> None:
     assert "from core.database import Base" in env_text
 
 
-def test_settings_database_url_is_asyncpg() -> None:
-    """DATABASE_URL must use the asyncpg driver so alembic async engine can connect."""
+def test_settings_database_url_is_asyncpg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DATABASE_URL must use the asyncpg driver so alembic async engine can connect.
+
+    Self-contained: injects required env vars via monkeypatch so the test does not
+    depend on the developer's shell env or the presence of apps/api/.env.
+    """
+    # Required env vars for Settings() to construct successfully
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost:5432/dbname")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("JWT_SECRET", "x" * 48)  # 48-char secret passes the min-length validator
+
     from core.config import Settings
 
     s = Settings(_env_file=None)  # type: ignore[call-arg]
