@@ -1,4 +1,10 @@
-"""End-to-end test for the Feishu inbound flow: webhook -> adapter -> envelope."""
+"""End-to-end test for the Feishu inbound flow: webhook -> adapter -> envelope.
+
+Note: end-to-end webhook -> envelope -> persistence is a Stage 5 task. The two
+existing webhook tests below cover what Task 4.12 owns (signature verification,
+timing, transport-level ACK). The adapter is exercised directly in
+`test_feishu_adapter_produces_envelope`.
+"""
 import json
 import time
 from datetime import UTC, datetime
@@ -85,6 +91,52 @@ async def test_feishu_inbound_e2e_signed_payload(feishu_app: FastAPI) -> None:
         )
     assert resp.status_code == 200
     assert resp.json() == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_feishu_webhook_returns_200_and_acks_quickly(feishu_app: FastAPI) -> None:
+    """Webhook ACKs 200 immediately (Feishu requires quick ACK). Persistence is Stage 5."""
+    body = _text_event(chat_id="oc_ack", open_id="ou_ack", message_id="om_ack", text="hi")
+    ts = str(int(time.time()))
+    sig = _sign(body, ts)
+    start = time.monotonic()
+    async with AsyncClient(
+        transport=ASGITransport(app=feishu_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/api/v1/channel/feishu/webhook/cli_test_app",
+            content=body,
+            headers={
+                "X-Lark-Request-Timestamp": ts,
+                "X-Lark-Request-Nonce": "nonce1",
+                "X-Lark-Signature": sig,
+                "Content-Type": "application/json",
+            },
+        )
+    elapsed = time.monotonic() - start
+    assert resp.status_code == 200
+    assert elapsed < 2.0, f"webhook took {elapsed}s — must ACK quickly"
+
+
+@pytest.mark.asyncio
+async def test_feishu_webhook_rejects_bad_signature_integration(feishu_app: FastAPI) -> None:
+    """Integration-level: bad signature returns 401."""
+    body = _text_event(chat_id="oc_x", open_id="ou_x", message_id="om_x", text="x")
+    ts = str(int(time.time()))
+    async with AsyncClient(
+        transport=ASGITransport(app=feishu_app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/api/v1/channel/feishu/webhook/cli_test_app",
+            content=body,
+            headers={
+                "X-Lark-Request-Timestamp": ts,
+                "X-Lark-Request-Nonce": "nonce1",
+                "X-Lark-Signature": "0" * 64,
+                "Content-Type": "application/json",
+            },
+        )
+    assert resp.status_code == 401
 
 
 @pytest.mark.asyncio
