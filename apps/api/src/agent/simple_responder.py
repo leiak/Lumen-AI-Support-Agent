@@ -36,6 +36,8 @@ M1_SYSTEM_PROMPT = """You are a friendly customer-service agent for an AI-custom
 Answer the customer's question concisely. If you don't know, say so honestly
 and suggest escalating to a human agent. Reply in the customer's language."""
 
+FALLBACK_MESSAGE = "抱歉,AI 助手暂时无法回复,请稍后再试或联系人工客服。"
+
 
 # Type alias for the per-tenant LLMClient factory. Stage 7+ may swap
 # this for a config-driven resolver that picks model + provider per tenant.
@@ -115,17 +117,27 @@ class SimpleResponder:
                 max_tokens=512,
             )
             response = await client.chat(request)
+            if not response.content.strip():
+                logger.warning(
+                    "agent: LLM returned empty content, sending fallback",
+                    extra={"conversation_id": conversation_id, "tenant_id": tenant_id},
+                )
+                return AgentResponse(
+                    content_text=FALLBACK_MESSAGE,
+                    role=MessageRole.AI,
+                )
             return AgentResponse(
                 content_text=response.content,
                 role=MessageRole.AI,
             )
         except Exception:
-            logger.exception(
+            logger.warning(
                 "agent: LLM call failed, sending fallback",
                 extra={"conversation_id": conversation_id, "tenant_id": tenant_id},
+                exc_info=True,
             )
             return AgentResponse(
-                content_text="抱歉,AI 助手暂时无法回复,请稍后再试或联系人工客服。",
+                content_text=FALLBACK_MESSAGE,
                 role=MessageRole.AI,
             )
 
@@ -148,8 +160,9 @@ class SimpleResponder:
             conversation_id=conversation_id,
             limit=MAX_HISTORY_MESSAGES,
         )
-        # Defensive cap — list_messages may return None or exceed limit.
-        msgs = (msgs or [])[:MAX_HISTORY_MESSAGES]
+        # Defensive slice in case the repository ignored `limit` and returned more —
+        # keep the LATEST MAX_HISTORY_MESSAGES, since recency matters most for the LLM context.
+        msgs = (msgs or [])[-MAX_HISTORY_MESSAGES:]
         out: list[LLMChatMessage] = []
         for m in msgs:
             if m.role == MessageRole.CUSTOMER:

@@ -7,6 +7,7 @@ import pytest
 
 from agent.simple_responder import (
     DEFAULT_MODEL,
+    FALLBACK_MESSAGE,
     MAX_HISTORY_MESSAGES,
     AgentResponse,
     SimpleResponder,
@@ -134,8 +135,71 @@ async def test_responder_returns_fallback_on_llm_failure() -> None:
 
     assert result is not None
     assert result.role == MessageRole.AI
-    # Fallback message — either Chinese hint or English-style "AI" works.
-    assert "AI" in result.content_text or "人工" in result.content_text
+    assert result.content_text == FALLBACK_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_responder_returns_fallback_on_empty_llm_content() -> None:
+    """LLM returning empty content triggers the same fallback as a hard failure."""
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(return_value=[])
+
+    fake_client = MagicMock()
+    fake_client.chat = AsyncMock(return_value=ChatResponse(
+        content="",  # empty
+        model="claude-haiku-4-5",
+        prompt_tokens=10, completion_tokens=0,
+        finish_reason="stop",
+    ))
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+
+    result = await responder.respond(tenant_id="t1", conversation_id="c1")
+    assert result is not None
+    assert result.role == MessageRole.AI
+    assert result.content_text == FALLBACK_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_responder_keeps_latest_messages_when_overflowed() -> None:
+    """When the repo returns > MAX_HISTORY_MESSAGES, the LATEST are kept."""
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    # 25 messages — older first, newer last (ascending chronological order)
+    many = [
+        _msg(MessageRole.CUSTOMER if i % 2 == 0 else MessageRole.AI, f"msg {i}")
+        for i in range(25)
+    ]
+    conv_service.list_messages = AsyncMock(return_value=many)
+
+    fake_client = MagicMock()
+    fake_client.chat = AsyncMock(return_value=ChatResponse(
+        content="ok", model="claude-haiku-4-5",
+        prompt_tokens=10, completion_tokens=5, finish_reason="stop",
+    ))
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+    )
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    chat_messages = fake_client.chat.await_args.args[0].messages
+    # Drop the system message, then assert we have the LATEST 20 (msg 5..24)
+    non_system = [m for m in chat_messages if m.role != "system"]
+    assert len(non_system) == 20
+    # The first user/assistant message in the request should be from msg 5
+    first_text = non_system[0].content
+    assert "msg 5" in first_text
+    # The last should be from msg 24
+    last_text = non_system[-1].content
+    assert "msg 24" in last_text
 
 
 @pytest.mark.asyncio

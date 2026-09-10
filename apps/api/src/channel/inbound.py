@@ -89,10 +89,11 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
             },
         )
     except Exception:
-        logger.exception(
+        logger.warning(
             "channel inbound: persistence failed",
             extra={
                 "envelope_id": envelope.envelope_id,
                 "channel_id": envelope.channel_id,
             },
+            exc_info=True,
         )
