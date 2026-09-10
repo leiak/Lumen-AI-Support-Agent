@@ -33,10 +33,25 @@ Robustness contract
   could extract + a warning log (PII-safe: count + types only).
 * Block ``text`` content is preserved EXACTLY — no line-ending
   normalization, no whitespace trimming inside a code block.
+
+Public API
+----------
+
+* :func:`enrich_blocks` — the ONLY entry point callers should use.
+  Dispatches on ``parsed.format`` and pulls any extra raw source bytes
+  it needs from ``parsed.metadata['raw_source']``.
+* :func:`strip_markdown_blocks` — used by the parser to keep code +
+  image spans out of the linearized ``text`` field.
+
+The internal ``_extract_*`` helpers below are private; they are
+implementation details of :func:`enrich_blocks` and may change without
+notice. The parser (Task 6.4 integration) calls :func:`enrich_blocks`
+and never the private helpers directly.
 """
 from __future__ import annotations
 
 import re
+from functools import cache
 from typing import TYPE_CHECKING
 
 from bs4 import BeautifulSoup, FeatureNotFound
@@ -58,15 +73,12 @@ log = get_logger(__name__)
 # calls e.g. ``pypdfium2`` for embedded images, or a vision-model call
 # for standalone images. For M1 we only extract *references* (markdown
 # ``![]()`` + HTML ``<img>``).
-_OCR_TODO_LOGGED = False
 
 
+@cache
 def _log_ocr_todo_once() -> None:
-    global _OCR_TODO_LOGGED
-    if _OCR_TODO_LOGGED:
-        return
+    """Log the OCR TODO exactly once per process (Stage 7+ will remove it)."""
     log.info("knowledge.multimodal.ocr_todo", note="image OCR not yet wired (Stage 7+)")
-    _OCR_TODO_LOGGED = True
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +92,17 @@ async def enrich_blocks(
 ) -> list[dict[str, object]]:
     """Extract structured blocks from a parsed document.
 
+    The ONLY public entry point for multimodal extraction. Dispatch
+    happens on ``parsed.format``:
+
+    * ``"markdown"`` — fenced code blocks + inline image references.
+    * ``"html"`` — ``<img>`` (with optional ``<figcaption>`` caption)
+      + ``<table>`` rows. Requires ``parsed.metadata['raw_source']`` to
+      be the original bytes; the parser populates this field so the
+      HTML source is available without an extra decode pass.
+    * Anything else (``text`` / ``pdf`` / ``json`` / unknown) returns
+      ``[]``.
+
     Returns a list of block dicts. Each block has at minimum a ``type``
     field; the rest of the shape depends on the type:
 
@@ -89,28 +112,31 @@ async def enrich_blocks(
       "caption": "..."}`` (HTML, caption from ``<figcaption>``).
     * ``{"type": "table", "rows": [[...], [...], ...]}`` (HTML only).
 
-    For M1, only Markdown fenced code blocks + inline images, and HTML
-    ``<img>`` + ``<table>`` elements, are extracted. PDF / JSON / plain
-    text always return ``[]``.
-
     The function never raises — malformed inputs return what we could
     extract + a warning log.
     """
     fmt = parsed.format
-    text = parsed.text
-    metadata = parsed.metadata
+    metadata = parsed.metadata if isinstance(parsed.metadata, dict) else {}
 
     blocks: list[dict[str, object]]
     if fmt == "markdown":
-        blocks = _extract_markdown_blocks(text)
+        # For markdown, ``parsed.text`` already IS the raw source.
+        blocks = _extract_markdown_blocks(parsed.text)
     elif fmt == "html":
-        # HTML extraction operates on the raw bytes (we need the tags
-        # themselves, not the linearized text). Pull source from
-        # metadata when present; fall back to re-using the text if not.
-        source_html = metadata.get("raw_source") if isinstance(metadata, dict) else None
-        if not isinstance(source_html, (str, bytes)):
-            source_html = text
-        blocks = _extract_html_blocks(source_html)
+        # HTML extraction operates on the original bytes, not the
+        # linearized text. The parser is responsible for stuffing the
+        # raw source into ``metadata['raw_source']``.
+        raw_source = metadata.get("raw_source")
+        if not isinstance(raw_source, (bytes, str)):
+            # Defensive: a caller that bypassed the parser and forgot
+            # to attach raw_source gets an empty list rather than a
+            # confusing crash.
+            log.warning(
+                "knowledge.multimodal.html_missing_raw_source",
+                format=fmt,
+            )
+            return []
+        blocks = _extract_html_blocks(raw_source)
     else:
         # text / pdf / json / unknown → no multimodal extraction in M1
         return []
@@ -138,20 +164,58 @@ async def enrich_blocks(
 # Fenced code block: ``` optional-language \n body \n ```
 # - Opening fence on its own line; optional language token right after ```.
 # - Closing fence: ``` on its own line (allow trailing whitespace).
-# - Non-greedy body capture.
+# - Body may be EMPTY (a ``` ``` block with no content is legal).
 # - We use a non-anchored pattern; re.findall finds each block in order.
 _MD_FENCED_CODE_RE = re.compile(
     r"^[ \t]{0,3}```([^\s`]*)[ \t]*\n"  # opening fence + optional language
-    r"(.*?)"  # body (non-greedy, DOTALL via flag below)
-    r"\n[ \t]{0,3}```[ \t]*(?:\n|$)",  # closing fence on its own line
+    r"(.*?)"  # body (non-greedy, DOTALL via flag below; may be empty)
+    r"(?:\n)?[ \t]{0,3}```[ \t]*(?:\n|$)",  # closing fence on its own line
     re.DOTALL | re.MULTILINE,
 )
 
-# Inline image: ![alt](src). ``src`` may contain balanced parens
-# (``http://example.com/foo(bar)`` is legal in CommonMark), so we match
-# lazily and stop at the FIRST unescaped ``)``.
-# Alt text may be empty (``![]()``) but cannot contain ``]``.
-_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+# Inline image: ![alt](src).
+#
+# We cannot use a single regex for the full image syntax: CommonMark
+# allows balanced parens in ``src`` (e.g. ``![x](https://example.com/foo(bar).png)``)
+# plus ``\)`` escapes. We split the work in two:
+#
+#   1. Find each ``![<alt>](`` opener.
+#   2. Walk character-by-character from the opening ``(`` to the
+#      matching close, respecting paren depth and ``\)`` escapes.
+#
+# The regex below only locates the opener; :func:`_scan_markdown_image_src`
+# does the depth-aware src scan.
+_MD_IMAGE_OPEN_RE = re.compile(r"!\[((?:\\.|[^\]\\])*)\]\(")
+
+
+def _scan_markdown_image_src(text: str, start: int) -> tuple[str, int] | None:
+    r"""Return ``(src, end_index)`` for the ``(...)`` body of a markdown image.
+
+    ``start`` is the index immediately AFTER the opening ``(`` of an
+    inline image link. Walks forward tracking paren depth, honoring
+    ``\)`` escapes, and returns the captured src (without the parens)
+    plus the index just past the closing ``)``. Returns ``None`` if
+    the link is unterminated or empty.
+    """
+    depth = 1
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] in ("(", ")", "\\"):
+            # Skip the escape pair.
+            i += 2
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                src = text[start:i]
+                return src, i + 1
+        i += 1
+    # Unterminated — treat as no match.
+    return None
 
 
 def _extract_markdown_blocks(text: str) -> list[dict[str, object]]:
@@ -178,10 +242,22 @@ def _extract_markdown_blocks(text: str) -> list[dict[str, object]]:
             error_message=str(exc),
         )
 
-    # 2. Inline image references. ``re.findall`` returns tuples of
-    #    (alt, src) for our two capture groups.
+    # 2. Inline image references. Walk each ``![alt](`` opener and
+    #    scan the src with paren-depth awareness.
     try:
-        for alt, src in _MD_IMAGE_RE.findall(text):
+        for m in _MD_IMAGE_OPEN_RE.finditer(text):
+            alt = m.group(1)
+            src_start = m.end()
+            scanned = _scan_markdown_image_src(text, src_start)
+            if scanned is None:
+                # Unterminated link — skip silently. We don't log per
+                # occurrence to keep PII safe; malformed input is
+                # common and not actionable.
+                continue
+            src, _end = scanned
+            if not src.strip():
+                # Empty src yields no anchor for the chunker; skip.
+                continue
             blocks.append(
                 {
                     "type": "image",
@@ -218,9 +294,9 @@ def strip_markdown_blocks(
       We do NOT key off the captured body because the body may appear
       in multiple blocks (identical snippets) and we want to remove
       each occurrence exactly once.
-    * For images we substitute the original markdown syntax with an
-      empty string. We re-derive the regex (with the same flags) so the
-      removal matches what was extracted.
+    * For images we walk the ``![alt](src)`` openers (same logic as
+      :func:`_extract_markdown_blocks`) and remove the full span,
+      again handling balanced parens in the src.
     """
     out = text
     has_code = any(b.get("type") == "code" for b in blocks)
@@ -229,8 +305,28 @@ def strip_markdown_blocks(
     if has_code:
         out = _MD_FENCED_CODE_RE.sub("", out)
     if has_image:
-        out = _MD_IMAGE_RE.sub("", out)
+        out = _strip_markdown_images(out)
     return out
+
+
+def _strip_markdown_images(text: str) -> str:
+    """Remove ``![alt](src)`` spans from ``text``, handling balanced parens."""
+    out_parts: list[str] = []
+    cursor = 0
+    for m in _MD_IMAGE_OPEN_RE.finditer(text):
+        out_parts.append(text[cursor:m.start()])
+        src_start = m.end()
+        scanned = _scan_markdown_image_src(text, src_start)
+        if scanned is None:
+            # Unterminated — keep the original opener in the output
+            # rather than silently swallowing the rest of the document.
+            out_parts.append(text[m.start():src_start])
+            cursor = src_start
+            continue
+        _src, end = scanned
+        cursor = end
+    out_parts.append(text[cursor:])
+    return "".join(out_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +334,110 @@ def strip_markdown_blocks(
 # ---------------------------------------------------------------------------
 
 
+def _extract_html_blocks_from_soup(
+    soup: BeautifulSoup,
+) -> list[dict[str, object]]:
+    """Extract ``<img>`` + ``<table>`` blocks from an EXISTING BeautifulSoup tree.
+
+    Operates on a soup that the caller has already built. We deliberately
+    do NOT decompose ``<img>`` or ``<table>`` here — the parser may
+    want to decompose them itself when linearizing the text, and a
+    second call into ``_extract_html_blocks_from_soup`` (e.g. from a
+    future Stage 7+ pipeline) should be idempotent.
+    """
+    blocks: list[dict[str, object]] = []
+
+    # Drop non-visible content so we never pick up images inside
+    # <noscript> or similar. Mirrors the parser's own sanitization step.
+    for tag_name in ("script", "style", "noscript"):
+        for tag in soup(tag_name):
+            tag.decompose()
+
+    # 1. Images. Walk every <img> (not just the top level) so images
+    #    nested inside <picture>, <figure>, <a>, etc. are still picked up.
+    try:
+        for img in soup.find_all("img"):
+            if not isinstance(img, Tag):
+                continue
+            alt = img.get("alt")
+            src = img.get("src")
+            if src is None:
+                # Skip images with no source — there's nothing for the
+                # chunker/embedder to anchor on, and a missing src is
+                # almost always a templating artifact.
+                continue
+            block: dict[str, object] = {
+                "type": "image",
+                "alt": "" if alt is None else str(alt),
+                "src": str(src),
+            }
+            # Optional caption from a parent <figure>'s <figcaption>.
+            # We also decompose the entire <figure> so that its caption
+            # text does NOT double-embed into the linearized text that
+            # the parser produces from the same soup.
+            parent_figure = img.find_parent("figure")
+            if isinstance(parent_figure, Tag):
+                cap = parent_figure.find("figcaption")
+                if isinstance(cap, Tag):
+                    caption_text = cap.get_text(" ", strip=True)
+                    if caption_text:
+                        block["caption"] = caption_text
+                # Drop the figure AND the image itself: the caption is
+                # captured on the block, and the image's alt would
+                # otherwise leak into the linearized text.
+                parent_figure.decompose()
+            else:
+                # No parent figure — decompose just the <img> so its
+                # alt text doesn't double-embed.
+                img.decompose()
+            blocks.append(block)
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning(
+            "knowledge.multimodal.html_image_failed",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+    # 2. Tables. Best-effort row extraction: rows = list of lists of
+    #    strings. We don't try to recover ``<thead>`` / ``<tbody>`` —
+    #    that's a Stage 7+ concern. An empty row or one with no cells
+    #    is dropped. Tables are decomposed so their text doesn't
+    #    double-embed.
+    try:
+        for table in soup.find_all("table"):
+            if not isinstance(table, Tag):
+                continue
+            rows: list[list[str]] = []
+            for tr in table.find_all("tr"):
+                if not isinstance(tr, Tag):
+                    continue
+                cells = [
+                    cell.get_text(" ", strip=True)
+                    for cell in tr.find_all(["th", "td"])
+                    if isinstance(cell, Tag)
+                ]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                blocks.append({"type": "table", "rows": rows})
+                table.decompose()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning(
+            "knowledge.multimodal.html_table_failed",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+    return blocks
+
+
 def _extract_html_blocks(source: str | bytes) -> list[dict[str, object]]:
     """Extract ``<img>`` + ``<table>`` blocks from an HTML document.
+
+    Convenience wrapper that builds a BeautifulSoup tree and then
+    delegates to :func:`_extract_html_blocks_from_soup`. The parser
+    prefers the from-soup variant so it can parse the HTML exactly
+    once per ``parse_document`` call.
 
     Defensive: malformed HTML returns ``[]`` + a warning rather than
     raising. BeautifulSoup is generally robust but a binary garbage
@@ -260,75 +458,4 @@ def _extract_html_blocks(source: str | bytes) -> list[dict[str, object]]:
             error_message=str(exc),
         )
         return []
-
-    blocks: list[dict[str, object]] = []
-
-    # Drop non-visible content so we never pick up images inside
-    # <noscript> or similar. Mirrors the parser's own sanitization step.
-    for tag_name in ("script", "style", "noscript"):
-        for tag in soup(tag_name):
-            tag.decompose()
-
-    # 1. Images. Walk every <img> (not just the top level) so images
-    #    nested inside <picture>, <figure>, etc. are still picked up.
-    try:
-        for img in soup.find_all("img"):
-            if not isinstance(img, Tag):
-                continue
-            alt = img.get("alt")
-            src = img.get("src")
-            if src is None:
-                # Skip images with no source — there's nothing for the
-                # chunker/embedder to anchor on, and a missing src is
-                # almost always a templating artifact.
-                continue
-            block: dict[str, object] = {
-                "type": "image",
-                "alt": "" if alt is None else str(alt),
-                "src": str(src),
-            }
-            # Optional caption from a parent <figure>'s <figcaption>.
-            parent_figure = img.find_parent("figure")
-            if isinstance(parent_figure, Tag):
-                cap = parent_figure.find("figcaption")
-                if isinstance(cap, Tag):
-                    caption_text = cap.get_text(" ", strip=True)
-                    if caption_text:
-                        block["caption"] = caption_text
-            blocks.append(block)
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning(
-            "knowledge.multimodal.html_image_failed",
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-        )
-
-    # 2. Tables. Best-effort row extraction: rows = list of lists of
-    #    strings. We don't try to recover ``<thead>`` / ``<tbody>`` —
-    #    that's a Stage 7+ concern. An empty row or one with no cells
-    #    is dropped.
-    try:
-        for table in soup.find_all("table"):
-            if not isinstance(table, Tag):
-                continue
-            rows: list[list[str]] = []
-            for tr in table.find_all("tr"):
-                if not isinstance(tr, Tag):
-                    continue
-                cells = [
-                    cell.get_text(" ", strip=True)
-                    for cell in tr.find_all(["th", "td"])
-                    if isinstance(cell, Tag)
-                ]
-                if cells:
-                    rows.append(cells)
-            if rows:
-                blocks.append({"type": "table", "rows": rows})
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning(
-            "knowledge.multimodal.html_table_failed",
-            error_type=type(exc).__name__,
-            error_message=str(exc),
-        )
-
-    return blocks
+    return _extract_html_blocks_from_soup(soup)

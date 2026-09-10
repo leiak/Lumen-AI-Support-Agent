@@ -38,8 +38,8 @@ from pypdf.errors import PdfReadError
 
 from core.logging import get_logger
 from knowledge.multimodal import (
-    _extract_html_blocks,
-    _extract_markdown_blocks,
+    _extract_html_blocks_from_soup,
+    enrich_blocks,
     strip_markdown_blocks,
 )
 
@@ -186,7 +186,7 @@ async def parse_document(
     # trivial text/markdown/json parsers are essentially instant but
     # running them in a thread is free and keeps the dispatch uniform.
     try:
-        result = await asyncio.to_thread(_parse_sync, file_bytes, fmt, file_name)
+        result = await _parse_async(file_bytes, fmt, file_name)
     except UnsupportedDocumentType:
         # Re-raise without wrapping so callers see the original message.
         raise
@@ -216,20 +216,27 @@ async def parse_document(
 
 
 # ---------------------------------------------------------------------------
-# Sync dispatch (runs in a thread)
+# Async dispatch (runs in a thread for heavy formats)
 # ---------------------------------------------------------------------------
 
 
-def _parse_sync(file_bytes: bytes, fmt: str, file_name: str) -> ParsedDocument:
-    """Synchronous dispatcher; runs inside ``asyncio.to_thread``."""
+async def _parse_async(file_bytes: bytes, fmt: str, file_name: str) -> ParsedDocument:
+    """Async dispatcher. Heavy formats (PDF, HTML) run inside a thread;
+    the cheap formats (text / markdown / json) parse inline so we can
+    ``await enrich_blocks(parsed=...)`` directly without an extra
+    event-loop hop.
+    """
     if fmt == "text":
         return _parse_text(file_bytes)
     if fmt == "markdown":
-        return _parse_markdown(file_bytes)
+        # Markdown extraction uses ``enrich_blocks`` which is async;
+        # call it inline — the work is tiny (regex on already-decoded
+        # text) and avoids a thread+event-loop round-trip per doc.
+        return await _parse_markdown_async(file_bytes)
     if fmt == "html":
-        return _parse_html(file_bytes)
+        return await asyncio.to_thread(_parse_html, file_bytes)
     if fmt == "pdf":
-        return _parse_pdf(file_bytes)
+        return await asyncio.to_thread(_parse_pdf, file_bytes)
     if fmt == "json":
         return _parse_json(file_bytes)
     # Defensive — _detect_format should never produce an unknown fmt,
@@ -361,7 +368,7 @@ _MD_BLOCKQUOTE_RE = re.compile(r"^>\s*", re.MULTILINE)
 _MD_HR_RE = re.compile(r"^\s*([-*_])\s*\1\s*\1[\s\1]*$", re.MULTILINE)
 
 
-def _parse_markdown(content: bytes) -> ParsedDocument:
+async def _parse_markdown_async(content: bytes) -> ParsedDocument:
     """Convert Markdown to plain text + structured blocks.
 
     Stripping order matters:
@@ -372,12 +379,12 @@ def _parse_markdown(content: bytes) -> ParsedDocument:
     3. Inline code → keep the text (single-line backticks only; do
        NOT span newlines — fenced code blocks are handled below).
     4. Blockquotes + horizontal rules.
-    5. **Multimodal extraction**: fenced code blocks + inline images
-       are pulled out into ``blocks`` BEFORE the link regex runs,
-       because the link regex would otherwise swallow
-       ``![alt](src)`` as a regular ``[alt](src)`` link. The block
-       spans are then stripped from ``text`` so the linearized view
-       doesn't double-embed them.
+    5. **Multimodal extraction** via :func:`knowledge.multimodal.enrich_blocks`
+       — fenced code blocks + inline images are pulled out into
+       ``blocks`` BEFORE the link regex runs, because the link regex
+       would otherwise swallow ``![alt](src)`` as a regular
+       ``[alt](src)`` link. The block spans are then stripped from
+       ``text`` so the linearized view doesn't double-embed them.
     6. Links ``[text](url)`` → ``text (url)`` on whatever's left.
     """
     text = content.decode("utf-8", errors="replace")
@@ -396,10 +403,18 @@ def _parse_markdown(content: bytes) -> ParsedDocument:
     text = _MD_BLOCKQUOTE_RE.sub("", text)
     text = _MD_HR_RE.sub("", text)
 
-    # 5. Multimodal extraction. Run BEFORE the link regex because the
-    #    link regex would otherwise treat `![alt](src)` as a regular
-    #    link and rewrite it as `alt (src)` before we ever see it.
-    blocks = _extract_markdown_blocks(text)
+    # 5. Multimodal extraction via the public ``enrich_blocks`` API.
+    #    We build a partial ``ParsedDocument`` snapshot and let the
+    #    helper extract code + image blocks from the partially-cleaned
+    #    text. The block spans are stripped from ``text`` so the
+    #    linearized view doesn't double-embed them.
+    snapshot = ParsedDocument(
+        text=text,
+        blocks=[],
+        metadata={"source_format": "markdown"},
+        format="markdown",
+    )
+    blocks = await enrich_blocks(parsed=snapshot)
     text = strip_markdown_blocks(text, blocks)
 
     # 6. Links: [text](url) → text (url). Run last so the
@@ -428,26 +443,35 @@ def _parse_html(content: bytes) -> ParsedDocument:
 
     Multimodal: ``<img>`` (with optional ``<figcaption>`` from the
     parent ``<figure>``) and ``<table>`` are pulled into the
-    ``blocks`` list via :mod:`knowledge.multimodal`; the image and
-    table nodes are then removed from the soup so their text doesn't
-    double-embed into ``text``.
+    ``blocks`` list via :mod:`knowledge.multimodal`. The image +
+    table + figure nodes are decomposed by the extractor itself so
+    their text doesn't double-embed into ``text``. We parse the HTML
+    EXACTLY ONCE — the multimodal helper operates on the same soup
+    that we use for text extraction.
     """
-    # Multimodal extraction FIRST — on the full HTML (before we mutate
-    # the soup). The helper is sync; it handles malformed HTML
-    # defensively and never raises.
-    blocks = _extract_html_blocks(content)
+    try:
+        soup = BeautifulSoup(content, "html.parser")
+    except Exception:
+        # BeautifulSoup rarely raises, but be defensive: if we can't
+        # parse at all, return an empty document rather than crashing
+        # the worker.
+        return ParsedDocument(
+            text="",
+            blocks=[],
+            metadata={
+                "source_format": "html",
+                "char_count": 0,
+                "block_count": 0,
+                "raw_source": content,
+            },
+            format="html",
+        )
 
-    soup = BeautifulSoup(content, "html.parser")
-    # Drop executable / non-visible content. decompose() removes the
-    # node AND its text, which is what we want for security.
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    # Strip images + tables from the linearized text — they now live
-    # on the ``blocks`` list and should not be embedded twice.
-    for tag in soup(["img"]):
-        tag.decompose()
-    for tag in soup(["table"]):
-        tag.decompose()
+    # Pull blocks out of the soup BEFORE we linearize the text. The
+    # extractor itself decomposes ``<img>`` / ``<figure>`` / ``<table>``
+    # so their text + captions do not double-embed. It also drops
+    # ``<script>`` / ``<style>`` / ``<noscript>`` for us.
+    blocks = _extract_html_blocks_from_soup(soup)
 
     # separator keeps block boundaries visible to the chunker; strip=True
     # removes the noisy leading/trailing whitespace each tag introduces.
@@ -459,6 +483,7 @@ def _parse_html(content: bytes) -> ParsedDocument:
             "source_format": "html",
             "char_count": len(text),
             "block_count": len(blocks),
+            "raw_source": content,
         },
         format="html",
     )

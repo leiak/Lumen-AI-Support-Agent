@@ -24,7 +24,12 @@ from knowledge.parser import ParsedDocument
 
 
 def _parsed(text: str, fmt: str, **metadata: object) -> ParsedDocument:
-    """Build a minimal ParsedDocument for the helpers."""
+    """Build a minimal ParsedDocument for the helpers.
+
+    For HTML, callers that want ``enrich_blocks`` to actually parse the
+    source must pass ``raw_source=<bytes>`` as a kwarg. Tests that only
+    assert empty-block behavior or non-HTML formats can omit it.
+    """
     return ParsedDocument(
         text=text,
         blocks=[],
@@ -220,7 +225,7 @@ async def test_strip_markdown_blocks_removes_code_and_image_spans() -> None:
 async def test_extract_html_image_with_alt_and_src() -> None:
     """A standalone ``<img>`` yields an image block with alt + src."""
     html = b'<html><body><img alt="Logo" src="logo.png" /></body></html>'
-    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html"))
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
     images = [b for b in blocks if b.get("type") == "image"]
     assert len(images) == 1
     assert images[0]["alt"] == "Logo"
@@ -237,7 +242,7 @@ async def test_extract_html_image_inside_figure_with_caption() -> None:
         b"<figcaption>Q4 sales overview</figcaption></figure>"
         b"</body></html>"
     )
-    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html"))
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
     images = [b for b in blocks if b.get("type") == "image"]
     assert len(images) == 1
     assert images[0]["alt"] == "Sales chart"
@@ -252,7 +257,7 @@ async def test_html_anchor_with_text_is_not_extracted() -> None:
         b'<p>See <a href="https://example.com">our docs</a> for more.</p>'
         b"</body></html>"
     )
-    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html"))
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
     assert blocks == []
 
 
@@ -264,7 +269,7 @@ async def test_html_image_inside_noscript_is_ignored() -> None:
         b'<img src="real.png" alt="real" />'
         b"</body></html>"
     )
-    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html"))
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
     images = [b for b in blocks if b.get("type") == "image"]
     # Only the real one survives; the <noscript> one is decomposed first.
     assert len(images) == 1
@@ -302,7 +307,7 @@ async def test_extract_handles_malformed_html_gracefully() -> None:
     # Mismatched / partial tags. BeautifulSoup is forgiving; this
     # exercises the defensive try/except around _extract_html_blocks.
     html = b"<html><body><img src='a.png' alt='a'><p>unclosed paragraph"
-    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html"))
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
     # We don't care WHAT it returns, only that it doesn't raise.
     assert isinstance(blocks, list)
     images = [b for b in blocks if b.get("type") == "image"]
@@ -316,7 +321,9 @@ async def test_extract_handles_binary_garbage_html_gracefully() -> None:
     # parser's format sniff, but the multimodal helper should still be
     # defensive on its own.
     garbage = b"\x00\x01\x02\xff\xfe<html><body><img src='x' alt='y'></body></html>\x00"
-    blocks = await enrich_blocks(parsed=_parsed(garbage.decode("utf-8", "replace"), "html"))
+    blocks = await enrich_blocks(
+        parsed=_parsed(garbage.decode("utf-8", "replace"), "html", raw_source=garbage)
+    )
     assert isinstance(blocks, list)
 
 
@@ -378,3 +385,212 @@ async def test_parser_populates_blocks_for_html() -> None:
     assert "Intro paragraph." in result.text
     # But the image src / alt don't double-appear.
     assert "logo.png" not in result.text
+
+
+# ---------------------------------------------------------------------------
+# Important 2 — Markdown images with balanced parens in src
+# ---------------------------------------------------------------------------
+
+
+async def test_markdown_image_with_balanced_parens_in_src() -> None:
+    """A markdown image whose src contains balanced parens captures the FULL url.
+
+    CommonMark allows ``![alt](https://example.com/foo(bar).png)``.
+    The earlier regex ``[^)]+`` would stop at the first ``)`` and
+    capture only ``https://example.com/foo(bar``. This test guards the
+    depth-aware src scan.
+    """
+    md = (
+        "Look at this chart:\n\n"
+        "![sales chart](https://example.com/charts/sales(q4).png)\n"
+    )
+    blocks = await enrich_blocks(parsed=_parsed(md, "markdown"))
+    images = [b for b in blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["alt"] == "sales chart"
+    assert images[0]["src"] == "https://example.com/charts/sales(q4).png"
+
+
+async def test_markdown_image_with_escaped_paren_in_src() -> None:
+    """An escaped ``\\)`` inside the src does NOT terminate the link."""
+    md = "x\n\n![alt](https://example.com/a\\)b.png)\n"
+    blocks = await enrich_blocks(parsed=_parsed(md, "markdown"))
+    images = [b for b in blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["src"] == "https://example.com/a\\)b.png"
+
+
+async def test_strip_markdown_blocks_removes_image_with_balanced_parens() -> None:
+    """``strip_markdown_blocks`` removes the entire image span, parens and all."""
+    md = (
+        "Intro.\n\n"
+        "![sales chart](https://example.com/charts/sales(q4).png)\n\n"
+        "Tail.\n"
+    )
+    blocks = await enrich_blocks(parsed=_parsed(md, "markdown"))
+    cleaned = strip_markdown_blocks(md, blocks)
+    assert "https://example.com/charts/sales(q4).png" not in cleaned
+    assert "![sales chart]" not in cleaned
+    assert "Intro." in cleaned
+    assert "Tail." in cleaned
+
+
+# ---------------------------------------------------------------------------
+# Important 3 — enrich_blocks html path is live when raw_source is present
+# ---------------------------------------------------------------------------
+
+
+async def test_enrich_blocks_html_with_raw_source_metadata() -> None:
+    """An HTML ParsedDocument carrying ``raw_source`` populates blocks via enrich_blocks.
+
+    Important 3 fix: this path used to be dead code because the parser
+    never set ``metadata['raw_source']``. Now that the parser does, an
+    external caller can build a ParsedDocument with the raw bytes and
+    call ``enrich_blocks`` directly without going through the parser.
+    """
+    html_bytes = (
+        b"<html><body>"
+        b"<p>Intro paragraph.</p>"
+        b'<img src="logo.png" alt="Logo" />'
+        b"</body></html>"
+    )
+    doc = ParsedDocument(
+        text="Intro paragraph.",  # linearized text — NOT what we extract from
+        blocks=[],
+        metadata={"source_format": "html", "raw_source": html_bytes},
+        format="html",
+    )
+    blocks = await enrich_blocks(parsed=doc)
+    images = [b for b in blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["src"] == "logo.png"
+    assert images[0]["alt"] == "Logo"
+
+
+async def test_enrich_blocks_html_without_raw_source_returns_empty() -> None:
+    """An HTML ParsedDocument missing ``raw_source`` returns ``[]`` (defensive)."""
+    doc = ParsedDocument(
+        text="Intro paragraph.",
+        blocks=[],
+        metadata={"source_format": "html"},  # no raw_source
+        format="html",
+    )
+    blocks = await enrich_blocks(parsed=doc)
+    assert blocks == []
+
+
+# ---------------------------------------------------------------------------
+# Important 5 — <figcaption> must not double-embed into the linearized text
+# ---------------------------------------------------------------------------
+
+
+async def test_html_figcaption_text_does_not_double_embed_in_linearized_text() -> None:
+    """A ``<figure><img/><figcaption>...</figcaption></figure>`` puts the caption
+    on the block AND keeps it OUT of the linearized text.
+    """
+    from knowledge.parser import parse_document
+
+    html = (
+        b"<html><body>"
+        b"<p>Before the figure.</p>"
+        b'<figure><img src="chart.png" alt="Sales chart" />'
+        b"<figcaption>Q4 sales overview</figcaption></figure>"
+        b"<p>After the figure.</p>"
+        b"</body></html>"
+    )
+    result = await parse_document(file_bytes=html, file_name="page.html", mime_type=None)
+
+    # The image block carries the caption.
+    images = [b for b in result.blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["caption"] == "Q4 sales overview"
+
+    # But the caption does NOT leak into the linearized text — the
+    # entire <figure> was decomposed after capture.
+    assert "Q4 sales overview" not in result.text
+
+    # Surrounding prose is preserved.
+    assert "Before the figure." in result.text
+    assert "After the figure." in result.text
+
+
+async def test_html_image_inside_anchor_is_extracted() -> None:
+    """An ``<img>`` nested inside ``<a>`` is still extracted as an image block."""
+    html = (
+        b"<html><body>"
+        b'<a href="https://example.com">'
+        b'<img src="thumb.png" alt="Thumbnail" />'
+        b"</a>"
+        b"</body></html>"
+    )
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
+    images = [b for b in blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["alt"] == "Thumbnail"
+    assert images[0]["src"] == "thumb.png"
+
+
+async def test_html_image_inside_picture_is_extracted() -> None:
+    """An ``<img>`` nested inside ``<picture>`` is still extracted as an image block."""
+    html = (
+        b"<html><body>"
+        b"<picture>"
+        b'<source srcset="big.png" media="(min-width: 800px)" />'
+        b'<img src="small.png" alt="Responsive" />'
+        b"</picture>"
+        b"</body></html>"
+    )
+    blocks = await enrich_blocks(parsed=_parsed(html.decode(), "html", raw_source=html))
+    images = [b for b in blocks if b.get("type") == "image"]
+    assert len(images) == 1
+    assert images[0]["src"] == "small.png"
+    assert images[0]["alt"] == "Responsive"
+
+
+# ---------------------------------------------------------------------------
+# Minor — Empty code-block body edge case
+# ---------------------------------------------------------------------------
+
+
+async def test_markdown_empty_code_block_body_is_captured() -> None:
+    """An empty fenced code block yields a code block with an empty body.
+
+    `````\\n`````` (just two fences, nothing between) is a legal CommonMark
+    code block; we must capture it as a code block with an empty body
+    rather than skipping it.
+    """
+    md = (
+        "Intro prose.\n"
+        "\n"
+        "```\n"
+        "```\n"
+        "\n"
+        "Tail prose.\n"
+    )
+    blocks = await enrich_blocks(parsed=_parsed(md, "markdown"))
+    codes = [b for b in blocks if b.get("type") == "code"]
+    assert len(codes) == 1
+    assert codes[0]["language"] == ""
+    assert str(codes[0]["text"]) == ""
+
+
+# ---------------------------------------------------------------------------
+# Private helpers are no longer imported cross-module (Important 1)
+# ---------------------------------------------------------------------------
+
+
+def test_private_helpers_are_underscore_prefixed() -> None:
+    """The parser must NOT import the private ``_extract_*`` helpers directly.
+
+    Guards against regressions of the "Parser imports private helpers
+    cross-module" issue.
+    """
+    import inspect
+
+    from knowledge import parser
+
+    source = inspect.getsource(parser)
+    assert "_extract_markdown_blocks" not in source, (
+        "parser.py must not import the private _extract_markdown_blocks — "
+        "route through enrich_blocks(parsed=...) instead."
+    )
