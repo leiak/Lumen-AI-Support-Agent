@@ -18,9 +18,15 @@ class ConversationRepository:
     """CRUD for Conversation rows."""
 
     async def create(self, *, conversation: Conversation) -> Conversation:
-        """Insert a Conversation. Returns the same instance after commit."""
+        """Insert a Conversation. Returns the same instance after commit.
+
+        Flushes + refreshes so DB-generated defaults (e.g. server-side
+        timestamps) are populated on the returned instance.
+        """
         async with get_session() as session:
             session.add(conversation)
+            await session.flush()
+            await session.refresh(conversation)
             await session.commit()
             return conversation
 
@@ -91,15 +97,33 @@ class ConversationRepository:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
-    async def update(self, conversation: Conversation) -> Conversation:
-        """Persist mutations on a Conversation. Returns the same instance."""
+    async def update(self, conversation: Conversation) -> Conversation | None:
+        """Persist mutations on a Conversation.
+
+        Loads the row by primary key to avoid stale-detached-state issues,
+        then applies the mutable attributes and refreshes the persisted
+        instance. Returns None when the row does not exist.
+        """
         async with get_session() as session:
-            session.add(conversation)
+            existing = await session.get(Conversation, conversation.id)
+            if existing is None:
+                return None
+            existing.status = conversation.status
+            existing.assigned_agent_id = conversation.assigned_agent_id
+            existing.ai_handling = conversation.ai_handling
+            existing.last_activity_at = conversation.last_activity_at
+            await session.flush()
+            await session.refresh(existing)
             await session.commit()
-            return conversation
+            return existing
 
     async def touch_last_activity(self, *, conversation_id: str, at: datetime) -> None:
-        """Update last_activity_at without loading the row."""
+        """Update last_activity_at without loading the row.
+
+        No-op when the conversation does not exist. Callers should
+        pre-validate ``conversation_id`` exists; this method silently
+        skips missing rows to avoid throwing in the message-write hot loop.
+        """
         async with get_session() as session:
             stmt = (
                 update(Conversation)
@@ -107,15 +131,22 @@ class ConversationRepository:
                 .values(last_activity_at=at)
             )
             await session.execute(stmt)
+            await session.commit()
 
 
 class MessageRepository:
     """CRUD for Message rows."""
 
     async def create(self, *, message: Message) -> Message:
-        """Insert a Message. Returns the same instance after commit."""
+        """Insert a Message. Returns the same instance after commit.
+
+        Flushes + refreshes so DB-generated defaults are populated on the
+        returned instance.
+        """
         async with get_session() as session:
             session.add(message)
+            await session.flush()
+            await session.refresh(message)
             await session.commit()
             return message
 
