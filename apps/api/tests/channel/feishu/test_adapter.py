@@ -6,6 +6,7 @@ import pytest
 
 from channel.enums import ChannelStatus, ChannelType
 from channel.feishu.adapter import FeishuAdapter
+from channel.feishu.exceptions import FeishuAPIError
 from channel.messages import MessageEnvelope
 from channel.models import Channel
 from core.id_gen import new_id
@@ -158,3 +159,55 @@ async def test_parse_minimally_empty_raw_does_not_crash() -> None:
     assert envelope.external_user_id == ""
     assert envelope.external_message_id == ""
     assert envelope.text == ""
+
+
+@pytest.mark.asyncio
+async def test_send_outbound_malformed_credentials_raises_feishu_api_error(monkeypatch) -> None:
+    """Invalid credentials JSON should raise FeishuAPIError, not JSONDecodeError."""
+    FeishuAdapter.reset_client()
+    monkeypatch.setattr(FeishuAdapter._client, "send_text_message", lambda **kw: None)
+
+    channel = _channel()
+    channel.credentials_encrypted = "{not-valid-json"
+    envelope = MessageEnvelope(
+        envelope_id=new_id(),
+        tenant_id=channel.tenant_id,
+        channel_type=ChannelType.FEISHU,
+        channel_id=channel.id,
+        external_conversation_id="oc_x",
+        external_user_id="ou_user",
+        external_message_id="om_in",
+        text="hi",
+        attachments=[],
+        raw={},
+        received_at=datetime.now(UTC),
+    )
+    with pytest.raises(FeishuAPIError, match="credentials_encrypted"):
+        await FeishuAdapter().send_outbound(envelope=envelope, channel=channel)
+    FeishuAdapter.reset_client()
+
+
+@pytest.mark.asyncio
+async def test_send_outbound_missing_app_id_raises_feishu_api_error(monkeypatch) -> None:
+    """Missing app_id should raise FeishuAPIError, not KeyError."""
+    FeishuAdapter.reset_client()
+    monkeypatch.setattr(FeishuAdapter._client, "send_text_message", lambda **kw: None)
+
+    channel = _channel()
+    channel.credentials_encrypted = '{"app_secret": "x"}'  # no app_id
+    envelope = MessageEnvelope(
+        envelope_id=new_id(),
+        tenant_id=channel.tenant_id,
+        channel_type=ChannelType.FEISHU,
+        channel_id=channel.id,
+        external_conversation_id="oc_x",
+        external_user_id="ou_user",
+        external_message_id="om_in",
+        text="hi",
+        attachments=[],
+        raw={},
+        received_at=datetime.now(UTC),
+    )
+    with pytest.raises(FeishuAPIError, match="missing credential field"):
+        await FeishuAdapter().send_outbound(envelope=envelope, channel=channel)
+    FeishuAdapter.reset_client()

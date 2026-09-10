@@ -186,3 +186,12 @@ async def test_clear_token_cache(client, httpx_mock) -> None:
     assert first == "t-first"
     assert second == "t-second"
     assert len(httpx_mock.get_requests()) == 2
+
+
+def test_feishu_token_repr_masks_access_token() -> None:
+    """Repr must not leak the bearer token in logs."""
+    from channel.feishu.client import FeishuToken
+    token = FeishuToken(access_token="t-secret-bearer", expires_at=12345.0)  # noqa: S106
+    s = repr(token)
+    assert "t-secret-bearer" not in s
+    assert "***" in s

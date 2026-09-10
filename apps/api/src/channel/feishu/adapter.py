@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 from channel.enums import ChannelType
 from channel.feishu.client import FeishuOpenAPIClient
+from channel.feishu.exceptions import FeishuAPIError
 from channel.messages import MessageEnvelope
 from channel.models import Channel
 from core.id_gen import new_id
@@ -76,10 +77,49 @@ class FeishuAdapter:
         `credentials_encrypted` JSON text column. The OpenAPI client is a
         class-level singleton that caches `tenant_access_token` per app_id.
         """
-        creds = json.loads(channel.credentials_encrypted)
-        await self._client.send_text_message(
-            app_id=creds["app_id"],
-            app_secret=creds["app_secret"],
-            receive_id=envelope.external_user_id,
-            text=envelope.text,
-        )
+        try:
+            creds = json.loads(channel.credentials_encrypted)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.error(
+                "feishu adapter: malformed credentials_encrypted",
+                extra={"channel_id": channel.id, "envelope_id": envelope.envelope_id},
+            )
+            raise FeishuAPIError("invalid credentials_encrypted JSON") from exc
+
+        try:
+            app_id = creds["app_id"]
+            app_secret = creds["app_secret"]
+        except KeyError as exc:
+            logger.error(
+                "feishu adapter: missing credential field",
+                extra={"channel_id": channel.id, "missing_field": exc.args[0]},
+            )
+            raise FeishuAPIError(f"missing credential field: {exc.args[0]}") from exc
+
+        try:
+            await self._client.send_text_message(
+                app_id=app_id,
+                app_secret=app_secret,
+                receive_id=envelope.external_user_id,
+                text=envelope.text,
+            )
+        except FeishuAPIError:
+            logger.warning(
+                "feishu send_outbound failed",
+                extra={
+                    "channel_id": channel.id,
+                    "envelope_id": envelope.envelope_id,
+                    "tenant_id": channel.tenant_id,
+                },
+                exc_info=True,
+            )
+            raise
+        else:
+            logger.info(
+                "feishu send_outbound ok",
+                extra={
+                    "channel_id": channel.id,
+                    "envelope_id": envelope.envelope_id,
+                    "tenant_id": channel.tenant_id,
+                },
+            )
