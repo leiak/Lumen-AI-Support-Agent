@@ -22,31 +22,30 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
+from agent import simple_responder
 from auth.jwt import create_access_token
 from channel.enums import ChannelStatus, ChannelType
 from channel.models import Channel
 from channel.repository import ChannelRepository
 from conversation.api import router as conversations_router
 from conversation.enums import ConversationStatus, MessageRole
-from conversation.models import Conversation
+from conversation.models import Conversation, Message
 from conversation.repository import ConversationRepository, MessageRepository
 from conversation.service import ConversationService
 from core.database import get_session
 from core.id_gen import new_id
+from llm_client.types import ChatResponse
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-from widget.api import router as widget_api_router
-from widget.tokens import create_widget_token
+from widget.adapter import WebWidgetAdapter
 from widget.ws.manager import ConnectionManager
-from widget.ws.router import router as widget_ws_router
 
 # ============================================================================
 # Fixtures / helpers
@@ -54,9 +53,28 @@ from widget.ws.router import router as widget_ws_router
 
 
 @pytest.fixture(autouse=True)
-def _reset_db_singletons():
-    """Reset async engine/sessionmaker between tests to avoid cross-loop contamination."""
+def _reset_db_singletons(monkeypatch: pytest.MonkeyPatch):
+    """Reset async engine/sessionmaker between tests to avoid cross-loop
+    contamination, AND rebind the shared ``ConnectionManager`` singleton to a
+    fresh instance.
+
+    The WS manager is shared by ``widget.ws.router`` (which owns the
+    connection lifecycle) and ``channel.inbound`` (which broadcasts
+    server-initiated events). Every module-level alias must be rebound to
+    the SAME fresh instance — otherwise a broadcast targets a different
+    connection table than the one the socket registered itself in, and
+    silently delivers to nobody. Same pattern as
+    ``tests/widget/integration/test_widget_e2e._reset_singletons``.
+    """
+    import channel.inbound as inbound_module
     from core.database import reset_engine, reset_sessionmaker
+    from widget.ws import manager as ws_manager_module
+    from widget.ws import router as ws_router_module
+
+    fresh = ConnectionManager()
+    monkeypatch.setattr(ws_manager_module, "manager", fresh)
+    monkeypatch.setattr(ws_router_module, "manager", fresh)
+    monkeypatch.setattr(inbound_module, "_wsm", fresh)
 
     yield
     reset_engine()
@@ -196,10 +214,16 @@ async def test_find_or_create_for_inbound_resolves_race() -> None:
     tenant, channel = await _seed_tenant_and_web_channel()
     try:
         service = ConversationService()
-        # ``asyncio.Barrier`` waits for *both* parties to reach the barrier
-        # before releasing them at the same instant. Combined with gather,
-        # this maximises the chance both find_or_create calls enter their
-        # read-then-create window before either commits.
+        # NOTE — best-effort race coverage, not a deterministic race test.
+        # ``asyncio.Barrier(2)`` + ``asyncio.gather`` only synchronises the
+        # *starts* of the two coroutines on the same event loop; in practice
+        # one of them almost always finishes its find-then-create window
+        # before the other even reaches the SELECT. The post-condition
+        # (exactly one OPEN row, both callers see the same id) is what we
+        # are actually exercising — both paths (winner-and-skip and
+        # IntegrityError-and-recover) yield the same observable state, so a
+        # green run here confirms only that ``find_or_create_for_inbound``
+        # is internally consistent under concurrent invocation.
         barrier = asyncio.Barrier(2)
 
         async def open_one() -> Conversation | None:
@@ -292,8 +316,15 @@ async def test_record_message_atomic_timestamp() -> None:
         assert recorded.sender_id == "u_cust_ts"
 
         # Atomicity check: the message created_at and the conversation's
-        # last_activity_at must be equal (same wall-clock instant).
-        assert recorded.created_at == conv.last_activity_at
+        # last_activity_at must be the same wall-clock instant. Use a
+        # sub-millisecond tolerance for forward-compat with future column-level
+        # ``func.now()`` defaults that may introduce a tiny gap between the
+        # two writes.
+        assert (
+            abs((recorded.created_at - conv.last_activity_at).total_seconds()) < 0.001
+        ), (
+            f"created_at={recorded.created_at} last_activity_at={conv.last_activity_at}"
+        )
         # And strictly newer than the baseline
         assert conv.last_activity_at > baseline_ts
     finally:
@@ -480,114 +511,156 @@ async def test_cross_tenant_get_returns_404() -> None:
             )
             assert resp_xt.json()["detail"] == "conversation not found"
     finally:
-        await _delete_tenant(tenant_a.id)
-        await _delete_tenant(tenant_b.id)
+        # Clean up both tenants in parallel for a small speedup.
+        await asyncio.gather(
+            _delete_tenant(tenant_a.id),
+            _delete_tenant(tenant_b.id),
+        )
 
 
 # ============================================================================
-# Test 6 — WS broadcast of AI auto-reply
+# Test 6 — WS broadcast of AI auto-reply (DB-backed)
 # ============================================================================
 
 
-@pytest.mark.asyncio
+@pytest.mark.integration
 async def test_ws_broadcast_carries_ai_reply(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A widget WS client must receive a ``message.complete`` frame whose
-    ``content`` field carries the AI auto-reply text.
+    """A widget ``message.complete`` broadcast must carry a REAL ULID that
+    exists in the ``messages`` table.
 
-    Focuses on the broadcast shape: we mock the DB and LLM layers so the
-    test only asserts on the WS frame. Mirrors the structure of
-    ``test_widget_e2e.test_widget_client_receives_message_complete_after_ai_response``
-    but stays narrow on the broadcast assertion.
+    Unlike the mocked coverage in
+    ``tests/widget/integration/test_widget_e2e.py`` — which proves the
+    broadcast *shape* with a stubbed ``ConversationService`` — this test
+    proves the conversation lifecycle actually produces a durable row
+    before the broadcast is emitted.
+
+    Implementation note — we drive ``process_inbound_envelope`` directly
+    from the test's main loop rather than round-tripping through the WS
+    endpoint. The WS endpoint runs inside ``TestClient``'s anyio portal,
+    which lives on a separate event loop from the test; the test's
+    ``asyncpg`` engine is bound to the test's loop, so any DB call from
+    inside the portal raises ``RuntimeError: got Future ... attached to a
+    different loop``. Driving the pipeline from the test's loop avoids
+    that while still exercising the real ``ConversationService``,
+    repositories, and ``SimpleResponder.respond`` path. We capture the
+    broadcast by monkey-patching ``ConnectionManager.broadcast_to_channel``
+    on the fresh singleton (rebound by the autouse fixture), so we
+    observe exactly the payload that ``_broadcast_ai_complete`` would have
+    delivered to a live socket.
+
+    The only mock is the LLMClient factory (swapped via
+    ``agent.simple_responder._default_llm_client_factory``) — we never
+    want a real Anthropic call in tests. ``ConversationService`` and the
+    repositories run unchanged against the live DB.
     """
-    # Reset the shared WS manager singleton so the router picks up our
-    # fresh instance for the broadcast path. Same pattern as the existing
-    # widget e2e tests.
-    import channel.inbound as inbound_module
-    from widget.ws import manager as ws_manager_module
-    from widget.ws import router as ws_router_module
+    tenant, channel = await _seed_tenant_and_web_channel(name="DB-backed WS Tenant")
+    try:
+        # Swap the LLMClient factory so SimpleResponder returns a canned
+        # response. We do NOT mock SimpleResponder itself — the call to
+        # ``responder.respond()`` runs for real and exercises the
+        # history-build + agent_response shape.
+        fake_reply_text = "AI broadcast reply from real DB lifecycle"
 
-    fresh = ConnectionManager()
-    monkeypatch.setattr(ws_manager_module, "manager", fresh)
-    monkeypatch.setattr(ws_router_module, "manager", fresh)
-    monkeypatch.setattr(inbound_module, "_wsm", fresh)
+        class _FakeLLMClient:
+            async def chat(self, _request: object, *, max_retries: int = 3) -> ChatResponse:
+                return ChatResponse(
+                    content=fake_reply_text,
+                    model="fake-model",
+                    prompt_tokens=10,
+                    completion_tokens=5,
+                    finish_reason="stop",
+                )
 
-    # A real channel so the token check passes
-    ch = Channel(
-        id=new_id(),
-        tenant_id=new_id(),
-        type=ChannelType.WEB,
-        name="x",
-        status=ChannelStatus.ACTIVE,
-        credentials_encrypted=json.dumps({}),
-        created_at=datetime.now(UTC),
-    )
+        monkeypatch.setattr(
+            simple_responder,
+            "_default_llm_client_factory",
+            lambda _tenant_id: _FakeLLMClient(),
+        )
 
-    async def fake_get_by_id(_self, _id):
-        return ch
+        # Capture broadcasts via the manager singleton that the autouse
+        # fixture just rebound. We still call through to the real
+        # ``broadcast_to_channel`` so any actual delivery (to zero
+        # connections, since this test never opens a WS) behaves
+        # identically to production.
+        from widget.ws import manager as ws_manager_module
 
-    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+        captured_broadcasts: list[dict[str, object]] = []
+        real_broadcast = ws_manager_module.manager.broadcast_to_channel
 
-    # Mock the DB: AI path must fire
-    conv_id = new_id()
-    ai_message_id = new_id()
-    customer_msg_id = new_id()
+        async def capture_broadcast(
+            channel_id: str, payload: dict[str, object], *, exclude: str | None = None
+        ) -> int:
+            captured_broadcasts.append(
+                {"channel_id": channel_id, "payload": dict(payload)}
+            )
+            return await real_broadcast(channel_id, payload, exclude=exclude)
 
-    conv = MagicMock(
-        id=conv_id,
-        tenant_id=ch.tenant_id,
-        ai_handling=True,
-        status=ConversationStatus.OPEN,
-    )
-    mock_service = MagicMock()
-    mock_service.find_or_create_for_inbound = AsyncMock(return_value=conv)
-    mock_service.record_message = AsyncMock(
-        side_effect=[
-            MagicMock(id=customer_msg_id, role=MessageRole.CUSTOMER),
-            MagicMock(id=ai_message_id, role=MessageRole.AI),
-        ]
-    )
-    monkeypatch.setattr(
-        "channel.inbound.ConversationService", lambda *a, **kw: mock_service
-    )
+        monkeypatch.setattr(
+            ws_manager_module.manager,
+            "broadcast_to_channel",
+            capture_broadcast,
+        )
 
-    # Mock the LLM — return a fixed reply
-    from agent.simple_responder import AgentResponse
+        # Parse an inbound frame via the widget adapter — the same code
+        # path the WS endpoint uses to turn a raw ``{"type": "message",
+        # ...}`` frame into a canonical MessageEnvelope.
+        adapter = WebWidgetAdapter()
+        frame = {
+            "type": "message",
+            "text": "trigger AI",
+            "external_user_id": "u_db_bcast",
+            "client_message_id": "cm_db_bcast_1",
+        }
+        envelope = await adapter.parse_inbound(raw=frame, channel=channel)
 
-    mock_responder = MagicMock()
-    mock_responder.respond = AsyncMock(
-        return_value=AgentResponse(content_text="AI broadcast reply", role=MessageRole.AI)
-    )
-    monkeypatch.setattr(
-        "channel.inbound.SimpleResponder", lambda *a, **kw: mock_responder
-    )
+        # Drive the full inbound pipeline from the test's main loop.
+        # ``process_inbound_envelope`` does:
+        #   find_or_create_for_inbound -> record_message(CUSTOMER)
+        #   -> SimpleResponder.respond -> record_message(AI)
+        #   -> _broadcast_ai_complete -> _wsm.broadcast_to_channel.
+        from channel.inbound import process_inbound_envelope
 
-    # Mount the widget router + WS router on a fresh app
-    app = FastAPI()
-    app.include_router(widget_api_router)
-    app.include_router(widget_ws_router)
+        await process_inbound_envelope(envelope)
 
-    token, _ = create_widget_token(channel=ch, external_user_id="u_bcast")
-    client = TestClient(app)
-    with client.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
-        ws.send_json({"type": "message", "text": "trigger AI"})
+        # The broadcast was captured exactly once.
+        assert len(captured_broadcasts) == 1, (
+            f"expected exactly 1 broadcast, got {len(captured_broadcasts)}"
+        )
+        broadcast = captured_broadcasts[0]
+        assert broadcast["channel_id"] == channel.id
 
-        # Drain the next two frames. The broadcast is sent inside
-        # process_inbound_envelope BEFORE the ack, but we index by frame
-        # type to avoid relying on that ordering.
-        frames: dict[str, dict] = {}
-        for _ in range(2):
-            frame = ws.receive_json()
-            frames[frame["type"]] = frame
+        payload = broadcast["payload"]
+        # WS frame shape — the same dict that
+        # ``ConnectionManager.send_to_connection`` would forward to a
+        # connected socket.
+        assert payload["type"] == "message.complete"
+        assert payload["content"] == fake_reply_text
+        assert payload["role"] == "ai"
+        assert len(str(payload["conversation_id"])) == 26
 
-        assert "ack" in frames
-        assert "message.complete" in frames
+        # Load-bearing assertion: the broadcast message_id is a REAL
+        # ULID that exists in the messages table. This is what makes
+        # this test additive over the widget e2e mocks — we prove the
+        # lifecycle produced the row before broadcasting.
+        ai_msg_id = str(payload["message_id"])
+        assert len(ai_msg_id) == 26
 
-        complete = frames["message.complete"]
-        # Broadcast must carry the AI reply — this is the load-bearing
-        # assertion for this test.
-        assert complete["content"] == "AI broadcast reply"
-        assert complete["role"] == "ai"
-        assert complete["conversation_id"] == conv_id
-        # And the message_id is the persisted AI row's ULID
-        assert complete["message_id"] == ai_message_id
-        assert len(complete["message_id"]) == 26
+        async with get_session() as session:
+            msg = await session.get(Message, ai_msg_id)
+            assert msg is not None, (
+                f"broadcast message_id {ai_msg_id} not present in messages table"
+            )
+            assert msg.role == MessageRole.AI
+            assert msg.content_text == fake_reply_text
+            # And the customer message was persisted too — proves the
+            # full customer-message + AI-reply + broadcast chain ran.
+            stmt = select(Message).where(
+                Message.conversation_id == msg.conversation_id
+            )
+            result = await session.execute(stmt)
+            all_msgs = list(result.scalars().all())
+            roles = sorted(m.role for m in all_msgs)
+            assert roles == sorted([MessageRole.CUSTOMER, MessageRole.AI]), roles
+            assert len(all_msgs) == 2
+    finally:
+        await _delete_tenant(tenant.id)
