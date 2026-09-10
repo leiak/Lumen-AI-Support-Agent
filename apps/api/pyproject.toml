@@ -21,6 +21,7 @@ dependencies = [
     "structlog>=24.1",
     "prometheus-client>=0.20",
     "arq>=0.25",
+    "ulid-py>=1.1.0",
 ]
 
 [project.optional-dependencies]

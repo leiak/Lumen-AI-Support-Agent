@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from core.config import get_settings
 from core.database import Base
+from tenant import models  # noqa: F401  -- import for Alembic autogenerate metadata
 
 config = context.config
 
