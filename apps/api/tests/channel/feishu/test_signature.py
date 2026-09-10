@@ -84,8 +84,11 @@ def test_verify_feishu_signature_invalid() -> None:
     )
 
 
-def test_verify_feishu_signature_timing_safe() -> None:
-    """Use hmac.compare_digest — invalid signatures don't leak via timing."""
+def test_verify_feishu_signature_rejects_wrong_sigs() -> None:
+    """Wrong signatures are rejected.
+
+    Constant-time property is delegated to `hmac.compare_digest`.
+    """
     body = b'{"event":"test"}'
     valid_sig = sign_feishu_payload(
         timestamp="1700000000",
@@ -144,9 +147,10 @@ def test_decrypt_feishu_event_bad_key() -> None:
     """Wrong key should raise (bad PKCS#7 padding) rather than silently returning plaintext."""
     encrypted_b64, iv_b64 = _encrypt_for_test("test", FEISHU_ENCRYPT_KEY)
 
-    # Decrypting with wrong key should either raise (bad padding) or return garbage.
-    # The contract is: it should NOT silently return the plaintext.
-    with pytest.raises(Exception):  # noqa: B017
+    # Decrypting with wrong key raises ValueError from the cryptography lib's
+    # PKCS#7 unpadder (bad padding bytes). The contract is: it should NOT
+    # silently return the plaintext.
+    with pytest.raises(ValueError):
         decrypt_feishu_event(
             encrypted=encrypted_b64,
             iv=iv_b64,

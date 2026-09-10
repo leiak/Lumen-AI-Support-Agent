@@ -7,13 +7,14 @@ Two security modes:
    events; we must decrypt them before parsing.
 2. Plain mode: no encryption. Events are plain JSON.
 
-Both modes require HMAC-SHA256 signature verification using the `encrypt_key`
-even in plain mode (the signature is over the timestamp + nonce + key + body).
+Both modes require signature verification using the `encrypt_key`
+even in plain mode. Feishu's signing scheme is a custom SHA-256 digest over the
+concatenation `timestamp + nonce + encrypt_key + body` (this is NOT HMAC;
+the key is embedded in the message string, not used as HMAC's key argument).
 """
 import base64
 import hashlib
 import hmac
-import logging
 import time
 from typing import Final
 
@@ -21,9 +22,15 @@ from cryptography.hazmat.primitives import padding as crypto_padding
 from cryptography.hazmat.primitives.ciphers import Cipher as CryptoCipher
 from cryptography.hazmat.primitives.ciphers import algorithms, modes
 
-logger = logging.getLogger(__name__)
-
 DEFAULT_TIMESTAMP_MAX_AGE_SECONDS: Final[int] = 300  # 5 minutes
+
+
+class FeishuDecryptionError(ValueError):
+    """Raised when an encrypted Feishu event cannot be decoded/decrypted.
+
+    Inherits from ValueError so existing callers that catch ValueError still
+    work, while allowing HTTP layers to map this specific failure to 400.
+    """
 
 
 def _derive_aes_key(encrypt_key: str) -> bytes:
@@ -62,13 +69,18 @@ def verify_feishu_signature(
     body: bytes,
     signature: str,
 ) -> bool:
-    """Constant-time check that `signature` matches the expected HMAC."""
-    expected = sign_feishu_payload(
-        timestamp=timestamp,
-        nonce=nonce,
-        encrypt_key=encrypt_key,
-        body=body,
-    )
+    """Constant-time check that `signature` matches the expected SHA-256 digest."""
+    try:
+        expected = sign_feishu_payload(
+            timestamp=timestamp,
+            nonce=nonce,
+            encrypt_key=encrypt_key,
+            body=body,
+        )
+    except UnicodeDecodeError:
+        # Body is not valid UTF-8 → treat as a signature mismatch rather than
+        # propagating an exception that would bypass the security check.
+        return False
     return hmac.compare_digest(expected, signature)
 
 
@@ -112,4 +124,10 @@ def decrypt_feishu_event(
 
     unpadder = crypto_padding.PKCS7(128).unpadder()
     plaintext = unpadder.update(padded) + unpadder.finalize()
-    return plaintext.decode("utf-8")
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # Decryption succeeded but the plaintext is not valid UTF-8 → treat
+        # as a malformed event payload so HTTP layer can return 400 instead
+        # of letting the exception crash the request handler.
+        raise FeishuDecryptionError("decrypted payload is not valid UTF-8") from exc
