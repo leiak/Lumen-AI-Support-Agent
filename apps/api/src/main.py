@@ -2,10 +2,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 from core.config import get_settings
 from core.health import aggregate_health
 from core.logging import configure_logging, get_logger
+from core.qdrant import close_qdrant_client
 from core.redis import close_redis, get_redis
 
 
@@ -15,10 +17,12 @@ async def lifespan(app: FastAPI) -> Any:
     configure_logging()
     log = get_logger("startup")
     log.info("api.starting", environment=settings.environment, service=settings.service_name)
-    # warm up redis
-    _ = get_redis()
+    # Eagerly create the redis client pool so the first request doesn't pay
+    # connection-setup latency. (The pool itself connects lazily on first command.)
+    get_redis()
     yield
     await close_redis()
+    await close_qdrant_client()
     log.info("api.shutdown")
 
 
@@ -30,5 +34,8 @@ app = FastAPI(
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
-    return await aggregate_health()
+async def health() -> JSONResponse:
+    body, all_ok = await aggregate_health()
+    # 200 when all components are healthy; 503 when degraded so that load
+    # balancers / k8s probes / alerting can detect the failure.
+    return JSONResponse(status_code=200 if all_ok else 503, content=body)

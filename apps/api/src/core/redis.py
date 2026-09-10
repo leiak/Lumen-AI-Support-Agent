@@ -23,3 +23,10 @@ async def close_redis() -> None:
     if _client is not None:
         await _client.aclose()
         _client = None
+
+
+def reset_redis() -> None:
+    """Clear the cached redis client. For test isolation only.
+    Note: does NOT close the connection — the next caller will get a fresh client."""
+    global _client
+    _client = None

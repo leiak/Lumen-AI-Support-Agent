@@ -81,3 +81,18 @@ async def set_tenant_context(session: AsyncSession, tenant_id: str) -> None:
 
 async def reset_tenant_context(session: AsyncSession) -> None:
     await session.execute(text("SELECT set_config('app.tenant_id', '', true)"))
+
+
+def reset_engine() -> None:
+    """Clear the cached engine and dispose its connection pool. For test isolation only."""
+    global _engine
+    if _engine is not None:
+        # sync dispose is fine; we're in a sync function called from a fixture
+        _engine.sync_engine.dispose()
+    _engine = None
+
+
+def reset_sessionmaker() -> None:
+    """Clear the cached sessionmaker. For test isolation only."""
+    global _sessionmaker
+    _sessionmaker = None
