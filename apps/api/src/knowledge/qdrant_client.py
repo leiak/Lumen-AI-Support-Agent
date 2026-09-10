@@ -4,12 +4,14 @@ Currently exposes a single idempotent helper, :func:`ensure_collection`,
 that guarantees a named Qdrant collection exists with the requested
 vector schema. The helper is designed to be safe to call on every
 process boot: a missing collection is created; a present one is left
-alone; any other failure is logged and swallowed so the API can keep
-serving traffic even when Qdrant is briefly unavailable.
+alone; a real failure (Qdrant unreachable, auth refused, schema
+rejected) is logged at WARNING and returns False so the health
+endpoint can surface the degraded state.
 """
 from __future__ import annotations
 
 from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from core.logging import get_logger
 from core.qdrant import get_qdrant_client
@@ -48,6 +50,34 @@ def _to_distance(distance: str) -> qmodels.Distance:
     return _DISTANCE_MAP.get(distance, qmodels.Distance.COSINE)
 
 
+def _is_not_found(exc: UnexpectedResponse) -> bool:
+    """Return True if the UnexpectedResponse corresponds to a 404.
+
+    The qdrant-client library surfaces missing collections as
+    UnexpectedResponse with status_code 404 and a "Not found" reason
+    phrase. We check both the numeric status code (preferred — stable
+    across qdrant versions) and a substring on the human-readable
+    message (defensive — guards against future qdrant clients that
+    might use a different status but the same wording).
+    """
+    if getattr(exc, "status_code", None) == 404:
+        return True
+    return "not found" in str(exc).lower()
+
+
+def _is_already_exists(exc: UnexpectedResponse) -> bool:
+    """Return True if the UnexpectedResponse corresponds to a 409.
+
+    When two processes race to create the same collection, the loser's
+    create call comes back as UnexpectedResponse status 409 with a
+    "Already exists" reason. Treat that as success — the end state is
+    what we wanted.
+    """
+    if getattr(exc, "status_code", None) == 409:
+        return True
+    return "already exists" in str(exc).lower()
+
+
 async def ensure_collection(
     *,
     name: str,
@@ -67,9 +97,10 @@ async def ensure_collection(
     one ``create_collection``) on the very first invocation. Subsequent
     calls hit only ``get_collection``.
 
-    All log payloads are PII-safe: only the collection name and the
-    exception class name are emitted, never the exception message
-    (which can carry Qdrant URLs, error bodies, or auth hints).
+    All log payloads are PII-safe: only the collection name, the
+    exception class name, and (where relevant) the status code are
+    emitted. The exception message is never logged because it can
+    carry Qdrant URLs, error bodies, or auth hints.
     """
     try:
         client = get_qdrant_client()
@@ -81,44 +112,64 @@ async def ensure_collection(
         )
         return False
 
+    # 1. Probe: does the collection already exist?
     try:
-        # 1. Probe: does the collection already exist?
-        try:
-            await client.get_collection(collection_name=name)
-        except Exception:
-            # Most commonly: UnexpectedResponse("Not found: ...").
-            # We don't care about the specific error class — any failure
-            # here just means we have to try to create. Debug-level only
-            # to keep the happy path quiet; WARNING/ERROR happen at the
-            # outer except if even the create fails.
-            log.debug("qdrant.collection.get_failed", collection=name)
+        await client.get_collection(collection_name=name)
+    except UnexpectedResponse as exc:
+        if _is_not_found(exc):
+            # Expected cold-boot case: fall through to create.
+            log.debug("qdrant.collection.missing", collection=name)
         else:
-            log.info("qdrant.collection.exists", collection=name)
-            return True
-
-        # 2. Create with the requested schema.
-        try:
-            await client.create_collection(
-                collection_name=name,
-                vectors_config=qmodels.VectorParams(
-                    size=vector_size,
-                    distance=_to_distance(distance),
-                ),
+            # Real Qdrant error (500, 401, 403, ...). Do NOT claim success.
+            log.warning(
+                "qdrant.collection.probe_failed",
+                collection=name,
+                status_code=getattr(exc, "status_code", None),
             )
-        except Exception:
-            # Race: another worker / process created the collection
-            # between our get_collection and create_collection calls.
-            # The end state is what we wanted (the collection exists),
-            # so treat this as success.
-            log.info("qdrant.collection.race_lost", collection=name)
-            return True
-
-        log.info("qdrant.collection.created", collection=name)
-        return True
+            return False
     except Exception as exc:
+        # Anything else — ConnectionError, timeout, DNS failure, etc.
         log.warning(
-            "qdrant.collection.ensure_failed",
+            "qdrant.collection.probe_error",
             collection=name,
             error_type=type(exc).__name__,
         )
         return False
+    else:
+        log.info("qdrant.collection.exists", collection=name)
+        return True
+
+    # 2. Create with the requested schema.
+    try:
+        await client.create_collection(
+            collection_name=name,
+            vectors_config=qmodels.VectorParams(
+                size=vector_size,
+                distance=_to_distance(distance),
+            ),
+        )
+    except UnexpectedResponse as exc:
+        if _is_already_exists(exc):
+            # Race lost: another worker created the collection between
+            # our probe and create. End state is what we wanted -> success.
+            log.info("qdrant.collection.race_lost", collection=name)
+            return True
+        # Real create error (bad schema, vector size mismatch, etc.).
+        log.warning(
+            "qdrant.collection.create_failed",
+            collection=name,
+            status_code=getattr(exc, "status_code", None),
+        )
+        return False
+    except Exception as exc:
+        # ConnectionError / timeout / schema validation that bubbled
+        # up as a non-UnexpectedResponse. Treat as hard failure.
+        log.warning(
+            "qdrant.collection.create_error",
+            collection=name,
+            error_type=type(exc).__name__,
+        )
+        return False
+
+    log.info("qdrant.collection.created", collection=name)
+    return True
