@@ -17,7 +17,9 @@ import pytest
 from pypdf import PageObject
 
 from knowledge.parser import (
+    MAX_PARSE_BYTES,
     SUPPORTED_FORMATS,
+    OversizeDocumentError,
     ParsedDocument,
     UnsupportedDocumentType,
     parse_document,
@@ -344,6 +346,55 @@ async def test_parse_text_falls_back_from_mime_to_suffix() -> None:
         mime_type="application/octet-stream",
     )
     assert result.format == "markdown"
+
+
+# ---------------------------------------------------------------------------
+# Size guard (DoS prevention)
+# ---------------------------------------------------------------------------
+
+
+async def test_parse_rejects_oversize_input() -> None:
+    """Bytes larger than MAX_PARSE_BYTES are rejected before any parsing.
+
+    Pins the DoS-prevention contract: a single oversize payload must
+    raise :class:`OversizeDocumentError` (a ``ValueError`` subclass) and
+    the message must surface the actual size + the limit so operators
+    can debug from the worker log alone.
+    """
+    # Exactly one byte over the limit — keeps the test fast and the
+    # intent unambiguous.
+    payload = b"x" * (MAX_PARSE_BYTES + 1)
+    with pytest.raises(OversizeDocumentError) as exc_info:
+        await parse_document(
+            file_bytes=payload,
+            file_name="huge.pdf",
+            mime_type=None,
+        )
+    msg = str(exc_info.value)
+    assert str(MAX_PARSE_BYTES + 1) in msg
+    assert str(MAX_PARSE_BYTES) in msg
+    # A single broad except ValueError must catch both parser failures.
+    assert isinstance(exc_info.value, ValueError)
+
+
+async def test_parse_at_limit_succeeds() -> None:
+    """Bytes exactly at MAX_PARSE_BYTES pass the size guard (boundary).
+
+    The check is ``> MAX_PARSE_BYTES`` (strict greater-than), so the
+    limit value itself must be accepted. Use a real, parseable format
+    (.txt) so we exercise the size guard without a 50 MiB fixture —
+    the content itself can be much smaller; what matters is that
+    ``len(file_bytes) == MAX_PARSE_BYTES`` triggers parsing, not
+    rejection.
+    """
+    payload = b"a" * MAX_PARSE_BYTES
+    result = await parse_document(
+        file_bytes=payload,
+        file_name="boundary.txt",
+        mime_type=None,
+    )
+    assert result.format == "text"
+    assert len(result.text) == MAX_PARSE_BYTES
 
 
 async def test_parse_returns_pii_safe_metadata() -> None:

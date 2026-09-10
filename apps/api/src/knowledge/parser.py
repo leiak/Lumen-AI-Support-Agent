@@ -64,6 +64,24 @@ class UnsupportedDocumentType(ValueError):  # noqa: N818 - name fixed by M1 spec
     """
 
 
+class OversizeDocumentError(ValueError):
+    """Raised when the input bytes exceed :data:`MAX_PARSE_BYTES`.
+
+    A :class:`ValueError` subclass for the same broad-catch reason as
+    :class:`UnsupportedDocumentType` — worker / API code can use a
+    single ``except ValueError`` to surface both as a clean
+    ``ArticleStatus.FAILED`` + ``error_message``.
+    """
+
+
+# Cap on raw input bytes accepted by :func:`parse_document`. Sized as a
+# reasonable M1 default that comfortably fits a real product doc / PDF
+# manual while still rejecting obvious DoS payloads (a 500 MB PDF, an
+# HTML billion-laughs bomb, etc.) before they reach a format-specific
+# parser that might materialise much more memory.
+MAX_PARSE_BYTES: int = 50 * 1024 * 1024  # 50 MiB
+
+
 @dataclass(slots=True)
 class ParsedDocument:
     """The parser's output.
@@ -127,7 +145,28 @@ async def parse_document(
     UnsupportedDocumentType
         If the format cannot be determined from ``mime_type`` or
         ``file_name``, and the bytes don't look like UTF-8 text.
+    OversizeDocumentError
+        If ``len(file_bytes)`` exceeds :data:`MAX_PARSE_BYTES`. Checked
+        before format detection so an oversized payload never reaches a
+        format-specific parser.
     """
+    # Size guard FIRST — before any format detection (which itself may
+    # scan bytes) or dispatch (which may materialise far more memory
+    # than 50 MiB, e.g. pypdf's internal structures or a BeautifulSoup
+    # tree on a billion-laughs HTML bomb).
+    if len(file_bytes) > MAX_PARSE_BYTES:
+        log.warning(
+            "knowledge.parse.oversize",
+            file_name=file_name,
+            actual_bytes=len(file_bytes),
+            max_bytes=MAX_PARSE_BYTES,
+        )
+        max_mib = MAX_PARSE_BYTES // (1024 * 1024)
+        raise OversizeDocumentError(
+            f"Document {file_name!r} is {len(file_bytes)} bytes, which exceeds "
+            f"the {MAX_PARSE_BYTES}-byte parser limit (max ~{max_mib} MiB)."
+        )
+
     fmt = _detect_format(file_name=file_name, mime_type=mime_type, file_bytes=file_bytes)
 
     log.info(
