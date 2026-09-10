@@ -1,0 +1,230 @@
+"""ORM models for the knowledge base (RAG) layer.
+
+Four tables:
+
+* ``knowledge_bases`` — a per-tenant named collection of articles.
+* ``articles`` — a single source document; carries lifecycle status.
+* ``article_versions`` — immutable snapshot of an article's raw text;
+  every re-index creates a new version (version_number monotonically
+  increases per article).
+* ``chunks`` — the unit of retrieval. Tenant + knowledge_base + article
+  are denormalized onto the chunk for cheap tenant-scoped RAG queries
+  without joins.
+
+Cascade is ``ON DELETE CASCADE`` everywhere so a single
+``DELETE FROM tenants`` cleans up the whole subtree — this is the pattern
+already used by the conversation and channel modules and matches the
+test fixture's ``_delete_tenant`` helper.
+
+Indexes:
+
+* ``knowledge_bases``: UNIQUE (tenant_id, slug) — URL-safe identifier
+  must be unique within a tenant.
+* ``articles``: (tenant_id, knowledge_base_id, status) and
+  (knowledge_base_id, status) — both list-by-tenant-with-status and
+  list-by-KB-with-status queries are common.
+* ``article_versions``: UNIQUE (article_id, version_number) plus an
+  index on (article_id, content_hash) for dedup / change detection.
+* ``chunks``: UNIQUE (article_version_id, chunk_index) plus an index
+  on (tenant_id, knowledge_base_id) for tenant-scoped retrieval.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import (
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from core.database import Base
+from knowledge.enums import ArticleSourceType, ArticleStatus
+
+
+class KnowledgeBase(Base):
+    """A named collection of articles within a Tenant.
+
+    Each KB pins its own embedding model + chunking parameters so that
+    re-indexing under a new model can be done by spinning up a NEW KB
+    rather than mutating the live one (preserves point IDs in Qdrant).
+    """
+
+    __tablename__ = "knowledge_bases"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "slug", name="uq_knowledge_bases_tenant_slug"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    slug: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str] = mapped_column(
+        String(100), nullable=False, default="text-embedding-3-small"
+    )
+    chunk_size: Mapped[int] = mapped_column(Integer, nullable=False, default=800)
+    chunk_overlap: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class Article(Base):
+    """A source document within a KnowledgeBase.
+
+    The body lives on ``ArticleVersion`` — every re-index creates a new
+    version, so this row carries only metadata + lifecycle status.
+    ``current_version_id`` is set after the first successful version is
+    created and stays stable across re-indexes; it is a soft FK (no
+    DB-level FK constraint) because PostgreSQL doesn't support deferred
+    FKs to rows that don't exist yet at insert time.
+    """
+
+    __tablename__ = "articles"
+    __table_args__ = (
+        Index(
+            "ix_articles_tenant_kb_status",
+            "tenant_id",
+            "knowledge_base_id",
+            "status",
+        ),
+        Index("ix_articles_kb_status", "knowledge_base_id", "status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_uri: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    source_type: Mapped[ArticleSourceType] = mapped_column(
+        String(20), nullable=False, default=ArticleSourceType.MANUAL
+    )
+    status: Mapped[ArticleStatus] = mapped_column(
+        String(20), nullable=False, default=ArticleStatus.DRAFT
+    )
+    current_version_id: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class ArticleVersion(Base):
+    """An immutable snapshot of an article's raw text.
+
+    ``version_number`` starts at 1 and is monotonic per ``article_id``.
+    ``content_hash`` is a sha256 hex of ``raw_text`` and is used for
+    dedup and change detection — re-indexing the same bytes should not
+    create a new version.
+
+    ``raw_text`` is stored (not just the chunks) so the chunker can
+    re-run under new parameters without going back to the source.
+    """
+
+    __tablename__ = "article_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "article_id", "version_number", name="uq_article_versions_article_version"
+        ),
+        Index("ix_article_versions_article_content_hash", "article_id", "content_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    article_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("articles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
+    # sha256 hex = 64 chars; we use Text (not String(64)) so we can swap
+    # to a longer hash (sha512 = 128) without a schema change later.
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class Chunk(Base):
+    """A retrieval unit. One ArticleVersion produces N Chunks.
+
+    Tenant + knowledge_base + article are denormalized onto the chunk so
+    tenant-scoped RAG queries don't have to join through articles +
+    versions.
+
+    ``qdrant_point_id`` is the ID of the corresponding point in Qdrant.
+    It is NULL until the embedding upsert succeeds; uniqueness on
+    (article_version_id, chunk_index) is what guarantees idempotent
+    re-embedding for the same version.
+    """
+
+    __tablename__ = "chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "article_version_id", "chunk_index", name="uq_chunks_version_index"
+        ),
+        Index("ix_chunks_tenant_kb", "tenant_id", "knowledge_base_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    article_version_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("article_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    article_id: Mapped[str] = mapped_column(
+        String(26),
+        ForeignKey("articles.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    qdrant_point_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

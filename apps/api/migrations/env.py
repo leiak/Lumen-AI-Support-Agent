@@ -15,6 +15,9 @@ from conversation import (
 )
 from core.config import get_settings
 from core.database import Base
+from knowledge import (
+    models as knowledge_models,  # noqa: F401  -- import for Alembic autogenerate metadata
+)
 from llm_client import (
     models as llm_models,  # noqa: F401  -- import for Alembic autogenerate metadata
 )
