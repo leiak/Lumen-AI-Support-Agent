@@ -96,3 +96,14 @@ def reset_sessionmaker() -> None:
     """Clear the cached sessionmaker. For test isolation only."""
     global _sessionmaker
     _sessionmaker = None
+
+
+# --- Alembic Base ---
+# All ORM models will inherit from this. Imported by migrations/env.py so alembic
+# can autogenerate migrations against Base.metadata.
+from sqlalchemy.orm import DeclarativeBase  # noqa: E402
+
+
+class Base(DeclarativeBase):
+    """Declarative base for all ORM models."""
+    pass
