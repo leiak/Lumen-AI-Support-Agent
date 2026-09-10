@@ -1,10 +1,8 @@
 """Protocols (interfaces) that channel adapters must implement."""
-from typing import Protocol
-
-from fastapi import Request
+from typing import Any, Protocol
 
 from channel.enums import ChannelType
-from channel.messages import Attachment, MessageEnvelope
+from channel.messages import MessageEnvelope
 from channel.models import Channel
 
 
@@ -12,29 +10,32 @@ class ChannelAdapter(Protocol):
     """Interface every channel adapter must implement.
 
     An adapter is responsible for:
-    - parsing inbound HTTP requests from the channel into a MessageEnvelope
+    - parsing inbound payloads from the channel into a MessageEnvelope
     - sending outbound messages to the channel via the provider's API
+
+    Signature/verification and decryption of inbound HTTP bodies is handled by
+    the channel's webhook HTTP layer; adapters operate on already-decoded
+    JSON dicts.
     """
 
     channel_type: ChannelType
 
-    async def parse_inbound(self, request: Request) -> MessageEnvelope:
-        """Parse an inbound HTTP request from the channel into a MessageEnvelope.
+    async def parse_inbound(self, *, raw: dict[str, Any], channel: Channel) -> MessageEnvelope:
+        """Convert an already-verified, decrypted provider event JSON into a MessageEnvelope.
 
-        Validates signatures (e.g., Feishu X-Lark-Signature), extracts user/chat IDs,
-        fetches message content from the provider API if needed.
+        ``raw`` is the parsed JSON body from the channel's webhook.
+        ``channel`` is the Channel ORM row (carries tenant_id, credentials, etc.).
         """
 
     async def send_outbound(
         self,
         *,
+        envelope: MessageEnvelope,
         channel: Channel,
-        external_user_id: str,
-        text: str,
-        attachments: list[Attachment] | None = None,
     ) -> None:
-        """Send a message to the external user via the channel.
+        """Deliver an outbound envelope to the external user via the channel.
 
-        ``channel`` is the Channel ORM row (carries credentials).
-        ``external_user_id`` is the user's ID in the external system.
+        ``envelope`` carries the text/attachments plus the destination identifiers
+        (external_user_id, external_conversation_id). ``channel`` carries the
+        credentials used to authenticate with the provider API.
         """

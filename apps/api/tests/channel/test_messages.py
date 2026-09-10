@@ -82,7 +82,7 @@ def test_channel_adapter_protocol_runtime_checkable() -> None:
     class FakeAdapter(ChannelAdapter):
         channel_type = ChannelType.WEB
 
-        async def parse_inbound(self, request):  # type: ignore[no-untyped-def]
+        async def parse_inbound(self, *, raw, channel):  # type: ignore[no-untyped-def]
             return MessageEnvelope(
                 tenant_id="t",
                 channel_type=self.channel_type,
@@ -93,7 +93,7 @@ def test_channel_adapter_protocol_runtime_checkable() -> None:
                 received_at=datetime.now(UTC),
             )
 
-        async def send_outbound(self, *, channel, external_user_id, text, attachments=None):  # type: ignore[no-untyped-def]
+        async def send_outbound(self, *, envelope, channel):  # type: ignore[no-untyped-def]
             return None
 
     adapter = FakeAdapter()
