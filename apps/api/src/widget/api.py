@@ -15,8 +15,7 @@ across channels or users).
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -24,30 +23,32 @@ from pydantic import BaseModel, Field
 from auth.jwt import TokenError
 from channel.enums import ChannelStatus
 from channel.repository import ChannelRepository
-from widget.tokens import (
-    WIDGET_TOKEN_REFRESH_GRACE_SECONDS,
-    create_widget_token,
-    decode_widget_token,
-)
+from widget.tokens import create_widget_token, decode_widget_token
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/widget", tags=["widget"])
 
 
+# TODO(Stage 5+): widget endpoints are public and need per-IP rate limiting
+# at the edge (NGINX/Cloudflare) or via a Redis-backed FastAPI middleware.
+# An attacker can otherwise flood /token with random channel_ids and force-sign tokens.
+
+
 class TokenRequest(BaseModel):
     channel_id: str = Field(..., min_length=1, max_length=64)
-    external_user_id: str = Field(..., min_length=1, max_length=128)
+    external_user_id: str = Field(..., min_length=1, max_length=200)
 
 
 class TokenResponse(BaseModel):
     token: str
     expires_at: datetime
+    expires_in: int  # seconds until expiry
 
 
 class RefreshRequest(BaseModel):
     channel_id: str = Field(..., min_length=1, max_length=64)
-    external_user_id: str = Field(..., min_length=1, max_length=128)
+    external_user_id: str = Field(..., min_length=1, max_length=200)
     previous_token: str = Field(..., min_length=1)
 
 
@@ -70,7 +71,8 @@ async def issue_widget_token(body: TokenRequest) -> TokenResponse:
     token, expires_at = create_widget_token(
         channel=channel, external_user_id=body.external_user_id
     )
-    return TokenResponse(token=token, expires_at=expires_at)
+    expires_in = int((expires_at - datetime.now(UTC)).total_seconds())
+    return TokenResponse(token=token, expires_at=expires_at, expires_in=expires_in)
 
 
 @router.post("/token/refresh", response_model=TokenResponse, status_code=status.HTTP_200_OK)
@@ -80,14 +82,14 @@ async def refresh_widget_token(body: RefreshRequest) -> TokenResponse:
     M1 best-effort: validates the existing token via `decode_widget_token`
     (which enforces signature + expiry + `typ == "widget"`). Full expiry
     grace (up to WIDGET_TOKEN_REFRESH_GRACE_SECONDS past `exp`) is a
-    Stage 5+ concern — see `_decode_with_grace`.
+    Stage 5+ concern.
     """
     try:
-        payload = _decode_with_grace(body.previous_token)
+        payload = decode_widget_token(body.previous_token)
     except TokenError as exc:
-        logger.info("widget refresh rejected: %s", exc)
+        logger.warning("widget refresh rejected: %s", exc)
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid previous token"
         ) from exc
 
     if payload.get("channel_id") != body.channel_id:
@@ -103,24 +105,10 @@ async def refresh_widget_token(body: RefreshRequest) -> TokenResponse:
     channel = await repo.get_by_id(body.channel_id)
     if channel is None or channel.status != ChannelStatus.ACTIVE:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="channel unavailable"
+            status_code=status.HTTP_403_FORBIDDEN, detail="channel is not active"
         )
     token, expires_at = create_widget_token(
         channel=channel, external_user_id=body.external_user_id
     )
-    return TokenResponse(token=token, expires_at=expires_at)
-
-
-def _decode_with_grace(token: str) -> dict[str, Any]:
-    """Decode a widget token; allow expiry up to WIDGET_TOKEN_REFRESH_GRACE_SECONDS past exp.
-
-    M1: thin pass-through — `decode_widget_token` enforces signature + `exp`
-    + `typ == "widget"`. Grace-past-expiry for refresh is intentionally
-    deferred to Stage 5+ (where the WebSocket connection handler will own
-    the leeway policy in one place).
-    """
-    # Constant is referenced here to keep the policy documented next to its
-    # enforcement point; once Stage 5 wires the leeway, this function will
-    # pass it through to `jose.jwt.decode`.
-    _ = WIDGET_TOKEN_REFRESH_GRACE_SECONDS
-    return decode_widget_token(token)
+    expires_in = int((expires_at - datetime.now(UTC)).total_seconds())
+    return TokenResponse(token=token, expires_at=expires_at, expires_in=expires_in)

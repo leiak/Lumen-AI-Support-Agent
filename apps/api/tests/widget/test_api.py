@@ -93,6 +93,9 @@ async def test_token_endpoint_200_returns_valid_token(monkeypatch) -> None:
     body = resp.json()
     assert "token" in body and len(body["token"]) > 20
     assert "expires_at" in body
+    assert isinstance(body["expires_in"], int)
+    # 30 min TTL -> expires_in should be in (0, 30*60 + a few seconds slack)
+    assert 0 < body["expires_in"] <= 30 * 60 + 5
 
 
 @pytest.mark.asyncio
@@ -200,6 +203,8 @@ async def test_refresh_endpoint_200_with_valid_previous_token(monkeypatch) -> No
     body = resp.json()
     assert "token" in body and len(body["token"]) > 20
     assert "expires_at" in body
+    assert isinstance(body["expires_in"], int)
+    assert 0 < body["expires_in"] <= 30 * 60 + 5
     # verify the new token is itself a valid widget token
     from widget.tokens import decode_widget_token
 
@@ -207,3 +212,112 @@ async def test_refresh_endpoint_200_with_valid_previous_token(monkeypatch) -> No
     assert decoded["sub"] == "u_1"
     assert decoded["channel_id"] == ch.id
     assert decoded["typ"] == "widget"
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_admin_token(monkeypatch) -> None:
+    """An admin `access` token (typ != widget) must be rejected by refresh."""
+    from auth.jwt import create_access_token
+
+    admin_token = create_access_token(
+        tenant_id="t1",
+        user_id="u_admin",
+        role="admin",
+        extra={"typ": "access"},
+    )
+
+    async def fake_find_by_id(self, _id):
+        return None
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_find_by_id)
+
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/widget/token/refresh",
+            json={
+                "channel_id": "01HX_X",
+                "external_user_id": "u1",
+                "previous_token": admin_token,
+            },
+        )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_expired_token(monkeypatch) -> None:
+    """A widget token whose `exp` is in the past must be rejected."""
+    from widget.tokens import create_widget_token
+
+    ch = _make_channel()
+    expired_token, _ = create_widget_token(
+        channel=ch, external_user_id="u_1", ttl_seconds=-60
+    )
+
+    async def fake_find_by_id(self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_find_by_id)
+
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/widget/token/refresh",
+            json={
+                "channel_id": ch.id,
+                "external_user_id": "u_1",
+                "previous_token": expired_token,
+            },
+        )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_rejects_empty_channel_id() -> None:
+    """Empty channel_id should yield 422 from Pydantic validation."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/widget/token",
+            json={"channel_id": "", "external_user_id": "u1"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_refresh_endpoint_rejects_missing_previous_token() -> None:
+    """Missing previous_token should yield 422 from Pydantic validation."""
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/widget/token/refresh",
+            json={"channel_id": "01HX_X", "external_user_id": "u1"},
+        )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_token_endpoint_200_token_decodes_with_widget_claims(monkeypatch) -> None:
+    """The issued token must decode as a widget token with correct claims."""
+    from widget.tokens import decode_widget_token
+
+    ch = _make_channel()
+
+    async def fake_find_by_id(self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_find_by_id)
+
+    app = _build_app()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/widget/token",
+            json={"channel_id": ch.id, "external_user_id": "u_99"},
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    payload = decode_widget_token(body["token"])
+    assert payload["typ"] == "widget"
+    assert payload["channel_id"] == ch.id
+    assert payload["tenant_id"] == ch.tenant_id
+    assert payload["sub"] == "u_99"
