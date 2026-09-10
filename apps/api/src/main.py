@@ -39,3 +39,8 @@ async def health() -> JSONResponse:
     # 200 when all components are healthy; 503 when degraded so that load
     # balancers / k8s probes / alerting can detect the failure.
     return JSONResponse(status_code=200 if all_ok else 503, content=body)
+
+
+from auth.api import router as auth_router  # noqa: E402
+
+app.include_router(auth_router)
