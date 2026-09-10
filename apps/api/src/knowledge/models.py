@@ -49,6 +49,13 @@ from sqlalchemy.orm import Mapped, mapped_column
 from core.database import Base
 from knowledge.enums import ArticleSourceType, ArticleStatus
 
+# Default chunking parameters for new KnowledgeBase rows.
+# Source: M1 spec, section 6.1 - a token-window chunker tuned for
+# English prose fed into text-embedding-3-small (8192-token context,
+# roughly 5-6 pages per KB).
+DEFAULT_CHUNK_SIZE = 800
+DEFAULT_CHUNK_OVERLAP = 100
+
 
 class KnowledgeBase(Base):
     """A named collection of articles within a Tenant.
@@ -75,8 +82,12 @@ class KnowledgeBase(Base):
     embedding_model: Mapped[str] = mapped_column(
         String(100), nullable=False, default="text-embedding-3-small"
     )
-    chunk_size: Mapped[int] = mapped_column(Integer, nullable=False, default=800)
-    chunk_overlap: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    chunk_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=DEFAULT_CHUNK_SIZE
+    )
+    chunk_overlap: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=DEFAULT_CHUNK_OVERLAP
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -93,10 +104,13 @@ class Article(Base):
 
     The body lives on ``ArticleVersion`` — every re-index creates a new
     version, so this row carries only metadata + lifecycle status.
-    ``current_version_id`` is set after the first successful version is
-    created and stays stable across re-indexes; it is a soft FK (no
-    DB-level FK constraint) because PostgreSQL doesn't support deferred
-    FKs to rows that don't exist yet at insert time.
+    ``current_version_id`` is a real FK to ``article_versions.id`` but
+    is nullable. Article creation proceeds in three steps: INSERT the
+    article with ``current_version_id=NULL``, INSERT the version row,
+    then UPDATE ``article.current_version_id`` to point at it. Because
+    the column is NULL at insert time, no deferral is needed. ``ondelete``
+    is ``SET NULL`` so a direct ``DELETE FROM article_versions`` doesn't
+    leave a dangling pointer on the article.
     """
 
     __tablename__ = "articles"
@@ -129,7 +143,11 @@ class Article(Base):
     status: Mapped[ArticleStatus] = mapped_column(
         String(20), nullable=False, default=ArticleStatus.DRAFT
     )
-    current_version_id: Mapped[str | None] = mapped_column(String(26), nullable=True)
+    current_version_id: Mapped[str | None] = mapped_column(
+        String(26),
+        ForeignKey("article_versions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

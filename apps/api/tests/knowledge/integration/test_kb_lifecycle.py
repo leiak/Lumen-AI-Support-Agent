@@ -72,6 +72,32 @@ async def _count(table: type) -> int:
         return int(result.scalar() or 0)
 
 
+async def _count_for_tenant(model: type, tenant_id: str) -> int:
+    """Count rows in ``model`` scoped to ``tenant_id``.
+
+    For models with a direct ``tenant_id`` column (``KnowledgeBase``,
+    ``Article``, ``Chunk``) we filter on that. For ``ArticleVersion`` —
+    which is keyed off ``article_id`` and carries no denormalized
+    ``tenant_id`` — we count versions whose article belongs to this
+    tenant. Scoping to the tenant keeps cascade-delete assertions from
+    leaking across tests.
+    """
+    async with get_session() as session:
+        if hasattr(model, "tenant_id"):
+            stmt = select(func.count()).select_from(model).where(
+                model.tenant_id == tenant_id
+            )
+        else:
+            # ArticleVersion: traverse via Article.tenant_id.
+            stmt = (
+                select(func.count())
+                .select_from(model)
+                .join(Article, model.article_id == Article.id)
+                .where(Article.tenant_id == tenant_id)
+            )
+        return int((await session.execute(stmt)).scalar() or 0)
+
+
 # ============================================================================
 # Test — create + cascade-delete end-to-end
 # ============================================================================
@@ -105,7 +131,6 @@ async def test_kb_lifecycle_and_tenant_cascade_delete() -> None:
         }
 
         # 2. KnowledgeBase
-        now_before = await _now()
         kb = KnowledgeBase(
             id=new_id(),
             tenant_id=tenant.id,
@@ -255,19 +280,24 @@ async def test_kb_lifecycle_and_tenant_cascade_delete() -> None:
         # with it because every FK is ON DELETE CASCADE.
         await _delete_tenant(tenant.id)
 
-        # 8. Verify every knowledge table is empty.
-        assert await _count(KnowledgeBase) == 0, "knowledge_bases not cleaned up"
-        assert await _count(Article) == 0, "articles not cleaned up"
-        assert await _count(ArticleVersion) == 0, "article_versions not cleaned up"
-        assert await _count(Chunk) == 0, "chunks not cleaned up"
+        # 8. Verify every knowledge table has zero rows for this tenant.
+        assert await _count_for_tenant(KnowledgeBase, tenant.id) == 0, (
+            "knowledge_bases not cleaned up"
+        )
+        assert await _count_for_tenant(Article, tenant.id) == 0, (
+            "articles not cleaned up"
+        )
+        assert await _count_for_tenant(ArticleVersion, tenant.id) == 0, (
+            "article_versions not cleaned up"
+        )
+        assert await _count_for_tenant(Chunk, tenant.id) == 0, (
+            "chunks not cleaned up"
+        )
 
         # Sanity: the tenant itself is also gone.
         async with get_session() as session:
             t = await session.get(Tenant, tenant.id)
             assert t is None
-
-        # Suppress the unused-variable linter complaint about now_before.
-        del now_before
     finally:
         # Belt-and-braces cleanup in case the test failed mid-way.
         await _delete_tenant(tenant.id)
@@ -279,7 +309,7 @@ async def test_kb_lifecycle_and_tenant_cascade_delete() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _now():
+def _now():
     from datetime import UTC, datetime
 
     return datetime.now(UTC)
