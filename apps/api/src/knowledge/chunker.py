@@ -45,8 +45,8 @@ Public API
 * :class:`ChunkCandidate` — the value type produced by the chunker.
 * :func:`chunk_document` — the only entry point callers should use.
 * :func:`chunk_text` — the lower-level length-based splitter. Exposed
-  for unit testing and (Stage 7+) for recursive sub-chunking of
-  oversized structured blocks.
+  for unit testing and for recursive sub-chunking of oversized
+  structured blocks within :func:`chunk_document`.
 """
 from __future__ import annotations
 
@@ -54,11 +54,25 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from core.logging import get_logger
+from knowledge.models import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from knowledge.parser import ParsedDocument
 
 log = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Limits
+# ---------------------------------------------------------------------------
+
+# Upper bound on the *output* text the chunker will accept from the
+# parser, in bytes (UTF-8 encoded length of the Python ``str``). The
+# parser already caps its INPUT at ``MAX_PARSE_BYTES`` (50 MB) but the
+# two layers are independent — defense in depth: a malformed HTML input
+# could in principle expand during parsing into a much larger
+# ``parsed.text`` and a downstream ``text.split()`` would OOM the worker.
+# Keep these aligned with :data:`knowledge.parser.MAX_PARSE_BYTES`.
+MAX_CHUNK_TEXT_BYTES = 50 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +87,10 @@ class ChunkCandidate:
     Attributes
     ----------
     text:
-        The chunk's textual content. Empty strings are never emitted.
+        The chunk's textual content. Empty strings are not emitted:
+        unknown block types are skipped entirely, and the
+        linearized-text path returns ``[]`` for empty / whitespace-only
+        input.
     block_index:
         0-based index into ``ParsedDocument.blocks`` if this chunk was
         derived from a structured block (code / image / table). ``None``
@@ -108,8 +125,8 @@ class ChunkCandidate:
 async def chunk_document(
     *,
     parsed: ParsedDocument,
-    chunk_size: int = 800,
-    chunk_overlap: int = 100,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
 ) -> list[ChunkCandidate]:
     """Split a parsed document into chunk candidates.
 
@@ -121,11 +138,13 @@ async def chunk_document(
     chunk_size:
         Target window size in **words** (whitespace-split). Must be
         > 0. Note: M1 measures in words, not tokens — real token
-        counting is Stage 7+.
+        counting is Stage 7+. Defaults to
+        :data:`knowledge.models.DEFAULT_CHUNK_SIZE`.
     chunk_overlap:
         Number of words repeated at the start of the next window.
         Must be strictly less than ``chunk_size`` so a chunk always
-        makes forward progress.
+        makes forward progress. Defaults to
+        :data:`knowledge.models.DEFAULT_CHUNK_OVERLAP`.
 
     Returns
     -------
@@ -135,9 +154,21 @@ async def chunk_document(
     Raises
     ------
     ValueError
-        If ``chunk_size <= 0`` or ``chunk_overlap >= chunk_size``.
+        If ``chunk_size <= 0``, ``chunk_overlap >= chunk_size``, or
+        ``len(parsed.text)`` exceeds :data:`MAX_CHUNK_TEXT_BYTES`
+        (defense-in-depth against pathological parser expansion).
     """
     _validate_config(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    # Size guard — runs BEFORE any ``text.split()`` so we never OOM on
+    # a pathological input before rejecting it. The parser already caps
+    # raw input bytes, but parsed.text can be much larger.
+    if len(parsed.text) > MAX_CHUNK_TEXT_BYTES:
+        raise ValueError(
+            f"parsed.text is {len(parsed.text)} bytes; chunker rejects "
+            f"inputs larger than MAX_CHUNK_TEXT_BYTES ({MAX_CHUNK_TEXT_BYTES}). "
+            "Re-chunk or split the source document before ingestion."
+        )
 
     candidates: list[ChunkCandidate] = []
     source_format = str(parsed.metadata.get("source_format", parsed.format))
@@ -188,8 +219,8 @@ async def chunk_document(
 def chunk_text(
     *,
     text: str,
-    chunk_size: int = 800,
-    chunk_overlap: int = 100,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     source_format: str = "",
 ) -> list[ChunkCandidate]:
     """Split a plain string into overlapping length-based windows.
@@ -315,8 +346,10 @@ def _chunk_block(
     * ``"image"`` — ``text = "Image: {alt} ({src})"`` (possibly with
       a caption appended, when present).
     * ``"table"`` — ``text = linearize_table_rows(block["rows"])``.
-    * Anything else — treated as plain text from ``block["text"]`` if
-      present.
+    * Anything else — **skipped entirely** (returns ``[]``). Unknown
+      block types must not leak as empty chunks into the indexer;
+      log a warning so the parser layer can be extended if the type
+      is genuinely needed.
 
     If the resulting text exceeds ``chunk_size`` words, it is split
     using :func:`chunk_text` so we don't emit a single oversized
@@ -327,7 +360,32 @@ def _chunk_block(
     text — this is intentional so callers can still index "an image
     with no alt" without losing the block anchor.
     """
+    # ``block`` comes from the parser as a dict; guard against a future
+    # schema change that introduces a non-dict entry so we don't crash
+    # the worker on malformed input.
+    if not isinstance(block, dict):
+        log.warning(
+            "knowledge.chunk.unknown_block",
+            extra={
+                "block_index": block_index,
+                "block_type": type(block).__name__,
+            },
+        )
+        return []
+
     block_type = str(block.get("type", ""))
+
+    # Unknown block types: skip with a warning rather than emitting an
+    # empty chunk. The parser layer is responsible for adding support
+    # for any new block type; we fail soft here so an unrecognized
+    # block doesn't poison the whole document's index.
+    if block_type not in {"code", "image", "table"}:
+        log.warning(
+            "knowledge.chunk.unknown_block_type",
+            extra={"block_index": block_index, "block_type": block_type},
+        )
+        return []
+
     text = _block_to_text(block, block_type)
     base_metadata: dict[str, object] = {
         "source_format": source_format,

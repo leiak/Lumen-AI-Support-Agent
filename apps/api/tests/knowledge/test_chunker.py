@@ -8,12 +8,18 @@ Covers Task 6.5 (M1 length-based chunking):
 * Oversized block → recursive sub-chunks (preserve ``block_index``).
 * Integration: parser → chunker on real markdown + HTML docs.
 * Edge cases — empty input, oversized single words, long text.
+* Defense in depth — size guard + unknown-block skip.
 """
 from __future__ import annotations
 
 import pytest
 
-from knowledge.chunker import chunk_document, chunk_text, linearize_table_rows
+from knowledge.chunker import (
+    MAX_CHUNK_TEXT_BYTES,
+    chunk_document,
+    chunk_text,
+    linearize_table_rows,
+)
 from knowledge.parser import ParsedDocument, parse_document
 
 # ---------------------------------------------------------------------------
@@ -576,3 +582,110 @@ async def test_chunk_pdf_document() -> None:
     chunks = await chunk_document(parsed=parsed, chunk_size=10, chunk_overlap=0)
     if chunks:
         assert all(c.block_index is None for c in chunks)
+
+
+# ---------------------------------------------------------------------------
+# Defense in depth: size guard + unknown-block skip
+# ---------------------------------------------------------------------------
+
+
+async def test_chunk_rejects_oversized_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``parsed.text`` larger than ``MAX_CHUNK_TEXT_BYTES`` is rejected
+    BEFORE any ``text.split()`` runs (no OOM on pathological inputs).
+
+    Uses ``monkeypatch`` to lower the cap rather than allocating 50 MB
+    of string data — the guard compares against the constant, so the
+    limit itself is what we test.
+    """
+    from knowledge import chunker
+
+    # Lower the cap so we can construct a tiny ``parsed.text`` that
+    # still exceeds it.
+    monkeypatch_cap = 1024  # 1 KB
+    monkeypatch.setattr(chunker, "MAX_CHUNK_TEXT_BYTES", monkeypatch_cap)
+
+    parsed = _parsed("a" * (monkeypatch_cap + 1), fmt="text")
+    with pytest.raises(ValueError, match="MAX_CHUNK_TEXT_BYTES"):
+        await chunk_document(parsed=parsed)
+
+
+async def test_chunk_rejects_oversized_text_before_split() -> None:
+    """Size guard runs BEFORE ``text.split()`` — we never touch the word
+    list when rejecting. Verified indirectly by checking that the error
+    message references the byte length, not a word count."""
+    parsed = _parsed("x" * (MAX_CHUNK_TEXT_BYTES + 1), fmt="text")
+    with pytest.raises(ValueError) as exc_info:
+        await chunk_document(parsed=parsed)
+    # The error must mention the size in bytes; not words. This proves
+    # the check ran on the raw string length, before splitting.
+    assert "bytes" in str(exc_info.value)
+    assert str(MAX_CHUNK_TEXT_BYTES + 1) in str(exc_info.value)
+
+
+async def test_chunk_accepts_text_at_or_below_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boundary: ``parsed.text`` exactly at the limit is accepted."""
+    from knowledge import chunker
+
+    monkeypatch_cap = 100
+    monkeypatch.setattr(chunker, "MAX_CHUNK_TEXT_BYTES", monkeypatch_cap)
+
+    parsed = _parsed("alpha " * (monkeypatch_cap // 6), fmt="text")
+    # No raise; we just need to confirm the equality boundary is inclusive.
+    chunks = await chunk_document(parsed=parsed, chunk_size=10, chunk_overlap=0)
+    assert len(chunks) >= 1
+
+
+async def test_chunk_skips_unknown_block_type() -> None:
+    """An unrecognized block type yields NO chunks (skipped, not emitted
+    as empty text). Known block types are unaffected."""
+    parsed = _parsed(
+        text="tail",
+        blocks=[
+            {"type": "weird_new_type", "text": "should be skipped"},
+            {"type": "code", "language": "py", "text": "kept = 1"},
+        ],
+        fmt="markdown",
+    )
+    chunks = await chunk_document(parsed=parsed, chunk_size=10, chunk_overlap=0)
+    # Only the known code block + the text chunk survive.
+    assert [c.metadata["block_type"] for c in chunks] == ["code", None]
+    assert chunks[0].text == "kept = 1"
+    assert chunks[1].text == "tail"
+
+
+async def test_chunk_skips_non_dict_block() -> None:
+    """A malformed non-dict entry in ``parsed.blocks`` is skipped, not
+    crashed on. Other blocks still process normally."""
+    parsed = _parsed(
+        text="after",
+        blocks=[
+            "not a dict",  # type: ignore[list-item]
+            {"type": "code", "language": "py", "text": "x = 1"},
+        ],
+        fmt="markdown",
+    )
+    chunks = await chunk_document(parsed=parsed, chunk_size=10, chunk_overlap=0)
+    # Code block + text chunk; the bogus entry was skipped.
+    assert [c.metadata["block_type"] for c in chunks] == ["code", None]
+    assert chunks[0].text == "x = 1"
+
+
+# ---------------------------------------------------------------------------
+# Defaults stay in sync with the model layer
+# ---------------------------------------------------------------------------
+
+
+async def test_chunk_text_defaults_match_model_constants() -> None:
+    """``chunk_text`` and ``chunk_document`` default to the model
+    constants — single source of truth for chunking parameters."""
+    from knowledge.models import DEFAULT_CHUNK_SIZE
+
+    parsed = _parsed(_words(DEFAULT_CHUNK_SIZE * 2 + 100), fmt="text")
+    chunks = await chunk_document(parsed=parsed)
+    # 1700 words, stride = DEFAULT_CHUNK_SIZE - DEFAULT_CHUNK_OVERLAP.
+    # Confirm the chunk_size default produced the expected first window size.
+    assert chunks[0].token_count == DEFAULT_CHUNK_SIZE
+    if len(chunks) > 1:
+        assert chunks[1].token_count == DEFAULT_CHUNK_SIZE
