@@ -51,6 +51,12 @@ _SUMMARIZE_SYSTEM_PROMPT = (
 )
 
 FALLBACK_MESSAGE = "抱歉,AI 助手暂时无法回复,请稍后再试或联系人工客服。"
+CHAT_TEMPERATURE = 0.7
+CHAT_MAX_TOKENS = 512
+SUMMARY_TEMPERATURE = 0.3
+SUMMARY_MAX_TOKENS = 200
+FALLBACK_TRANSCRIPT_CHARS = 1000
+FALLBACK_SUMMARY_CHARS = 500
 
 
 # Type alias for the per-tenant LLMClient factory. Stage 7+ may swap
@@ -110,7 +116,7 @@ class SimpleResponder:
         if not conv.ai_handling:
             logger.info(
                 "agent: conversation not in AI handling, skipping",
-                extra={"conversation_id": conversation_id},
+                extra={"tenant_id": tenant_id, "conversation_id": conversation_id},
             )
             return None
 
@@ -127,8 +133,8 @@ class SimpleResponder:
                     ),
                     *history,
                 ],
-                temperature=0.7,
-                max_tokens=512,
+                temperature=CHAT_TEMPERATURE,
+                max_tokens=CHAT_MAX_TOKENS,
             )
             response = await client.chat(request)
             if not response.content.strip():
@@ -185,8 +191,9 @@ class SimpleResponder:
         msgs = msgs or []
 
         if len(msgs) > MAX_HISTORY_BEFORE_SUMMARY:
-            # Conversation is longer than the LLM context window.
-            # Summarize the oldest, keep the latest MAX_HISTORY_MESSAGES verbatim.
+            # Conversation exceeds the no-summarize threshold.
+            # Summarize the oldest overflowing messages and keep the
+            # latest MAX_HISTORY_MESSAGES verbatim.
             to_summarize = msgs[:-MAX_HISTORY_MESSAGES]
             to_keep = msgs[-MAX_HISTORY_MESSAGES:]
             try:
@@ -208,26 +215,19 @@ class SimpleResponder:
                 )
                 transcript = "\n".join(
                     f"{m.role.value}: {m.content_text}" for m in to_summarize
-                )[:1000]
+                )[:FALLBACK_TRANSCRIPT_CHARS]
                 summary_message = LLMChatMessage(
                     role=LLMMessageRole.SYSTEM,
                     content=f"Earlier conversation (truncated):\n{transcript}",
                 )
-            mapped = [
-                mapped_msg
-                for mapped_msg in (self._map_message(m) for m in to_keep)
-                if mapped_msg is not None
-            ]
-            return [summary_message, *mapped]
+            mapped = [self._map_message(m) for m in to_keep]
+            return [summary_message, *[m for m in mapped if m is not None]]
 
         # Short conversation: keep the LATEST MAX_HISTORY_MESSAGES verbatim.
         # (Defensive slice in case the repository ignored `limit`.)
         kept = msgs[-MAX_HISTORY_MESSAGES:]
-        return [
-            mapped_msg
-            for mapped_msg in (self._map_message(x) for x in kept)
-            if mapped_msg is not None
-        ]
+        mapped = [self._map_message(m) for m in kept]
+        return [m for m in mapped if m is not None]
 
     def _map_message(self, m: Message) -> LLMChatMessage | None:
         """Map our ``Message`` ORM to an LLM ``ChatMessage``.
@@ -268,11 +268,19 @@ class SimpleResponder:
                 ),
                 LLMChatMessage(role=LLMMessageRole.USER, content=transcript),
             ],
-            temperature=0.3,
-            max_tokens=200,
+            temperature=SUMMARY_TEMPERATURE,
+            max_tokens=SUMMARY_MAX_TOKENS,
         )
-        response = await client.chat(request)
+        try:
+            response = await client.chat(request)
+        except Exception:
+            logger.warning(
+                "agent: summary LLM call failed, using truncated transcript",
+                extra={"tenant_id": tenant_id},
+                exc_info=True,
+            )
+            return transcript[:FALLBACK_SUMMARY_CHARS]
         summary = response.content.strip()
         if not summary:
-            return transcript[:500]
+            return transcript[:FALLBACK_SUMMARY_CHARS]
         return summary
