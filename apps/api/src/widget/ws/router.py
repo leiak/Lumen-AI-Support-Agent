@@ -13,13 +13,12 @@ from channel.inbound import process_inbound_envelope
 from channel.repository import ChannelRepository
 from widget.adapter import WebWidgetAdapter
 from widget.tokens import decode_widget_token
-from widget.ws.manager import ConnectionManager
+from widget.ws.manager import manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/widget", tags=["widget-ws"])
 
-# Module-level singleton — single-process M1 deployment.
-manager = ConnectionManager()
+__all__ = ["manager", "router", "websocket_endpoint"]
 
 
 @router.websocket("/ws")

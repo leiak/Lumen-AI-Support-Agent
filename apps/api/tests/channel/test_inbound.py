@@ -219,3 +219,133 @@ async def test_process_inbound_swallows_ai_responder_exception() -> None:
 
         # Only the customer message was recorded; AI attempt failed.
         assert mock_service.record_message.await_count == 1
+
+
+# ---- Task 5.4: WS message.complete push ----
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_broadcasts_message_complete_to_ws() -> None:
+    """AI message persistence triggers a message.complete WS broadcast."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch("channel.inbound._broadcast_ai_complete", new_callable=AsyncMock) as mock_bcast:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+
+        ai_msg = MagicMock(id="m_ai_1", role=MessageRole.AI, content_text="AI reply")
+        mock_service.record_message = AsyncMock(side_effect=[MagicMock(), ai_msg])
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(
+            return_value=AgentResponse(content_text="AI reply", role=MessageRole.AI)
+        )
+
+        await process_inbound_envelope(_envelope(channel_id="ch1"))
+
+        mock_bcast.assert_awaited_once_with(
+            channel_id="ch1",
+            conversation_id="c1",
+            message_id="m_ai_1",
+            role=MessageRole.AI,
+            content="AI reply",
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_broadcast_uses_persisted_message_id() -> None:
+    """The pushed message_id must be the persisted row id, not a fresh ULID.
+
+    The frontend dedupes the WS push against a follow-up REST fetch, so the
+    two must agree on the id.
+    """
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch("channel.inbound._broadcast_ai_complete", new_callable=AsyncMock) as mock_bcast:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1", tenant_id="t1", ai_handling=True, status=ConversationStatus.OPEN
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+
+        persisted = MagicMock(id="PERSISTED_ROW_ID", role=MessageRole.AI)
+        mock_service.record_message = AsyncMock(side_effect=[MagicMock(), persisted])
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(
+            return_value=AgentResponse(content_text="x", role=MessageRole.AI)
+        )
+
+        await process_inbound_envelope(_envelope())
+
+        assert mock_bcast.await_args.kwargs["message_id"] == "PERSISTED_ROW_ID"
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_skips_broadcast_when_no_ai_response() -> None:
+    """If AI returns None (e.g. conversation not ai_handling), no broadcast."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound._broadcast_ai_complete", new_callable=AsyncMock) as mock_bcast:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=False,
+            status=ConversationStatus.PENDING,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock()
+
+        await process_inbound_envelope(_envelope())
+
+        mock_bcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_skips_broadcast_on_cross_tenant_probe() -> None:
+    """A blocked cross-tenant probe must not emit anything onto the wire."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound._broadcast_ai_complete", new_callable=AsyncMock) as mock_bcast:
+        mock_service = mock_svc_cls.return_value
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=None)
+        mock_service.record_message = AsyncMock()
+
+        await process_inbound_envelope(_envelope())
+
+        mock_bcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_swallows_broadcast_failure() -> None:
+    """WS broadcast failure does not break the inbound path."""
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch("channel.inbound._broadcast_ai_complete", new_callable=AsyncMock) as mock_bcast:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+
+        ai_msg = MagicMock(id="m_ai_1", role=MessageRole.AI, content_text="reply")
+        mock_service.record_message = AsyncMock(side_effect=[MagicMock(), ai_msg])
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(
+            return_value=AgentResponse(content_text="reply", role=MessageRole.AI)
+        )
+        mock_bcast.side_effect = RuntimeError("WS down")
+
+        # Must not raise — the AI message is already durably persisted.
+        await process_inbound_envelope(_envelope())
+
+        assert mock_service.record_message.await_count == 2

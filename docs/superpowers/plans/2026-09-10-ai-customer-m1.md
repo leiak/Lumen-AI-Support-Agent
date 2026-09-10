@@ -2531,6 +2531,17 @@ def verify_feishu_signature(*, timestamp: str, nonce: str, body: bytes, encrypt_
 {"type": "message.complete", "conversation_id": "...", "message_id": "...", "content": "..."}
 ```
 
+> **M1 实现偏差(任务 5.4)**:M1 **只发 `message.complete`,不发 `message.delta`**。
+> 原因:M1 的 LLM client 未实现流式(`AnthropicProvider.stream` 抛
+> `NotImplementedError`),没有增量内容可转发。事件在 AI 消息**持久化之后**发出,
+> `message_id` 用的是落库后的真实行 ID(便于前端与 REST 查询去重)。
+> 实际 payload 比上面多一个 `role` 字段(值为 `"ai"`)。
+> 阶段 7 接入 LangGraph 真流式后,在现有 `message.complete` 之前补发
+> `message.delta` 即可,完成帧的契约不变。
+> 广播走 `widget.ws.manager.manager` 这个**唯一**进程级单例
+> (`widget.ws.router` 管连接生命周期,`channel.inbound` 管服务端推送;
+> 若各自 new 一个实例,广播会静默发给 0 个客户端)。
+
 **任务清单**:
 - 5.1 Conversation + Message 模型与迁移(含 RLS 策略)
 - 5.2 渠道入站 → 创建/查找会话

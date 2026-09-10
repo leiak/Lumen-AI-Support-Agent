@@ -18,10 +18,23 @@ from widget.ws.router import router as widget_ws_router
 
 @pytest.fixture(autouse=True)
 def _reset_singletons(monkeypatch):
-    """Reset the WS manager singleton between tests."""
+    """Reset the WS manager singleton between tests.
+
+    The manager is shared by ``widget.ws.router`` (which owns the connection
+    lifecycle) and ``channel.inbound`` (which broadcasts server-initiated
+    events). Every module-level alias must be rebound to the SAME fresh
+    instance — otherwise a broadcast targets a different connection table
+    than the one the socket registered itself in, and silently delivers to
+    nobody.
+    """
+    import channel.inbound as inbound_module
+    from widget.ws import manager as ws_manager_module
     from widget.ws import router as ws_router_module
 
-    monkeypatch.setattr(ws_router_module, "manager", ConnectionManager())
+    fresh = ConnectionManager()
+    monkeypatch.setattr(ws_manager_module, "manager", fresh)
+    monkeypatch.setattr(ws_router_module, "manager", fresh)
+    monkeypatch.setattr(inbound_module, "_wsm", fresh)
 
 
 def _channel() -> Channel:
@@ -176,6 +189,123 @@ async def test_cross_adapter_envelope_consistency_real() -> None:
     assert widget_envelope.attachments == []
     assert isinstance(feishu_envelope.received_at, datetime)
     assert isinstance(widget_envelope.received_at, datetime)
+
+
+def test_widget_client_receives_message_complete_after_ai_response(monkeypatch) -> None:
+    """End-to-end: WS client connects -> sends message -> receives AI message.complete.
+
+    Exercises the real `process_inbound_envelope` -> `_broadcast_ai_complete`
+    -> `ConnectionManager.broadcast_to_channel` -> socket path. Only the DB
+    (ConversationService) and the LLM (SimpleResponder) are mocked.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent.simple_responder import AgentResponse
+    from channel.repository import ChannelRepository
+    from conversation.enums import ConversationStatus, MessageRole
+
+    ch = _channel()
+    token, _ = create_widget_token(channel=ch, external_user_id="u_e2e")
+
+    async def fake_get_by_id(_self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+
+    # Mock DB: conversation is OPEN + ai_handling, so the AI path fires.
+    conv = MagicMock(
+        id="conv_e2e_1",
+        tenant_id=ch.tenant_id,
+        ai_handling=True,
+        status=ConversationStatus.OPEN,
+    )
+    ai_message_id = new_id()
+    mock_service = MagicMock()
+    mock_service.find_or_create_for_inbound = AsyncMock(return_value=conv)
+    mock_service.record_message = AsyncMock(
+        side_effect=[
+            MagicMock(id=new_id(), role=MessageRole.CUSTOMER),
+            MagicMock(id=ai_message_id, role=MessageRole.AI),
+        ]
+    )
+    monkeypatch.setattr(
+        "channel.inbound.ConversationService", lambda *a, **kw: mock_service
+    )
+
+    # Mock LLM.
+    mock_responder = MagicMock()
+    mock_responder.respond = AsyncMock(
+        return_value=AgentResponse(content_text="AI says hi", role=MessageRole.AI)
+    )
+    monkeypatch.setattr(
+        "channel.inbound.SimpleResponder", lambda *a, **kw: mock_responder
+    )
+
+    testclient = TestClient(_make_app())
+    with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
+        ws.send_json({"type": "message", "text": "hi"})
+
+        # Two frames come back. The broadcast is emitted from inside
+        # process_inbound_envelope, which the endpoint awaits *before*
+        # sending the ack — so message.complete arrives first. Index by
+        # type rather than depending on that ordering.
+        frames = {}
+        for _ in range(2):
+            frame = ws.receive_json()
+            frames[frame["type"]] = frame
+
+        assert set(frames) == {"ack", "message.complete"}
+        assert len(frames["ack"]["external_message_id"]) > 0
+
+        complete = frames["message.complete"]
+        assert complete == {
+            "type": "message.complete",
+            "conversation_id": "conv_e2e_1",
+            "message_id": ai_message_id,
+            "role": "ai",
+            "content": "AI says hi",
+        }
+        # The id is the persisted row's ULID, so a follow-up REST fetch dedupes.
+        assert len(complete["message_id"]) == 26
+
+
+def test_widget_client_gets_no_message_complete_when_ai_disabled(monkeypatch) -> None:
+    """A human-handled conversation yields an ack only — no AI push."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from channel.repository import ChannelRepository
+    from conversation.enums import ConversationStatus
+
+    ch = _channel()
+    token, _ = create_widget_token(channel=ch, external_user_id="u_e2e")
+
+    async def fake_get_by_id(_self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+
+    conv = MagicMock(
+        id="conv_e2e_2",
+        tenant_id=ch.tenant_id,
+        ai_handling=False,
+        status=ConversationStatus.PENDING,
+    )
+    mock_service = MagicMock()
+    mock_service.find_or_create_for_inbound = AsyncMock(return_value=conv)
+    mock_service.record_message = AsyncMock(return_value=MagicMock(id=new_id()))
+    monkeypatch.setattr(
+        "channel.inbound.ConversationService", lambda *a, **kw: mock_service
+    )
+
+    testclient = TestClient(_make_app())
+    with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
+        ws.send_json({"type": "message", "text": "hi"})
+        assert ws.receive_json()["type"] == "ack"
+
+        # Nothing else should be queued: a ping round-trip must come back
+        # as the very next frame.
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
 
 
 def test_widget_ws_rejects_garbage_token_integration(monkeypatch) -> None:

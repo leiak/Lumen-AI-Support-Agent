@@ -95,3 +95,17 @@ class ConnectionManager:
             if ok:
                 delivered += 1
         return delivered
+
+
+# Process-wide singleton — single-process M1 deployment.
+#
+# This MUST be the one and only instance: `widget.ws.router` owns the
+# connection lifecycle (connect/disconnect) while `channel.inbound` performs
+# server-initiated broadcasts. If each module instantiated its own
+# ConnectionManager they would hold separate connection tables and every
+# broadcast would silently deliver to zero clients.
+#
+# It lives here rather than in `widget.ws.router` because `router` imports
+# `channel.inbound.process_inbound_envelope`; importing back the other way
+# would be a circular import. This module depends on nothing but core.id_gen.
+manager = ConnectionManager()

@@ -2,13 +2,23 @@
 
 Bridges the MessageEnvelope emitted by channel adapters with the
 ConversationService: ensures a conversation exists for the (channel, customer)
-pair and persists the inbound message.
+pair, persists the inbound message, triggers an AI auto-response if applicable,
+and broadcasts a ``message.complete`` event to any connected widget clients.
 
 The processor is best-effort: any error is logged and swallowed so the
 caller (webhook or WS handler) can always return 200 to the channel
 provider. The channel provider's payload is the source of truth; retrying
 on our DB error would cause duplicate customer messages on eventual
 recovery.
+
+M1 limitation — no token streaming
+----------------------------------
+We emit a single ``message.complete`` frame *after* the AI message is
+persisted; there are no ``message.delta`` frames. The M1 LLM client does not
+implement streaming (``AnthropicProvider.stream`` raises NotImplementedError),
+so there is nothing incremental to forward. The event envelope is shaped so
+Stage 7 can add ``message.delta`` frames ahead of the existing
+``message.complete`` without changing the completion contract.
 """
 from __future__ import annotations
 
@@ -19,7 +29,52 @@ from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
 
+# The shared process-wide connection table. Imported by reference (not
+# instantiated here) so that widget.ws.router — which owns the connection
+# lifecycle — and this module broadcast into the *same* set of sockets.
+from widget.ws.manager import manager as _wsm
+
 logger = logging.getLogger(__name__)
+
+
+async def _broadcast_ai_complete(
+    *,
+    channel_id: str,
+    conversation_id: str,
+    message_id: str,
+    role: MessageRole,
+    content: str,
+) -> None:
+    """Best-effort WS broadcast of an AI ``message.complete`` event.
+
+    Wrapped in try/except so a WS failure (dead socket, serialisation error)
+    never breaks the inbound path — the message is already durably persisted,
+    and the client can recover the missed event via the REST message list.
+
+    ``message_id`` is the *persisted* row id, which lets the frontend dedupe
+    this push against a subsequent REST fetch.
+    """
+    try:
+        await _wsm.broadcast_to_channel(
+            channel_id=channel_id,
+            payload={
+                "type": "message.complete",
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "role": role.value,
+                "content": content,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "channel inbound: WS broadcast failed",
+            extra={
+                "channel_id": channel_id,
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+            },
+            exc_info=True,
+        )
 
 
 async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
@@ -41,7 +96,8 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
             customer_external_id=envelope.external_user_id,
         )
         if conversation is None:
-            # Cross-tenant guard tripped — log and drop.
+            # Cross-tenant guard tripped — log and drop. No broadcast: we
+            # must not leak the existence of another tenant's conversation.
             logger.warning(
                 "channel inbound: cross-tenant probe blocked",
                 extra={
@@ -67,11 +123,21 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
                 conversation_id=conversation.id,
             )
             if ai_response is not None:
-                await conv_service.record_message(
+                ai_message = await conv_service.record_message(
                     tenant_id=envelope.tenant_id,
                     conversation_id=conversation.id,
                     role=ai_response.role,
                     content_text=ai_response.content_text,
+                )
+                # Push to any widget clients subscribed to this channel.
+                # Deliberately after the persist so the event carries a real
+                # row id and can never describe a message that isn't durable.
+                await _broadcast_ai_complete(
+                    channel_id=envelope.channel_id,
+                    conversation_id=conversation.id,
+                    message_id=ai_message.id,
+                    role=ai_response.role,
+                    content=ai_response.content_text,
                 )
                 logger.info(
                     "channel inbound: AI auto-response recorded",
