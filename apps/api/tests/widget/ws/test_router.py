@@ -123,6 +123,14 @@ async def test_ws_endpoint_message_frame_yields_ack(
 
     monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
 
+    # Stub persistence so we don't need a DB for this transport-level test.
+    async def fake_process(_env):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "widget.ws.router.process_inbound_envelope", fake_process
+    )
+
     testclient = TestClient(_make_app())
     with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
         ws.send_json({"type": "message", "text": "hi"})

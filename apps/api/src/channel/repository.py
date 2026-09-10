@@ -1,4 +1,5 @@
 """Repository for Channel rows."""
+import json
 from typing import Any
 
 from sqlalchemy import select
@@ -106,3 +107,27 @@ class ChannelRepository:
     async def soft_delete(self, channel_id: str) -> Channel | None:
         """Soft-delete: flip status to DISABLED. Returns updated row, or None if not found."""
         return await self.update_status(channel_id, ChannelStatus.DISABLED)
+
+    async def get_by_app_id(self, app_id: str) -> Channel | None:
+        """Look up a FEISHU channel by its app_id stored in ``credentials_encrypted``.
+
+        ``app_id`` is Feishu-specific — we filter to FEISHU channel type and
+        scan the (small) set of FEISHU rows in M1, parsing the credentials
+        JSON per row. Suitable for low-volume webhook lookup; revisit if the
+        channel count grows large enough to warrant a dedicated column.
+
+        Returns the matching Channel, or None if no FEISHU channel has that
+        app_id. Channels whose ``credentials_encrypted`` is malformed JSON
+        are silently skipped (logged at debug).
+        """
+        async with get_session() as session:
+            stmt = select(Channel).where(Channel.type == ChannelType.FEISHU)
+            result = await session.execute(stmt)
+            for ch in result.scalars().all():
+                try:
+                    creds = json.loads(ch.credentials_encrypted)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(creds, dict) and creds.get("app_id") == app_id:
+                    return ch
+        return None

@@ -71,8 +71,38 @@ def _sign(body: bytes, timestamp: str, nonce: str = "nonce1") -> str:
 
 
 @pytest.mark.asyncio
-async def test_feishu_inbound_e2e_signed_payload(feishu_app: FastAPI) -> None:
-    """Webhook accepts a signed Feishu text event and returns 200."""
+async def test_feishu_inbound_e2e_signed_payload(monkeypatch, feishu_app: FastAPI) -> None:
+    """Webhook accepts a signed Feishu text event and returns 200.
+
+    Task 5.2 wires persistence. The unit-level e2e now stubs the channel
+    lookup + persistence processor so it tests the HTTP path only; full
+    DB-backed coverage lives in
+    ``tests/channel/integration/test_feishu_inbound_pipeline.py``.
+    """
+    from channel.repository import ChannelRepository
+
+    fake_ch = Channel(
+        id=new_id(),
+        tenant_id=new_id(),
+        type=ChannelType.FEISHU,
+        name="x",
+        status=ChannelStatus.ACTIVE,
+        credentials_encrypted=json.dumps({"app_id": "cli_test_app"}),
+        created_at=datetime.now(UTC),
+    )
+
+    async def fake_get_by_app_id(self, app_id):  # type: ignore[no-untyped-def]
+        return fake_ch if app_id == "cli_test_app" else None
+
+    monkeypatch.setattr(ChannelRepository, "get_by_app_id", fake_get_by_app_id)
+
+    async def fake_process(_env):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "channel.feishu.webhook.process_inbound_envelope", fake_process
+    )
+
     body = _text_event(chat_id="oc_1", open_id="ou_user_1", message_id="om_1", text="hello")
     ts = str(int(time.time()))
     sig = _sign(body, ts)
@@ -94,8 +124,34 @@ async def test_feishu_inbound_e2e_signed_payload(feishu_app: FastAPI) -> None:
 
 
 @pytest.mark.asyncio
-async def test_feishu_webhook_returns_200_and_acks_quickly(feishu_app: FastAPI) -> None:
-    """Webhook ACKs 200 immediately (Feishu requires quick ACK). Persistence is Stage 5."""
+async def test_feishu_webhook_returns_200_and_acks_quickly(
+    monkeypatch, feishu_app: FastAPI
+) -> None:
+    """Webhook ACKs 200 immediately (Feishu requires quick ACK)."""
+    from channel.repository import ChannelRepository
+
+    fake_ch = Channel(
+        id=new_id(),
+        tenant_id=new_id(),
+        type=ChannelType.FEISHU,
+        name="x",
+        status=ChannelStatus.ACTIVE,
+        credentials_encrypted=json.dumps({"app_id": "cli_test_app"}),
+        created_at=datetime.now(UTC),
+    )
+
+    async def fake_get_by_app_id(self, app_id):  # type: ignore[no-untyped-def]
+        return fake_ch if app_id == "cli_test_app" else None
+
+    monkeypatch.setattr(ChannelRepository, "get_by_app_id", fake_get_by_app_id)
+
+    async def fake_process(_env):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "channel.feishu.webhook.process_inbound_envelope", fake_process
+    )
+
     body = _text_event(chat_id="oc_ack", open_id="ou_ack", message_id="om_ack", text="hi")
     ts = str(int(time.time()))
     sig = _sign(body, ts)

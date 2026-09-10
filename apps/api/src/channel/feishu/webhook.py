@@ -6,11 +6,14 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import JSONResponse
 
+from channel.feishu.adapter import FeishuAdapter
 from channel.feishu.signature import (
     decrypt_feishu_event,
     verify_feishu_signature,
     verify_timestamp_freshness,
 )
+from channel.inbound import process_inbound_envelope
+from channel.repository import ChannelRepository
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +48,21 @@ async def receive_webhook(
     """Receive a Feishu event.
 
     Verifies signature + timestamp freshness, decrypts if the event is
-    AES-wrapped, and ACKs with 200. Parsing into a MessageEnvelope and
-    persisting the binding is the caller's responsibility — this handler
-    only handles the transport-level concerns.
+    AES-wrapped, resolves the channel by ``app_id``, parses the event into
+    a MessageEnvelope via the FeishuAdapter, and hands it off to the
+    channel-agnostic inbound processor for conversation/message
+    persistence.
 
-    TODO(Task 4.13): resolve `app_id` -> Channel via the repository, look up
-    the per-tenant encrypt_key from `credentials_encrypted`, and reject
-    unknown apps with 404. For M1 we accept any `app_id` and use a stub
-    encrypt_key — see `M1_STUB_ENCRYPT_KEY`.
+    M1 limitation: signature verification uses ``M1_STUB_ENCRYPT_KEY``
+    rather than the per-tenant key stored on the channel row — see
+    ``M1_STUB_ENCRYPT_KEY`` for the security warning. The only protection
+    against forged webhooks from an unrelated tenant is the 404-on-unknown
+    app_id below; do not expose M1 deployments to the public Internet.
     """
     body = await request.body()
+    # M1: signature verification uses the stub encrypt key — see warning
+    # in M1_STUB_ENCRYPT_KEY. Task 4.13 wires up real per-tenant credential
+    # lookup. Persistence is wired in Task 5.2 — see channel/inbound.py.
     encrypt_key = M1_STUB_ENCRYPT_KEY
 
     ts = x_lark_request_timestamp or ""
@@ -112,5 +120,18 @@ async def receive_webhook(
             status_code=200, content={"challenge": payload["challenge"]}
         )
 
-    # For M1 we just ACK; persistence happens in Stage 5 (会话 + 消息).
+    # Resolve channel by app_id, parse envelope, persist via the
+    # channel-agnostic inbound processor. process_inbound_envelope swallows
+    # persistence errors and logs them, so we always ACK 200 to Feishu.
+    channel_repo = ChannelRepository()
+    channel = await channel_repo.get_by_app_id(app_id)
+    if channel is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"unknown app_id {app_id}"},
+        )
+
+    adapter = FeishuAdapter()
+    envelope = await adapter.parse_inbound(raw=payload, channel=channel)
+    await process_inbound_envelope(envelope)
     return JSONResponse(status_code=200, content={"ok": True})

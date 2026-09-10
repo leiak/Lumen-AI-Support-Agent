@@ -9,8 +9,9 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 
 from auth.jwt import TokenError
 from channel.enums import ChannelStatus
+from channel.inbound import process_inbound_envelope
 from channel.repository import ChannelRepository
-from core.id_gen import new_id
+from widget.adapter import WebWidgetAdapter
 from widget.tokens import decode_widget_token
 from widget.ws.manager import ConnectionManager
 
@@ -96,10 +97,16 @@ async def websocket_endpoint(
                 # No-op for M1; Stage 5 will broadcast typing events.
                 pass
             elif frame_type == "message":
-                # Defer persistence to Stage 5 (会话 + 消息).
+                # Parse via the widget adapter, persist via the channel-agnostic
+                # inbound processor, then ACK with the resulting conversation_id
+                # so the frontend can refresh its state. Full WS protocol
+                # (broadcast envelope, etc.) is a Stage 5+ concern.
+                adapter = WebWidgetAdapter()
+                envelope = await adapter.parse_inbound(raw=frame, channel=channel)
+                await process_inbound_envelope(envelope)
                 await websocket.send_json({
                     "type": "ack",
-                    "external_message_id": new_id(),
+                    "external_message_id": envelope.envelope_id,
                 })
             else:
                 await websocket.send_json(
