@@ -75,3 +75,34 @@ class ChannelRepository:
             await session.commit()
             await session.refresh(channel)
             return channel
+
+    async def update(
+        self,
+        channel_id: str,
+        *,
+        name: str | None = None,
+        credentials_encrypted: str | None = None,
+        status: ChannelStatus | None = None,
+    ) -> Channel | None:
+        """Patch a channel's mutable fields. Returns updated row, or None if not found.
+
+        Only the fields that are explicitly provided (not None) are modified.
+        The caller is expected to enforce tenant scoping before calling.
+        """
+        async with get_session() as session:
+            channel = await session.get(Channel, channel_id)
+            if channel is None:
+                return None
+            if name is not None:
+                channel.name = name
+            if credentials_encrypted is not None:
+                channel.credentials_encrypted = credentials_encrypted
+            if status is not None:
+                channel.status = status
+            await session.commit()
+            await session.refresh(channel)
+            return channel
+
+    async def soft_delete(self, channel_id: str) -> Channel | None:
+        """Soft-delete: flip status to DISABLED. Returns updated row, or None if not found."""
+        return await self.update_status(channel_id, ChannelStatus.DISABLED)
