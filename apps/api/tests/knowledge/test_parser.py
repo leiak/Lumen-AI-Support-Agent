@@ -103,7 +103,14 @@ async def test_parse_text_returns_decoded_content() -> None:
 
 
 async def test_parse_markdown_strips_headers_and_code_fences() -> None:
-    """Headers lose their ``#`` prefix; code-fence content is preserved."""
+    """Headers lose their ``#`` prefix; code-fence content is moved to blocks.
+
+    Task 6.4 changed the contract: fenced code blocks are extracted
+    into ``ParsedDocument.blocks`` (as ``{"type": "code", ...}``) and
+    REMOVED from the linearized ``text`` so the chunker (Task 6.5) can
+    keep each code block as its own chunk. The inner code is no longer
+    expected to appear in ``text``; it lives on the blocks list.
+    """
     md = b"""# Title
 
 Some intro text.
@@ -125,10 +132,16 @@ More prose after the fence.
     assert "Title" in result.text
     assert "##" not in result.text
     assert "Section 1" in result.text
-    # Code-fence markers are gone but the inner text is kept.
+    # Code-fence markers AND inner code are gone from text — the
+    # chunker will see them via the blocks list instead.
     assert "```" not in result.text
-    assert 'print("inside a code fence")' in result.text
+    assert "inside a code fence" not in result.text
     assert "More prose after the fence." in result.text
+    # The code block is captured as a structured block.
+    code_blocks = [b for b in result.blocks if b.get("type") == "code"]
+    assert len(code_blocks) == 1
+    assert code_blocks[0]["language"] == "python"
+    assert 'print("inside a code fence")' in str(code_blocks[0]["text"])
 
 
 async def test_parse_html_extracts_visible_text_only() -> None:

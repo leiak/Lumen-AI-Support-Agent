@@ -37,6 +37,11 @@ from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
 from core.logging import get_logger
+from knowledge.multimodal import (
+    _extract_html_blocks,
+    _extract_markdown_blocks,
+    strip_markdown_blocks,
+)
 
 log = get_logger(__name__)
 
@@ -340,15 +345,16 @@ def _parse_text(content: bytes) -> ParsedDocument:
 
 # Markdown → plain text via regex normalization. We deliberately do NOT
 # render to HTML (saves a dep + a rendering pass) and we do NOT preserve
-# every markdown feature (tables, footnotes, ...) — chunking + embedding
-# benefit from linearized prose.
-_MD_CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
+# every markdown feature (footnotes, ...) — chunking + embedding benefit
+# from linearized prose. Fenced code blocks and inline images are
+# extracted as structured blocks via ``knowledge.multimodal``; their
+# spans are stripped from ``text`` so the chunker doesn't double-embed
+# them.
 _MD_HEADER_PREFIX_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _MD_ITALIC_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
-_MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
-_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 # Blockquote marker at line start: '> ' → ''.
 _MD_BLOCKQUOTE_RE = re.compile(r"^>\s*", re.MULTILINE)
 # Horizontal rules: ---, ***, ___ on their own line.
@@ -356,73 +362,104 @@ _MD_HR_RE = re.compile(r"^\s*([-*_])\s*\1\s*\1[\s\1]*$", re.MULTILINE)
 
 
 def _parse_markdown(content: bytes) -> ParsedDocument:
-    """Convert Markdown to plain text using regex normalization.
+    """Convert Markdown to plain text + structured blocks.
 
     Stripping order matters:
 
-    1. Code fences first (preserves inner text from further mangling).
-    2. Headers (keep the text, drop the ``#`` prefix).
-    3. Bold/italic (unbalanced markers are left alone — better to keep
+    1. Headers (keep the text, drop the ``#`` prefix).
+    2. Bold/italic (unbalanced markers are left alone — better to keep
        stray ``*`` than to lose real text).
-    4. Links ``[text](url)`` → ``text (url)``.
-    5. Inline code → keep the text.
-    6. Images → drop (alt text would be noise; URLs are not useful in
-       embeddings).
-    7. Blockquotes + horizontal rules.
+    3. Inline code → keep the text (single-line backticks only; do
+       NOT span newlines — fenced code blocks are handled below).
+    4. Blockquotes + horizontal rules.
+    5. **Multimodal extraction**: fenced code blocks + inline images
+       are pulled out into ``blocks`` BEFORE the link regex runs,
+       because the link regex would otherwise swallow
+       ``![alt](src)`` as a regular ``[alt](src)`` link. The block
+       spans are then stripped from ``text`` so the linearized view
+       doesn't double-embed them.
+    6. Links ``[text](url)`` → ``text (url)`` on whatever's left.
     """
     text = content.decode("utf-8", errors="replace")
 
-    # 1. Code fences: keep inner content, drop the ``` markers.
-    text = _MD_CODE_FENCE_RE.sub(lambda m: m.group(0).replace("```", ""), text)
-
-    # 2. Headers.
+    # 1. Headers.
     text = _MD_HEADER_PREFIX_RE.sub("", text)
 
-    # 3. Bold + italic.
+    # 2. Bold + italic.
     text = _MD_BOLD_RE.sub(r"\1", text)
     text = _MD_ITALIC_RE.sub(r"\1", text)
 
-    # 4. Links: [text](url) → text (url)
-    text = _MD_LINK_RE.sub(r"\1 (\2)", text)
-
-    # 5. Inline code.
+    # 3. Inline code (single-line only — fences are handled below).
     text = _MD_INLINE_CODE_RE.sub(r"\1", text)
 
-    # 6. Images.
-    text = _MD_IMAGE_RE.sub("", text)
-
-    # 7. Blockquotes + horizontal rules.
+    # 4. Blockquotes + horizontal rules.
     text = _MD_BLOCKQUOTE_RE.sub("", text)
     text = _MD_HR_RE.sub("", text)
+
+    # 5. Multimodal extraction. Run BEFORE the link regex because the
+    #    link regex would otherwise treat `![alt](src)` as a regular
+    #    link and rewrite it as `alt (src)` before we ever see it.
+    blocks = _extract_markdown_blocks(text)
+    text = strip_markdown_blocks(text, blocks)
+
+    # 6. Links: [text](url) → text (url). Run last so the
+    #    image syntax was already stripped by step 5.
+    text = _MD_LINK_RE.sub(r"\1 (\2)", text)
 
     text = text.strip()
     return ParsedDocument(
         text=text,
-        blocks=[],
-        metadata={"source_format": "markdown", "char_count": len(text)},
+        blocks=blocks,
+        metadata={
+            "source_format": "markdown",
+            "char_count": len(text),
+            "block_count": len(blocks),
+        },
         format="markdown",
     )
 
 
 def _parse_html(content: bytes) -> ParsedDocument:
-    """Extract visible text from HTML.
+    """Extract visible text + structured blocks from HTML.
 
     Security: ``<script>`` and ``<style>`` tags (and ``<noscript>``) are
     decomposed entirely before text extraction — we must NEVER carry
     inline JS into the embedding pipeline.
+
+    Multimodal: ``<img>`` (with optional ``<figcaption>`` from the
+    parent ``<figure>``) and ``<table>`` are pulled into the
+    ``blocks`` list via :mod:`knowledge.multimodal`; the image and
+    table nodes are then removed from the soup so their text doesn't
+    double-embed into ``text``.
     """
+    # Multimodal extraction FIRST — on the full HTML (before we mutate
+    # the soup). The helper is sync; it handles malformed HTML
+    # defensively and never raises.
+    blocks = _extract_html_blocks(content)
+
     soup = BeautifulSoup(content, "html.parser")
     # Drop executable / non-visible content. decompose() removes the
     # node AND its text, which is what we want for security.
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
+    # Strip images + tables from the linearized text — they now live
+    # on the ``blocks`` list and should not be embedded twice.
+    for tag in soup(["img"]):
+        tag.decompose()
+    for tag in soup(["table"]):
+        tag.decompose()
+
     # separator keeps block boundaries visible to the chunker; strip=True
     # removes the noisy leading/trailing whitespace each tag introduces.
     text = soup.get_text(separator="\n", strip=True)
     return ParsedDocument(
         text=text,
-        blocks=[],
-        metadata={"source_format": "html", "char_count": len(text)},
+        blocks=blocks,
+        metadata={
+            "source_format": "html",
+            "char_count": len(text),
+            "block_count": len(blocks),
+        },
         format="html",
     )
 
