@@ -5,6 +5,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.settings import Environment
 
+# Known dev/test secret patterns. The actual .env example uses the second
+# one. Production must reject any of these to prevent the
+# classic "deployed with .env default" footgun.
+_KNOWN_DEV_SECRETS: frozenset[str] = frozenset(
+    {
+        "dev-secret",
+        "dev-secret-please-change-in-production-32chars",
+        "test-secret-32-chars-minimum-length",
+    }
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -47,8 +58,8 @@ class Settings(BaseSettings):
     def _validate_jwt_secret(self) -> Self:
         if len(self.jwt_secret) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
-        if self.environment == Environment.PRODUCTION and self.jwt_secret == "dev-secret":  # noqa: S105
-            raise ValueError("Refusing to use dev secret in production")
+        if self.environment == Environment.PRODUCTION and self.jwt_secret in _KNOWN_DEV_SECRETS:
+            raise ValueError("Refusing to use known dev/test secret in production")
         return self
 
 
@@ -60,3 +71,9 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings()  # type: ignore[call-arg]
     return _settings
+
+
+def reset_settings() -> None:
+    """Clear the cached settings singleton. For test isolation only."""
+    global _settings
+    _settings = None
