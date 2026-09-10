@@ -71,6 +71,7 @@ explicit_package_bases = true
 
 [dependency-groups]
 dev = [
+    "pytest-httpx>=0.36.2",
     "types-passlib>=1.7.7.20260211",
     "types-python-jose>=3.5.0.20260408",
 ]
