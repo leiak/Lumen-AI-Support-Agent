@@ -1,16 +1,16 @@
-"""Cross-tenant broadcast isolation tests for ``ConnectionManager``.
+"""Channel-scoped broadcast isolation tests for ``ConnectionManager``.
 
-These are unit-style tests (no DB) that exercise the real
-``ConnectionManager`` against fake WebSocket doubles. They prove the two
-broadcast entrypoints are strictly tenant-scoped:
+Unit-style tests (no DB) that exercise the real ``ConnectionManager``
+against fake WebSocket doubles. They prove ``broadcast_to_channel`` is
+strictly channel-scoped: only connections whose ``channel_id`` matches
+receive the frame, even when other connections on the same tenant use
+different channel ids.
 
-  - ``broadcast_to_channel(channel_id=...)`` only reaches connections
-    whose ``channel_id`` matches. Connections on other channels — even
-    within the same tenant — must not receive the frame.
-
-  - ``broadcast_to_tenant(tenant_id=...)`` only reaches connections whose
-    ``tenant_id`` matches. Connections from other tenants — even on the
-    same channel id by coincidence — must not receive the frame.
+Tenant isolation in M1 is enforced at the connection layer in
+``widget/ws/router.py`` (the token's ``tenant_id`` must match the
+channel's ``tenant_id`` before the connection is registered), so once
+a connection exists it is always tenant-correct, and channel scoping
+on top is sufficient to keep frames from leaking across tenants.
 
 Why feed fakes straight into ``manager.connect`` instead of going through
 ``TestClient.websocket_connect``? The same cross-loop trade-off
@@ -44,7 +44,6 @@ def manager() -> ConnectionManager:
     return ConnectionManager()
 
 
-@pytest.mark.asyncio
 async def test_broadcast_to_channel_only_reaches_matching_channel(
     manager: ConnectionManager,
 ) -> None:
@@ -81,44 +80,4 @@ async def test_broadcast_to_channel_only_reaches_matching_channel(
     assert delivered == 1
     assert ws_a.sent == [payload]
     assert ws_b.sent == []
-    assert ws_c.sent == []
-
-
-@pytest.mark.asyncio
-async def test_broadcast_to_tenant_only_reaches_matching_tenant(
-    manager: ConnectionManager,
-) -> None:
-    """``broadcast_to_tenant(tenant_A)`` must reach every connection owned
-    by tenant_A, but nothing from tenant_B.
-
-    Setup:
-        - tenant_A, channel_a -> ws_a
-        - tenant_A, channel_b -> ws_b
-        - tenant_B, channel_c -> ws_c
-    Even though ws_a and ws_c happen to use different channel ids,
-    ``broadcast_to_tenant`` is tenant-scoped, so ws_c must not receive.
-    """
-    ws_a = FakeWebSocket()
-    ws_b = FakeWebSocket()
-    ws_c = FakeWebSocket()
-
-    await manager.connect(
-        websocket=ws_a, channel_id="ch_a", tenant_id="tenant_A",
-        external_user_id="u_a",
-    )
-    await manager.connect(
-        websocket=ws_b, channel_id="ch_b", tenant_id="tenant_A",
-        external_user_id="u_b",
-    )
-    await manager.connect(
-        websocket=ws_c, channel_id="ch_c", tenant_id="tenant_B",
-        external_user_id="u_c",
-    )
-
-    payload = {"type": "notice", "text": "tenant-wide maintenance"}
-    delivered = await manager.broadcast_to_tenant("tenant_A", payload)
-
-    assert delivered == 2
-    assert ws_a.sent == [payload]
-    assert ws_b.sent == [payload]
     assert ws_c.sent == []

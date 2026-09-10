@@ -4,19 +4,22 @@ For M1 single-process deployments only. Multi-worker fanout via Redis pub/sub
 is Stage 5+ (see Stage 5 plan: 会话 + 消息).
 
 Caveats:
-- Read methods (list_connections, count, send_to_connection) do not hold the
-  lock. In CPython this is safe from corruption thanks to the GIL, but readers
+- Read methods (list_connections, count, get_state) do not hold the lock.
+  In CPython this is safe from corruption thanks to the GIL, but readers
   may observe a half-completed state during concurrent connect/disconnect.
   Acceptable for M1 observability use cases; not safe for atomic snapshots.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from core.id_gen import new_id
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -85,38 +88,27 @@ class ConnectionManager:
         *,
         exclude: str | None = None,
     ) -> int:
+        """Fan out ``payload`` to every connection on ``channel_id``.
+
+        Returns the number of connections that successfully received the
+        frame. If any target's socket raises mid-delivery, the failure is
+        logged and the remaining targets are still attempted — one dead
+        socket does not abort the fanout.
+        """
         targets = [
             cid for cid, state in self._states.items()
             if state.channel_id == channel_id and cid != exclude
         ]
         delivered = 0
         for cid in targets:
-            ok = await self.send_to_connection(cid, payload)
-            if ok:
-                delivered += 1
-        return delivered
-
-    async def broadcast_to_tenant(
-        self,
-        tenant_id: str,
-        payload: dict[str, Any],
-        *,
-        exclude: str | None = None,
-    ) -> int:
-        """Fan out a payload to every connection belonging to ``tenant_id``.
-
-        Used for tenant-wide server-initiated events (e.g. maintenance
-        notices, channel-level fanout aggregated by tenant). Like
-        :meth:`broadcast_to_channel`, this is an M1 single-process in-memory
-        fanout — multi-worker delivery via Redis pub/sub is Stage 5+.
-        """
-        targets = [
-            cid for cid, state in self._states.items()
-            if state.tenant_id == tenant_id and cid != exclude
-        ]
-        delivered = 0
-        for cid in targets:
-            ok = await self.send_to_connection(cid, payload)
+            try:
+                ok = await self.send_to_connection(cid, payload)
+            except Exception:
+                logger.warning(
+                    "widget ws: broadcast send failed",
+                    extra={"connection_id": cid},
+                )
+                continue
             if ok:
                 delivered += 1
         return delivered

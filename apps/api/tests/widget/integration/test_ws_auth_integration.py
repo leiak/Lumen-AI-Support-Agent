@@ -3,7 +3,7 @@
 Complementary coverage to ``tests/widget/ws/test_router.py`` (which uses
 mocked repositories to isolate transport behavior). These tests exercise
 the *real* ``ChannelRepository.get_by_id`` against the live Postgres
-instance, proving that the auth check enforces the four claim-level
+instance, proving that the auth check enforces the five claim-level
 contract terms that the mocked suite cannot observe:
 
   1. JWT signature is verified against the runtime secret.
@@ -31,6 +31,7 @@ the tenant in ``finally:``.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -39,6 +40,7 @@ from fastapi import status
 from jose import jwt
 
 from channel.enums import ChannelStatus, ChannelType
+from channel.models import Channel
 from channel.repository import ChannelRepository
 from core.config import get_settings
 from core.database import get_session, reset_engine, reset_sessionmaker
@@ -74,7 +76,7 @@ class FakeWebSocket:
 
 
 @pytest.fixture(autouse=True)
-def _reset_db_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
+def _reset_db_singletons() -> Iterator[None]:
     """Per-test DB-engine reset, mirroring the lifecycle-test autouse fixture."""
     reset_engine()
     reset_sessionmaker()
@@ -100,7 +102,7 @@ def _mint_widget_token(
 
 async def _seed_tenant_and_web_channel(
     *, name: str = "WS Auth Tenant"
-) -> tuple[Tenant, object]:
+) -> tuple[Tenant, Channel]:
     """Seed a tenant + ACTIVE WEB channel. Returns (tenant, channel)."""
     tenant = await TenantRepository().create(name=name, plan=TenantPlan.FREE)
     channel = await ChannelRepository().create(
@@ -127,8 +129,9 @@ async def _delete_tenant(tenant_id: str) -> None:
 # ============================================================================
 
 
-@pytest.mark.integration
-async def test_widget_token_with_wrong_secret_is_rejected() -> None:
+async def test_widget_token_with_wrong_secret_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A widget JWT signed with the wrong secret must be rejected.
 
     The token is structurally valid and carries all the right claims, but
@@ -150,10 +153,15 @@ async def test_widget_token_with_wrong_secret_is_rejected() -> None:
     )
 
     fake_ws = FakeWebSocket()
-    await websocket_endpoint(websocket=fake_ws, token=token)
+    with caplog.at_level("WARNING", logger="widget.ws.router"):
+        await websocket_endpoint(websocket=fake_ws, token=token)
 
     assert fake_ws.close_code == status.WS_1008_POLICY_VIOLATION
     assert fake_ws.accepted is False
+    assert any(
+        "widget ws: rejected token" in rec.message
+        for rec in caplog.records
+    )
 
 
 # ============================================================================
@@ -161,8 +169,9 @@ async def test_widget_token_with_wrong_secret_is_rejected() -> None:
 # ============================================================================
 
 
-@pytest.mark.integration
-async def test_widget_token_missing_sub_is_rejected() -> None:
+async def test_widget_token_missing_sub_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A widget JWT without ``sub`` must be rejected before any DB lookup."""
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -175,10 +184,15 @@ async def test_widget_token_missing_sub_is_rejected() -> None:
     token = _mint_widget_token(payload)
 
     fake_ws = FakeWebSocket()
-    await websocket_endpoint(websocket=fake_ws, token=token)
+    with caplog.at_level("WARNING", logger="widget.ws.router"):
+        await websocket_endpoint(websocket=fake_ws, token=token)
 
     assert fake_ws.close_code == status.WS_1008_POLICY_VIOLATION
     assert fake_ws.accepted is False
+    assert any(
+        "widget ws: token missing sub claim" in rec.message
+        for rec in caplog.records
+    )
 
 
 # ============================================================================
@@ -186,8 +200,9 @@ async def test_widget_token_missing_sub_is_rejected() -> None:
 # ============================================================================
 
 
-@pytest.mark.integration
-async def test_widget_token_missing_channel_id_is_rejected() -> None:
+async def test_widget_token_missing_channel_id_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A widget JWT without ``channel_id`` must be rejected before any DB lookup."""
     now = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -199,10 +214,15 @@ async def test_widget_token_missing_channel_id_is_rejected() -> None:
     token = _mint_widget_token(payload)
 
     fake_ws = FakeWebSocket()
-    await websocket_endpoint(websocket=fake_ws, token=token)
+    with caplog.at_level("WARNING", logger="widget.ws.router"):
+        await websocket_endpoint(websocket=fake_ws, token=token)
 
     assert fake_ws.close_code == status.WS_1008_POLICY_VIOLATION
     assert fake_ws.accepted is False
+    assert any(
+        "widget ws: token missing channel_id or tenant_id" in rec.message
+        for rec in caplog.records
+    )
 
 
 # ============================================================================
@@ -210,8 +230,9 @@ async def test_widget_token_missing_channel_id_is_rejected() -> None:
 # ============================================================================
 
 
-@pytest.mark.integration
-async def test_widget_token_expired_is_rejected() -> None:
+async def test_widget_token_expired_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A widget JWT whose ``exp`` is in the past must be rejected."""
     past = datetime.now(UTC) - timedelta(minutes=5)
     payload = {
@@ -224,55 +245,61 @@ async def test_widget_token_expired_is_rejected() -> None:
     token = _mint_widget_token(payload)
 
     fake_ws = FakeWebSocket()
-    await websocket_endpoint(websocket=fake_ws, token=token)
+    with caplog.at_level("WARNING", logger="widget.ws.router"):
+        await websocket_endpoint(websocket=fake_ws, token=token)
 
     assert fake_ws.close_code == status.WS_1008_POLICY_VIOLATION
     assert fake_ws.accepted is False
+    assert any(
+        "widget ws: rejected token" in rec.message
+        for rec in caplog.records
+    )
 
 
 # ============================================================================
-# Test 5 — token for unknown channel is rejected (live DB lookup)
+# Test 5 — live-DB cross-tenant rejection (the 跨租户拒绝 branch)
 # ============================================================================
 
 
 @pytest.mark.integration
-async def test_widget_token_for_unknown_channel_is_rejected() -> None:
-    """A structurally-valid widget JWT for a channel that does not exist
-    in the DB must be rejected, not silently accepted.
+async def test_widget_token_with_tenant_mismatch_against_live_channel_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A widget JWT whose ``tenant_id`` does not match the seeded channel's
+    ``tenant_id`` must be rejected by the *live* cross-tenant branch in
+    ``router.py`` (lines 66-73), without mocking the repository.
 
-    This is the *only* test in this file that exercises the live
-    ``ChannelRepository.get_by_id`` path: it seeds a real tenant + channel
-    so the engine is wired up and we have something to cascade-delete, but
-    the token targets a different ``channel_id`` that is guaranteed not
-    to be present in the channels table.
+    This is the only test in this file that exercises the real
+    ``ChannelRepository.get_by_id`` round-trip. We seed a real tenant +
+    ACTIVE WEB channel and mint a token whose ``tenant_id`` belongs to
+    a *different* tenant — the endpoint must resolve the channel, hit
+    the tenant-mismatch check, and close with ``WS_1008_POLICY_VIOLATION``.
     """
-    tenant, _seeded_channel = await _seed_tenant_and_web_channel(
-        name="WS Auth Unknown Channel Tenant"
+    tenant, channel = await _seed_tenant_and_web_channel(
+        name="WS Auth Tenant Mismatch"
     )
     try:
-        # Generate a channel_id that we never insert into the DB.
-        unknown_channel_id = new_id()
+        other_tenant_id = new_id()  # != tenant.id
+        assert other_tenant_id != tenant.id
         now = datetime.now(UTC)
         payload = {
-            "sub": "u_unknown",
-            "channel_id": unknown_channel_id,
-            "tenant_id": tenant.id,
+            "sub": "u_cross",
+            "channel_id": channel.id,
+            "tenant_id": other_tenant_id,
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(minutes=10)).timestamp()),
         }
         token = _mint_widget_token(payload)
 
         fake_ws = FakeWebSocket()
-        await websocket_endpoint(websocket=fake_ws, token=token)
+        with caplog.at_level("WARNING", logger="widget.ws.router"):
+            await websocket_endpoint(websocket=fake_ws, token=token)
 
-        # The endpoint runs ``repo.get_by_id(unknown_channel_id)`` against
-        # the real DB; it returns None, so the server closes the WS.
         assert fake_ws.close_code == status.WS_1008_POLICY_VIOLATION
         assert fake_ws.accepted is False
-
-        # Sanity: the unknown_channel_id really is not in the DB.
-        repo = ChannelRepository()
-        looked_up = await repo.get_by_id(unknown_channel_id)
-        assert looked_up is None
+        assert any(
+            "widget ws: tenant mismatch" in rec.message
+            for rec in caplog.records
+        )
     finally:
         await _delete_tenant(tenant.id)
