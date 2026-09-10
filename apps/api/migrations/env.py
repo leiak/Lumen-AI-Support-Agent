@@ -10,6 +10,9 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from channel import (
     models as channel_models,  # noqa: F401  -- import for Alembic autogenerate metadata
 )
+from conversation import (
+    models as conversation_models,  # noqa: F401  -- import for Alembic autogenerate metadata
+)
 from core.config import get_settings
 from core.database import Base
 from llm_client import (
