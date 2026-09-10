@@ -164,6 +164,56 @@ async def test_find_or_create_for_inbound_returns_none_when_existing_is_other_te
     conv_repo.create.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_find_or_create_for_inbound_resolves_race_on_integrity_error() -> None:
+    """If create() raises IntegrityError (concurrent insert), retry via find_open."""
+    from sqlalchemy.exc import IntegrityError
+
+    winning = _conv(id="c_winner", tenant_id="t1", channel_id="ch1", customer_external_id="user1")
+    conv_repo = MagicMock()
+    # First find returns None; create raises IntegrityError; second find returns the winning row.
+    conv_repo.find_open_by_channel_customer = AsyncMock(side_effect=[None, winning])
+    conv_repo.create = AsyncMock(
+        side_effect=IntegrityError("statement", "params", "orig")
+    )
+    conv_repo.touch_last_activity = AsyncMock()
+
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    result = await svc.find_or_create_for_inbound(
+        tenant_id="t1", channel_id="ch1", customer_external_id="user1"
+    )
+
+    assert result is winning
+    assert conv_repo.find_open_by_channel_customer.await_count == 2
+    conv_repo.create.assert_awaited_once()
+    conv_repo.touch_last_activity.assert_awaited_once_with(
+        conversation_id="c_winner", at=FROZEN_NOW
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_or_create_for_inbound_reraises_when_winner_is_other_tenant() -> None:
+    """If IntegrityError fires and the winning row belongs to another tenant, re-raise."""
+    from sqlalchemy.exc import IntegrityError
+
+    conv_repo = MagicMock()
+    conv_repo.find_open_by_channel_customer = AsyncMock(
+        side_effect=[None, _conv(tenant_id="t_other")]
+    )
+    conv_repo.create = AsyncMock(
+        side_effect=IntegrityError("statement", "params", "orig")
+    )
+    conv_repo.touch_last_activity = AsyncMock()
+
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    with pytest.raises(IntegrityError):
+        await svc.find_or_create_for_inbound(
+            tenant_id="t1", channel_id="ch1", customer_external_id="user1"
+        )
+
+
 # ---- list_for_tenant ----
 
 

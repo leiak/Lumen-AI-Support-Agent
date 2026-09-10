@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
 
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
@@ -379,7 +380,7 @@ async def test_conversation_repo_roundtrip_live_db() -> None:
         engine = get_engine()
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-    except Exception:
+    except (OperationalError, DBAPIError):
         pytest.skip("DB not available")
 
     from core.database import get_session
@@ -423,7 +424,6 @@ async def test_partial_unique_index_allows_closed_and_open_for_same_pair() -> No
     """
     try:
         from sqlalchemy import text as sa_text
-        from sqlalchemy.exc import IntegrityError as _IntegrityError
 
         from channel.enums import ChannelType
         from channel.repository import ChannelRepository
@@ -435,7 +435,7 @@ async def test_partial_unique_index_allows_closed_and_open_for_same_pair() -> No
         engine = get_engine()
         async with engine.connect() as conn:
             await conn.execute(sa_text("SELECT 1"))
-    except Exception:
+    except (OperationalError, DBAPIError):
         pytest.skip("DB not available")
 
     tenant = await TenantRepository().create(
@@ -476,12 +476,8 @@ async def test_partial_unique_index_allows_closed_and_open_for_same_pair() -> No
             customer_external_id=cust,
             status=ConversationStatus.OPEN,
         )
-        with pytest.raises((_IntegrityError, Exception)) as exc_info:
+        with pytest.raises(IntegrityError):
             await repo.create(conversation=second_open)
-        # Be tolerant: the create path may wrap IntegrityError as a
-        # generic Exception depending on session handling; the important
-        # invariant is the database rejected the second open row.
-        assert exc_info.value is not None
     finally:
         async with get_session() as session:
             t = await session.get(Tenant, tenant.id)

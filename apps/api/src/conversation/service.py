@@ -23,12 +23,22 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
+
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
 from conversation.repository import ConversationRepository, MessageRepository
 from core.id_gen import new_id
 
 logger = logging.getLogger(__name__)
+
+# Default and hard-cap page sizes used by the service layer for tenant /
+# message listing. The repositories' own defaults may differ (see the
+# list_by_conversation default of 100) — that's intentional: the repo
+# serves both this service and the tests, while the service default
+# reflects the API contract for the inbox/message list endpoints.
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
 
 
 class ConversationService:
@@ -73,6 +83,13 @@ class ConversationService:
         )
         if existing is not None:
             if existing.tenant_id != tenant_id:
+                logger.warning(
+                    "conversation.cross_tenant_probe_blocked",
+                    extra={
+                        "channel_id": channel_id,
+                        "tenant_id": tenant_id,
+                    },
+                )
                 return None
             await self._repo.touch_last_activity(
                 conversation_id=existing.id, at=self._clock()
@@ -91,14 +108,39 @@ class ConversationService:
             opened_at=now,
             last_activity_at=now,
         )
-        return await self._repo.create(conversation=conv)
+        try:
+            return await self._repo.create(conversation=conv)
+        except IntegrityError:
+            # Race: another concurrent inbound created the open conversation
+            # between our find and our insert. The partial unique index
+            # uq_conversations_channel_customer_open caught it. Re-read to
+            # return the winner if it belongs to us.
+            existing = await self._repo.find_open_by_channel_customer(
+                channel_id=channel_id,
+                customer_external_id=customer_external_id,
+            )
+            if existing is not None and existing.tenant_id == tenant_id:
+                logger.info(
+                    "conversation.race_resolved_by_unique_index",
+                    extra={
+                        "channel_id": channel_id,
+                        "tenant_id": tenant_id,
+                    },
+                )
+                await self._repo.touch_last_activity(
+                    conversation_id=existing.id, at=self._clock()
+                )
+                return existing
+            # The winning row belongs to another tenant — this is the
+            # legitimate cross-tenant-abuse signal; re-raise.
+            raise
 
     async def list_for_tenant(
         self,
         *,
         tenant_id: str,
         status: ConversationStatus | None = None,
-        limit: int = 50,
+        limit: int = DEFAULT_PAGE_SIZE,
         offset: int = 0,
     ) -> list[Conversation]:
         """List conversations for a tenant, newest-activity first."""
@@ -139,7 +181,16 @@ class ConversationService:
         API layer maps both cases to 404.
         """
         conv = await self._repo.get_by_id(conversation_id)
-        if conv is None or conv.tenant_id != tenant_id:
+        if conv is None:
+            return None
+        if conv.tenant_id != tenant_id:
+            logger.warning(
+                "conversation.cross_tenant_probe_blocked",
+                extra={
+                    "conversation_id": conversation_id,
+                    "tenant_id": tenant_id,
+                },
+            )
             return None
         return conv
 
@@ -273,7 +324,7 @@ class ConversationService:
         tenant_id: str,
         conversation_id: str,
         before: datetime | None = None,
-        limit: int = 50,
+        limit: int = DEFAULT_PAGE_SIZE,
     ) -> list[Message] | None:
         """Return messages for a tenant-owned conversation, oldest-first.
 
