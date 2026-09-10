@@ -107,24 +107,42 @@ async def test_parse_malformed_content_does_not_crash() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_outbound_raises_not_implemented() -> None:
-    """Outbound is deferred to Task 4.8."""
+async def test_send_outbound_delegates_to_client(monkeypatch) -> None:
+    """FeishuAdapter.send_outbound should call the API client with the right args."""
+    FeishuAdapter.reset_client()  # fresh instance
+
+    captured: dict = {}
+
+    async def fake_send(*, app_id, app_secret, receive_id, text):
+        captured["app_id"] = app_id
+        captured["app_secret"] = app_secret
+        captured["receive_id"] = receive_id
+        captured["text"] = text
+        return {"code": 0, "msg": "ok", "data": {"message_id": "om_xyz"}}
+
+    monkeypatch.setattr(FeishuAdapter._client, "send_text_message", fake_send)
     channel = _channel()
     envelope = MessageEnvelope(
         envelope_id=new_id(),
         tenant_id=channel.tenant_id,
         channel_type=ChannelType.FEISHU,
         channel_id=channel.id,
-        external_conversation_id="oc_test",
-        external_user_id="ou_test",
-        external_message_id="om_test",
-        text="hi",
+        external_conversation_id="oc_x",
+        external_user_id="ou_user_99",
+        external_message_id="om_in_1",
+        text="reply text",
         attachments=[],
         raw={},
         received_at=datetime.now(UTC),
     )
-    with pytest.raises(NotImplementedError, match=r"Task 4\.8"):
-        await FeishuAdapter().send_outbound(envelope=envelope, channel=channel)
+    await FeishuAdapter().send_outbound(envelope=envelope, channel=channel)
+    assert captured == {
+        "app_id": "cli_test_app",
+        "app_secret": "secret",
+        "receive_id": "ou_user_99",
+        "text": "reply text",
+    }
+    FeishuAdapter.reset_client()  # cleanup
 
 
 def test_adapter_channel_type() -> None:
