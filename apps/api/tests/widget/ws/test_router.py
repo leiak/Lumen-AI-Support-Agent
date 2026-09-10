@@ -30,11 +30,12 @@ def _channel(*, status: ChannelStatus = ChannelStatus.ACTIVE) -> Channel:
 
 @pytest.fixture
 def fresh_manager(monkeypatch) -> ConnectionManager:
-    """Reset the module-level manager between tests."""
+    """Reset the module-level manager between tests via monkeypatch teardown."""
     from widget.ws import router as r
 
-    r.manager = ConnectionManager()
-    return r.manager
+    new_mgr = ConnectionManager()
+    monkeypatch.setattr(r, "manager", new_mgr)
+    return new_mgr
 
 
 def _make_app() -> FastAPI:
@@ -129,3 +130,71 @@ async def test_ws_endpoint_message_frame_yields_ack(
         assert reply["type"] == "ack"
         assert "external_message_id" in reply
         assert len(reply["external_message_id"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_typing_frame_noop(fresh_manager, monkeypatch) -> None:
+    """A 'typing' frame should be silently accepted (no reply)."""
+    ch = _channel()
+    token, _ = create_widget_token(channel=ch, external_user_id="u1")
+
+    async def fake_get_by_id(_self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+
+    testclient = TestClient(_make_app())
+    with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
+        ws.send_json({"type": "typing", "value": True})
+        # No reply expected — type is no-op.
+        # Send a ping to verify the connection is still alive.
+        ws.send_json({"type": "ping"})
+        reply = ws.receive_json()
+        assert reply == {"type": "pong"}
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_tenant_mismatch_rejected(fresh_manager, monkeypatch) -> None:
+    """A widget token for tenant A must not connect to a channel owned by tenant B."""
+    ch = _channel()
+    # Make the token's tenant_id differ from the channel's tenant_id.
+    token, _ = create_widget_token(channel=ch, external_user_id="u1")
+
+    async def fake_get_by_id(_self, _id):
+        # Return a channel with a different tenant than the token's.
+        return Channel(
+            id=ch.id,
+            tenant_id="tenant_A",
+            type=ChannelType.WEB,
+            name="x",
+            status=ChannelStatus.ACTIVE,
+            credentials_encrypted="{}",
+            created_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+
+    testclient = TestClient(_make_app())
+    with pytest.raises(WebSocketDisconnect):
+        with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_ws_endpoint_disconnect_clears_manager(fresh_manager, monkeypatch) -> None:
+    """Client disconnect must remove the entry from the manager."""
+    ch = _channel()
+    token, _ = create_widget_token(channel=ch, external_user_id="u1")
+
+    async def fake_get_by_id(_self, _id):
+        return ch
+
+    monkeypatch.setattr(ChannelRepository, "get_by_id", fake_get_by_id)
+
+    testclient = TestClient(_make_app())
+    with testclient.websocket_connect(f"/api/v1/widget/ws?token={token}") as ws:
+        ws.send_json({"type": "ping"})
+        ws.receive_json()
+        assert fresh_manager.count() == 1
+    # After the context exits, the client has disconnected.
+    assert fresh_manager.count() == 0

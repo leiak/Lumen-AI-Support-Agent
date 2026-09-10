@@ -2,6 +2,12 @@
 
 For M1 single-process deployments only. Multi-worker fanout via Redis pub/sub
 is Stage 5+ (see Stage 5 plan: 会话 + 消息).
+
+Caveats:
+- Read methods (list_connections, count, send_to_connection) do not hold the
+  lock. In CPython this is safe from corruption thanks to the GIL, but readers
+  may observe a half-completed state during concurrent connect/disconnect.
+  Acceptable for M1 observability use cases; not safe for atomic snapshots.
 """
 from __future__ import annotations
 

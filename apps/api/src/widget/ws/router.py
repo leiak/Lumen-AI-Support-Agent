@@ -30,29 +30,44 @@ async def websocket_endpoint(
     try:
         payload = decode_widget_token(token)
     except TokenError as exc:
-        logger.info("widget ws: rejected token: %s", exc)
+        logger.warning("widget ws: rejected token: %s", exc)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    channel_id_raw = payload.get("channel_id")
-    tenant_id_raw = payload.get("tenant_id")
-    external_user_id_raw = payload.get("sub", "")
-
-    if not isinstance(channel_id_raw, str) or not isinstance(tenant_id_raw, str):
-        logger.info("widget ws: missing claims in widget token")
+    channel_id = payload.get("channel_id")
+    tenant_id = payload.get("tenant_id")
+    if (
+        not isinstance(channel_id, str)
+        or not channel_id
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+    ):
+        logger.warning("widget ws: token missing channel_id or tenant_id")
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
-    channel_id: str = channel_id_raw
-    tenant_id: str = tenant_id_raw
-    external_user_id: str = external_user_id_raw if isinstance(external_user_id_raw, str) else ""
+
+    external_user_id = payload.get("sub")
+    if not isinstance(external_user_id, str) or not external_user_id:
+        logger.warning("widget ws: token missing sub claim")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     # 2. Look up channel
     repo = ChannelRepository()
     channel = await repo.get_by_id(channel_id)
     if channel is None or channel.status != ChannelStatus.ACTIVE:
-        logger.info(
+        logger.warning(
             "widget ws: channel not active",
             extra={"channel_id": channel_id},
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # 2b. Tenant cross-use enforcement: token's tenant must match channel's tenant.
+    if channel.tenant_id != tenant_id:
+        logger.warning(
+            "widget ws: tenant mismatch",
+            extra={"token_tenant_id": tenant_id, "channel_tenant_id": channel.tenant_id},
         )
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
