@@ -63,3 +63,5 @@ ignore = ["S101"]
 python_version = "3.11"
 strict = true
 files = ["src"]
+mypy_path = "src"
+explicit_package_bases = true
