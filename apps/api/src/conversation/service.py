@@ -226,6 +226,42 @@ class ConversationService:
             )
         return updated
 
+    async def escalate_to_human_queue(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> Conversation | None:
+        """Move the conversation to PENDING with no agent assigned (queue wait).
+
+        Distinct from :meth:`assign_to_agent` which targets a specific
+        agent — this method is the escalation entry point used by the
+        AI auto-reply's ``escalate_to_human`` tool. The conversation
+        sits in the human queue waiting to be claimed by an agent.
+
+        Returns ``None`` on cross-tenant / missing. Updates
+        ``last_activity_at`` so the conversation sorts to the top of
+        the queue. Tenant isolation is re-validated by the inner
+        ``self.get(...)`` call — no caller can smuggle a foreign
+        ``conversation_id`` past the service boundary.
+        """
+        conv = await self.get(
+            tenant_id=tenant_id, conversation_id=conversation_id
+        )
+        if conv is None:
+            return None
+        conv.status = ConversationStatus.PENDING
+        conv.assigned_agent_id = None
+        conv.ai_handling = False
+        conv.last_activity_at = self._clock()
+        updated = await self._repo.update(conv)
+        if updated is not None:
+            logger.info(
+                "conversation escalated to human queue",
+                extra={
+                    "conversation_id": conversation_id,
+                    "tenant_id": tenant_id,
+                },
+            )
+        return updated
+
     async def return_to_ai(
         self, *, tenant_id: str, conversation_id: str
     ) -> Conversation | None:
