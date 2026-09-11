@@ -187,6 +187,26 @@ async def index_article(*, article_id: str) -> IndexResult:
     would require an extra round-trip to find existing row IDs and
     adds little value for an M1 worker that runs one-at-a-time.
 
+    Qdrant / DB write ordering
+    --------------------------
+
+    The Qdrant upsert (step 7b) happens BEFORE the ``Chunk`` row
+    INSERT (step 8), and the two are not in a shared transaction —
+    Qdrant has no distributed-transaction story with Postgres, so one
+    of the two must go first. We write vectors first so the DB row is
+    only ever created once its vector definitively exists: a Chunk row
+    whose ``qdrant_point_id`` points at nothing would make the 6.11
+    retriever return a hit it cannot resolve. The tradeoff is the
+    opposite failure: if the DB INSERT fails after a successful upsert,
+    the article goes ``FAILED`` while Qdrant retains orphan points for
+    that ``article_version_id``. Those orphans are invisible to the
+    retriever (no Chunk row references them) and self-heal on retry —
+    re-running ``index_article`` calls
+    :func:`delete_points_by_article_version` for the same version in
+    step 7a, which removes them before the fresh upsert. Accepted for
+    M1; a Stage 7+ outbox / two-phase cleanup sweep would close the
+    window properly.
+
     Failure handling
     ----------------
 
@@ -348,6 +368,14 @@ async def index_article(*, article_id: str) -> IndexResult:
         # Step 6. Embed. ``embed_texts`` is imported at module
         # level so tests can monkeypatch
         # ``knowledge.worker.embed_texts`` directly.
+        #
+        # Guard the model name first: an empty ``embedding_model``
+        # would otherwise reach the provider as a blank ``model``
+        # param and come back as an opaque 400. Failing here funnels
+        # through the normal FAILED path with a clear class name.
+        if not embedding_model:
+            raise ValueError("KnowledgeBase.embedding_model is empty")
+
         texts = [c.text for c in chunk_candidates]
         embedding_result = await embed_texts(
             texts=texts,
@@ -477,10 +505,6 @@ async def index_article(*, article_id: str) -> IndexResult:
 # ---------------------------------------------------------------------------
 
 
-# ``error_type_only`` — we deliberately store ONLY the exception
-# class name in Article.error_message. No repr(exc) is ever logged
-# (exception args can carry PII / infra hints). Operators rely on the
-# class name plus the surrounding log handler's stack trace.
 def _qdrant_point_id(chunk_id: str) -> str:
     """Compute a deterministic Qdrant point ID from a chunk ULID.
 
@@ -508,23 +532,36 @@ def _sanitize_metadata(
     ``str`` / ``int`` / ``float`` / ``bool`` / ``None`` / ``list`` /
     ``dict`` of those is coerced via ``str(...)``. We never want a
     malformed payload to crash the worker.
+
+    Recursion is shared with :func:`_safe_primitive` (mutually
+    recursive): this function walks dict *values*, that one walks list
+    *elements* and routes nested dicts back here. Together they handle
+    arbitrary nesting depth.
     """
-    out: dict[str, Any] = {}
-    for key, value in metadata.items():
-        if isinstance(value, (str, int, float, bool)) or value is None:
-            out[key] = value
-        elif isinstance(value, (list, dict)):
-            out[key] = _sanitize_metadata(value) if isinstance(value, dict) else [
-                _safe_primitive(v) for v in value
-            ]
-        else:
-            out[key] = str(value)
-    return out
+    return {key: _safe_primitive(value) for key, value in metadata.items()}
 
 
 def _safe_primitive(value: Any) -> Any:
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    """Recursively coerce a metadata value to a Qdrant-serializable primitive.
+
+    Strings, ints, floats, bools, and None pass through. Dicts are
+    routed back through :func:`_sanitize_metadata` and lists are walked
+    element-wise (both recurse), so a nested structure like
+    ``{"tables": [{"rows": 5}]}`` keeps its shape instead of collapsing
+    the inner dict to ``str(...)``. Anything else falls back to
+    ``str(value)`` so Qdrant's JSON serializer never sees an
+    unsupported type.
+
+    M1 chunker metadata is shallow, so the recursion is latent today —
+    it exists so a future chunker that emits nested block metadata
+    (e.g. 6.10 table/image extraction) doesn't silently lose structure.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, dict):
+        return _sanitize_metadata(value)
+    if isinstance(value, list):
+        return [_safe_primitive(v) for v in value]
     return str(value)
 
 
@@ -589,6 +626,10 @@ async def _set_status(
         return False
 
 
+# ``error_type_only`` — we deliberately store ONLY the exception
+# class name in Article.error_message. No repr(exc) is ever logged
+# (exception args can carry PII / infra hints). Operators rely on the
+# class name plus the surrounding log handler's stack trace.
 async def _fail_and_return(
     *,
     article_id: str,

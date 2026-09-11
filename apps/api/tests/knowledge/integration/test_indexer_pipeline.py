@@ -263,6 +263,47 @@ async def _qdrant_scroll_by_article_version(
     return out
 
 
+async def _qdrant_count_by_article_version(*, article_version_id: str) -> int:
+    """Exact point count for one article_version_id payload.
+
+    Uses ``client.count`` (rather than scrolling and taking ``len``)
+    so a "zero points remain" assertion is a direct server-side count
+    and can't be fooled by scroll pagination.
+    """
+    client = get_qdrant_client()
+    flt = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="article_version_id",
+                match=qmodels.MatchValue(value=article_version_id),
+            )
+        ]
+    )
+    result = await client.count(
+        collection_name=DEFAULT_COLLECTION,
+        count_filter=flt,
+        exact=True,
+    )
+    return result.count
+
+
+async def _blank_version_raw_text(*, version_id: str) -> None:
+    """Empty an existing ArticleVersion's raw_text in place.
+
+    Blanking the SAME version the worker will re-index is what makes
+    the empty-branch test meaningful: the stale Qdrant points already
+    carry this ``article_version_id``, so the delete in the empty
+    branch has something real to remove. Creating a brand-new empty
+    version instead would leave the delete a guaranteed no-op.
+    """
+    async with get_session() as session:
+        version = await session.get(ArticleVersion, version_id)
+        assert version is not None
+        version.raw_text = ""
+        version.content_hash = hashlib.sha256(b"").hexdigest()
+        await session.commit()
+
+
 async def _delete_qdrant_points_for_article(*, article_id: str) -> None:
     """Best-effort cleanup of any Qdrant points for an article."""
     client = get_qdrant_client()
@@ -667,6 +708,77 @@ async def test_qdrant_upsert_failure_marks_failed(
         # No chunks were persisted (we never reached step 8).
         chunks = await _list_chunks_for_version(version.id)
         assert chunks == []
+    finally:
+        await _delete_qdrant_points_for_article(article_id=article.id)
+
+
+@pytest.mark.integration
+async def test_index_article_empty_clears_stale_qdrant_points(
+    tenant_factory: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Indexing an empty version removes any prior Qdrant points + DB chunks.
+
+    Covers the empty-chunks branch of ``index_article``: the article
+    still lands INDEXED (an empty document is a valid indexed state)
+    with ``chunks_indexed == 0``, and BOTH stores are swept clean for
+    that version.
+
+    The sweep is the part worth pinning. A regression that skipped the
+    ``delete_points_by_article_version`` call in the empty branch would
+    leave the previous run's vectors orphaned in Qdrant — invisible in
+    the DB (no Chunk rows reference them) but still returned by the
+    6.11 retriever's similarity search, so a "cleared" article would
+    keep answering questions from its deleted content. We blank the
+    SAME version in place so those stale points really do carry the
+    ``article_version_id`` the worker is about to re-index; indexing a
+    fresh empty version instead would make the delete a no-op and the
+    test would pass even with the call removed.
+    """
+    await _ensure_collection_ready()
+    _patch_embed(monkeypatch, dim=DEFAULT_VECTOR_SIZE)
+    tenant = tenant_factory
+    kb = await _make_kb(tenant_id=tenant.id)
+    article = await _make_article(tenant_id=tenant.id, knowledge_base_id=kb.id)
+    # 900 words at chunk_size=800/overlap=100 -> 2 chunks, so the
+    # assertion below proves a multi-point sweep, not just a single one.
+    raw_text = " ".join(f"w{i}" for i in range(900))
+    version = await _make_version(article_id=article.id, raw_text=raw_text)
+    await _set_article_current_version(
+        article_id=article.id, version_id=version.id
+    )
+
+    try:
+        first = await index_article(article_id=article.id)
+        assert first.status == ArticleStatus.INDEXED
+        assert first.chunks_indexed == 2
+
+        # Baseline: the version really does have points to go stale.
+        assert await _qdrant_count_by_article_version(
+            article_version_id=version.id
+        ) == 2
+        assert len(await _list_chunks_for_version(version.id)) == 2
+
+        # Blank the version and re-index.
+        await _blank_version_raw_text(version_id=version.id)
+        second = await index_article(article_id=article.id)
+
+        # Empty is a valid INDEXED state, not a failure.
+        assert second.status == ArticleStatus.INDEXED
+        assert second.chunks_indexed == 0
+
+        article_after = await _get_article(article.id)
+        assert article_after.status == ArticleStatus.INDEXED
+        assert article_after.error_message is None
+
+        # DB swept.
+        assert await _list_chunks_for_version(version.id) == []
+        # Qdrant swept — the regression this test exists for.
+        assert await _qdrant_count_by_article_version(
+            article_version_id=version.id
+        ) == 0
+        # Nothing left for the article at all.
+        assert await _qdrant_scroll_by_article(article_id=article.id) == []
     finally:
         await _delete_qdrant_points_for_article(article_id=article.id)
 
