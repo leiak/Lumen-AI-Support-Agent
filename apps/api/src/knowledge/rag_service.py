@@ -45,6 +45,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from knowledge.models import KnowledgeBase
 from knowledge.repository import KnowledgeBaseRepository
 from knowledge.retriever import (
     KnowledgeBaseNotFoundError,
@@ -316,7 +317,7 @@ class RAGService:
         *,
         tenant_id: str,
         knowledge_base_id: str | None,
-    ) -> "object | None":
+    ) -> KnowledgeBase | None:
         """Resolve which KB to use for this tenant.
 
         Returns the ORM :class:`KnowledgeBase` row (or ``None``).
@@ -345,25 +346,13 @@ class RAGService:
                 )
             return kb
 
-        kbs = await self._kb_repo.list_by_tenant(tenant_id=tenant_id, limit=2)
-        if not kbs:
+        kb = await self._kb_repo.get_default_for_tenant(tenant_id=tenant_id)
+        if kb is None:
             log.info(
                 "knowledge.rag.no_kb",
                 tenant_id=tenant_id,
             )
-            return None
-        if len(kbs) > 1:
-            # Multiple KBs for one tenant is a misconfiguration
-            # under the M1 singleton rule. Pick the newest
-            # (list_by_tenant is already newest-first) so the
-            # behavior is deterministic and the WARNING surfaces
-            # the misconfiguration in observability.
-            log.warning(
-                "knowledge.rag.multiple_kbs_using_newest",
-                tenant_id=tenant_id,
-                kb_count=len(kbs),
-            )
-        return kbs[0]
+        return kb
 
 
 def _empty_context() -> RagContext:

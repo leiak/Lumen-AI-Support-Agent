@@ -24,6 +24,7 @@ incoming messages.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -740,6 +741,289 @@ async def test_simple_responder_injects_rag_context(
             "RAG context did not contain any distinctive phrase from "
             "the indexed weather article. "
             f"Captured RAG blocks: {rag_blocks!r}"
+        )
+    finally:
+        await _delete_qdrant_points_for_article(article_id=weather_art.id)
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+async def test_build_context_empty_query_returns_empty(
+    tenant_factory: Tenant,
+) -> None:
+    """An empty/whitespace query yields an empty RagContext, no exception.
+
+    The RAG service must never raise on empty input — a customer
+    pressing Enter on the chat widget shouldn't surface a 500. The
+    service short-circuits BEFORE the KB lookup so no DB call is
+    made at all in this path.
+    """
+    tenant = tenant_factory
+    rag = RAGService()
+
+    for empty_query in ("", "   ", "\t\n", " "):
+        ctx = await rag.build_context_for_query(
+            tenant_id=tenant.id,
+            query=empty_query,
+            top_k=5,
+        )
+        assert isinstance(ctx, RagContext)
+        assert ctx.chunk_count == 0
+        assert ctx.system_message == ""
+        assert ctx.knowledge_base_id == ""
+        assert ctx.knowledge_base_name == ""
+        assert ctx.retrieval_score_max == 0.0
+
+
+@pytest.mark.integration
+async def test_build_context_multiple_kbs_uses_newest(
+    tenant_factory: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a tenant has >1 KB, the newest-by-created_at one is used.
+
+    M1 treats multiple KBs per tenant as a misconfiguration, but
+    the service must remain deterministic — newer-wins. We seed
+    two KBs with a small ``asyncio.sleep`` between them so the
+    ``created_at`` ordering is unambiguous, then assert the
+    returned ``RagContext.knowledge_base_id`` matches the newer KB.
+    """
+    await _ensure_collection_ready()
+    _patch_embed_topic_coded(monkeypatch)
+    tenant = tenant_factory
+
+    older_kb = await _make_kb(tenant_id=tenant.id, slug="kb-multi-older", name="Older KB")
+    # Force a non-zero gap between ``created_at`` values so the
+    # newest-first ORDER BY is deterministic even on clocks with
+    # sub-millisecond resolution.
+    await asyncio.sleep(0.01)
+    newer_kb = await _make_kb(tenant_id=tenant.id, slug="kb-multi-newer", name="Newer KB")
+
+    # Index one article into the newer KB so retrieval has data to
+    # return — otherwise the no-hits branch returns an empty
+    # context that doesn't tell us which KB was selected.
+    weather_art, _ = await _make_article_and_version(
+        tenant_id=tenant.id,
+        knowledge_base_id=newer_kb.id,
+        title="Weather Patterns",
+        raw_text=WEATHER_TEXT,
+    )
+
+    try:
+        result = await index_article(article_id=weather_art.id)
+        assert result.status == ArticleStatus.INDEXED
+
+        rag = RAGService()
+        ctx = await rag.build_context_for_query(
+            tenant_id=tenant.id,
+            query="what is the weather forecast today",
+            top_k=5,
+            score_threshold=None,
+        )
+
+        assert ctx.chunk_count >= 1, "expected chunks from newer KB"
+        assert ctx.knowledge_base_id == newer_kb.id, (
+            f"expected newer KB {newer_kb.id}, got {ctx.knowledge_base_id} "
+            f"(older KB was {older_kb.id})"
+        )
+        assert ctx.knowledge_base_id != older_kb.id
+    finally:
+        await _delete_qdrant_points_for_article(article_id=weather_art.id)
+
+
+@pytest.mark.integration
+async def test_simple_responder_rag_with_long_history_summary(
+    tenant_factory: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RAG context AND history summary both appear in the LLM request.
+
+    When the conversation has more than ``MAX_HISTORY_BEFORE_SUMMARY``
+    (50) messages, the simple responder:
+
+    1. Runs RAG against the most recent customer message and prepends
+       the result as a synthetic ``system`` message.
+    2. Summarizes the overflowing oldest messages and prepends the
+       summary as another ``system`` message.
+    3. Keeps the latest ``MAX_HISTORY_MESSAGES`` (20) verbatim.
+
+    This test verifies all three land in the final LLM request in
+    the expected order, by stubbing the LLM client to capture every
+    call. The responder makes two LLM calls in this path (summary
+    + chat) — we assert on the second one.
+    """
+    await _ensure_collection_ready()
+    _patch_embed_topic_coded(monkeypatch)
+    tenant = tenant_factory
+
+    # KB + indexed article.
+    kb = await _make_kb(tenant_id=tenant.id, slug="kb-long")
+    weather_art, _ = await _make_article_and_version(
+        tenant_id=tenant.id,
+        knowledge_base_id=kb.id,
+        title="Weather Encyclopedia",
+        raw_text=WEATHER_TEXT,
+    )
+
+    try:
+        result = await index_article(article_id=weather_art.id)
+        assert result.status == ArticleStatus.INDEXED
+
+        # Channel + conversation.
+        channel = await ChannelRepository().create(
+            tenant_id=tenant.id,
+            type=ChannelType.WEB,
+            name="Long History Channel",
+            credentials_encrypted="{}",
+            status=ChannelStatus.ACTIVE,
+        )
+
+        conv_repo = ConversationRepository()
+        msg_repo = MessageRepository()
+        conv_service = ConversationService(
+            repo=conv_repo, message_repo=msg_repo
+        )
+
+        now = datetime.now(UTC)
+        conversation = Conversation(
+            id=new_id(),
+            tenant_id=tenant.id,
+            channel_id=channel.id,
+            customer_external_id="ou_long",
+            status=ConversationStatus.OPEN,
+            assigned_agent_id=None,
+            ai_handling=True,
+            opened_at=now,
+            last_activity_at=now,
+        )
+        await conv_repo.create(conversation=conversation)
+
+        # Seed > MAX_HISTORY_BEFORE_SUMMARY (50) messages. Alternate
+        # customer + AI roles so the most recent message is a
+        # CUSTOMER (the one RAG will run against). The last customer
+        # message mentions weather so the retrieval hits the indexed
+        # article and the RAG system block is non-empty.
+        from agent.simple_responder import MAX_HISTORY_BEFORE_SUMMARY
+
+        total_messages = MAX_HISTORY_BEFORE_SUMMARY + 5  # 55
+        seeded: list[Message] = []
+        for i in range(total_messages):
+            role = (
+                MessageRole.CUSTOMER if i % 2 == 0 else MessageRole.AI
+            )
+            content = (
+                "What's the weather forecast today?"
+                if i == total_messages - 1
+                else f"prior turn {i}"
+            )
+            msg = Message(
+                id=new_id(),
+                conversation_id=conversation.id,
+                role=role,
+                content_text=content,
+                sender_id=None,
+                content_blocks_json=None,
+                tool_calls_json=None,
+                created_at=now,
+            )
+            await msg_repo.create(message=msg)
+            seeded.append(msg)
+
+        # Stub LLM client. The responder invokes it twice in this
+        # path: first for the summary call, then for the chat call.
+        # Capture BOTH so we can assert on the chat call's payload.
+        captured_calls: list[list] = []
+
+        async def _fake_chat(request):  # type: ignore[no-untyped-def]
+            captured_calls.append(list(request.messages))
+            return ChatResponse(
+                content="stubbed AI reply",
+                model=request.model,
+                prompt_tokens=10,
+                completion_tokens=5,
+                finish_reason="stop",
+            )
+
+        from unittest.mock import MagicMock
+
+        fake_client = MagicMock()
+        fake_client.chat = _fake_chat
+
+        responder = SimpleResponder(
+            conv_service=conv_service,
+            llm_client_factory=lambda t: fake_client,
+            rag_service=_RAGServiceNoThreshold(),
+        )
+
+        ai_response = await responder.respond(
+            tenant_id=tenant.id,
+            conversation_id=conversation.id,
+        )
+
+        assert ai_response is not None
+        assert ai_response.role == MessageRole.AI
+
+        # Two LLM calls: summary then chat.
+        assert len(captured_calls) == 2, (
+            f"expected 2 LLM calls (summary + chat), got {len(captured_calls)}"
+        )
+
+        chat_messages = captured_calls[1]
+        # First message is always the M1 system prompt.
+        assert chat_messages[0].role == "system"
+        assert "customer-service agent" in chat_messages[0].content
+
+        # The RAG system message must be present and contain the
+        # indexed article text. It should appear BEFORE the summary
+        # message — the responder prepends RAG first.
+        rag_blocks = [
+            m.content for m in chat_messages if "Retrieved knowledge:" in m.content
+        ]
+        assert rag_blocks, (
+            "RAG system message not found in chat LLM request. "
+            f"Roles + content prefixes: {[(m.role, m.content[:50]) for m in chat_messages]}"
+        )
+        assert any(
+            phrase in block
+            for block in rag_blocks
+            for phrase in (
+                "barometric pressure",
+                "cold front",
+                "thunderstorms",
+                "humidity",
+            )
+        ), "RAG block did not contain a phrase from the weather article"
+
+        # The history summary must be present.
+        summary_blocks = [
+            m.content
+            for m in chat_messages
+            if "summary" in m.content.lower()[:80]
+            or "Earlier conversation" in m.content
+        ]
+        assert summary_blocks, (
+            "History summary system message not found in chat LLM request. "
+            f"System contents: {[m.content[:80] for m in chat_messages if m.role == 'system']}"
+        )
+
+        # Order: M1 prompt → RAG block → summary block → mapped messages.
+        system_indices = [
+            (i, m.content)
+            for i, m in enumerate(chat_messages)
+            if m.role == "system"
+        ]
+        # First system message is the M1 prompt.
+        # Second should be RAG (Retrieved knowledge:).
+        # Third should be the summary (starts with "Previous conversation summary:" or
+        # the fallback "Earlier conversation (truncated):").
+        assert "Retrieved knowledge:" in system_indices[1][1], (
+            f"expected RAG block at system slot 1, got: {system_indices[1][1][:80]!r}"
+        )
+        assert (
+            "Previous conversation summary:" in system_indices[2][1]
+            or "Earlier conversation (truncated):" in system_indices[2][1]
+        ), (
+            f"expected summary block at system slot 2, got: {system_indices[2][1][:80]!r}"
         )
     finally:
         await _delete_qdrant_points_for_article(article_id=weather_art.id)

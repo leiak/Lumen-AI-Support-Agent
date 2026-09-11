@@ -246,7 +246,7 @@ class SimpleResponder:
                     exc_info=True,
                 )
                 transcript = "\n".join(
-                    f"{m.role.value}: {m.content_text}" for m in to_summarize
+                    f"{m.role}: {m.content_text}" for m in to_summarize
                 )[:FALLBACK_TRANSCRIPT_CHARS]
                 summary_message = LLMChatMessage(
                     role=LLMMessageRole.SYSTEM,
@@ -296,7 +296,7 @@ class SimpleResponder:
         the caller still has *some* context to work with.
         """
         transcript = "\n".join(
-            f"{m.role.value}: {m.content_text}" for m in messages
+            f"{m.role}: {m.content_text}" for m in messages
         )
         client = self._llm_client_factory(tenant_id)
         request = ChatRequest(
