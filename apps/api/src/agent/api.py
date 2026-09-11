@@ -1,4 +1,4 @@
-"""Agent workspace HTTP API (Stage 8.1 + 8.2).
+"""Agent workspace HTTP API (Stage 8.1 + 8.2 + 8.3).
 
 This router owns the agent-facing endpoints used by the workspace
 frontend:
@@ -11,6 +11,10 @@ frontend:
   atomic claim: the calling agent takes ownership of a PENDING
   conversation. Uses ``SELECT ... FOR UPDATE`` so two concurrent
   claim attempts cannot both succeed (Stage 8.2).
+- ``POST /api/v1/agents/conversations/{conversation_id}/suggest-reply``
+  — read-only AI-suggested reply preview for the workspace UI
+  (Stage 8.3). Returns suggested text, the retrieved RAG chunks
+  formatted as citations, and a ``turn_kind`` discriminator.
 
 The agent reply endpoint (``POST /conversations/{id}/messages``) lives
 on the conversation router to keep its canonical URL
@@ -23,11 +27,14 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from agent.exceptions import SuggestionServiceNotFoundError
 from agent.schemas import (
     AgentMeOut,
     ConversationListOut,
     ConversationOut,
+    SuggestionOut,
 )
+from agent.suggest import SuggestionService
 from auth.dependencies import require_agent_or_admin
 from conversation.enums import ConversationStatus
 from conversation.exceptions import ConversationNotClaimableError
@@ -245,3 +252,89 @@ async def claim_conversation(
         agent_id=agent_id,
     )
     return _conv_out(conv)
+
+
+@router.post(
+    "/conversations/{conversation_id}/suggest-reply",
+    response_model=SuggestionOut,
+)
+async def suggest_reply(
+    conversation_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
+) -> SuggestionOut:
+    """Generate a read-only AI-suggested reply preview (Stage 8.3).
+
+    Given the conversation's current state (last customer message
+    + recent history), returns:
+
+    * ``suggested_text`` — the LLM-generated reply the agent
+      could send. If the LLM call fails, falls back to the
+      standard ``FALLBACK_MESSAGE`` and surfaces
+      ``turn_kind="llm_unavailable"`` + ``warning="llm_unavailable"``.
+    * ``citations`` — the retrieved RAG chunks used as context,
+      formatted as ``(article_id, chunk_index, text, score)``
+      tuples so the frontend can render ``"(article {id},
+      chunk {idx})"`` links.
+    * ``retrieval_score_max`` — highest cosine similarity across
+      the retrieved chunks (``0.0`` when no chunks).
+    * ``turn_kind`` — one of ``rag_hit`` / ``no_rag`` /
+      ``no_customer_message`` / ``llm_unavailable``.
+    * ``warning`` — currently only set to ``"llm_unavailable"``
+      when the LLM failed; ``None`` on success.
+
+    **Critical invariants (pinned by tests):**
+
+    * **READ-ONLY.** The endpoint NEVER persists anything to the
+      DB and NEVER mutates conversation state. It does not call
+      :meth:`ConversationService.record_message`, does not
+      dispatch the ``escalate_to_human`` tool, and does not
+      broadcast WS events.
+    * **PII-safe logs.** Only opaque IDs (``tenant_id``,
+      ``conversation_id``) plus ``error_type`` on failure.
+    * **Tenant isolation.** Cross-tenant or unknown
+      ``conversation_id`` → 404 with the generic
+      ``"conversation not found"`` wording the rest of the
+      workspace API uses (anti-enumeration).
+    * **RAG fail-open.** ``EmbeddingError`` or any other RAG
+      failure → empty citations, ``turn_kind="no_rag"``, the LLM
+      call still proceeds.
+    * **LLM fail-safe.** ``RateLimited`` /
+      ``ProviderUnavailable`` / ``OutputInvalid`` /
+      ``InvalidRequest`` → ``suggested_text=FALLBACK_MESSAGE``,
+      ``warning="llm_unavailable"``,
+      ``turn_kind="llm_unavailable"``.
+
+    Auth: ``require_agent_or_admin`` so assigned agents and
+    admins can both request a preview. The request body is
+    currently empty — future extensions (model override,
+    ``max_tokens`` override, etc.) will be additive and won't
+    change the auth contract.
+    """
+    tenant_id = claims["tenant_id"]
+    try:
+        result = await SuggestionService().suggest_reply(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        )
+    except SuggestionServiceNotFoundError:
+        # Cross-tenant or unknown — same 404 the rest of the API
+        # uses to prevent enumeration via response differentiation.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="conversation not found",
+        ) from None
+    log.info(
+        "agent suggestion generated",
+        conversation_id=conversation_id,
+        tenant_id=tenant_id,
+        turn_kind=result.turn_kind,
+        citation_count=len(result.citations),
+    )
+    return SuggestionOut(
+        conversation_id=result.conversation_id,
+        suggested_text=result.suggested_text,
+        citations=result.citations,
+        retrieval_score_max=result.retrieval_score_max,
+        warning=result.warning,
+        turn_kind=result.turn_kind,  # type: ignore[arg-type]
+    )

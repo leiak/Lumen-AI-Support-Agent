@@ -23,10 +23,23 @@ disturbing the conversation API contract.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from conversation.enums import ConversationStatus
+
+# ---------------------------------------------------------------------------
+# Stage 8.3 — AI-suggested reply shapes
+# ---------------------------------------------------------------------------
+
+# Truncation limit for ``CitationOut.text``. The full chunk text
+# lives in the chunks table and could be very long (KB articles
+# can run thousands of characters per chunk); the frontend only
+# needs enough to render a tooltip / preview. 200 chars keeps the
+# suggestion payload compact while still showing the chunk's
+# gist for the agent to verify the citation.
+CITATION_TEXT_MAX_CHARS = 200
 
 
 class AgentMeOut(BaseModel):
@@ -96,3 +109,76 @@ class ConversationListOut(BaseModel):
     """
 
     items: list[ConversationOut]
+
+
+# ---------------------------------------------------------------------------
+# Stage 8.3 — AI-suggested reply response shapes
+# ---------------------------------------------------------------------------
+
+
+class CitationOut(BaseModel):
+    """One RAG citation surfaced to the agent workspace UI.
+
+    Represents a single retrieved chunk the LLM saw when producing
+    the suggestion. The frontend uses ``article_id`` +
+    ``chunk_index`` to render an ``"(article {id}, chunk {idx})"``
+    link so the agent can verify the citation by jumping to the
+    source article.
+
+    ``text`` is truncated to :data:`CITATION_TEXT_MAX_CHARS` to keep
+    the suggestion payload compact; the full chunk text is
+    available via the KB admin API when the agent needs more
+    context.
+
+    PII: ``article_id`` and ``chunk_index`` are opaque ULIDs /
+    small integers — safe to surface in the response. ``text`` is
+    KB content (already curated by the tenant); it is NOT
+    customer PII, but we still bound its size to keep payloads
+    predictable.
+    """
+
+    article_id: str
+    chunk_index: int
+    text: str
+    score: float
+
+
+# Literal alias for the ``turn_kind`` discriminator on
+# ``SuggestionOut``. Centralised here so the route handler and
+# tests share a single source of truth.
+SuggestionTurnKind = Literal["rag_hit", "no_rag", "no_customer_message", "llm_unavailable"]
+
+
+class SuggestionOut(BaseModel):
+    """Response shape for ``POST /conversations/{id}/suggest-reply``.
+
+    Read-only "show me what the AI would say right now" preview
+    for the agent workspace. The endpoint NEVER persists anything
+    to the DB and NEVER mutates conversation state — every
+    field on this response is a snapshot.
+
+    ``turn_kind`` is the discriminator the frontend uses to drive
+    empty-state UI ("no KB yet" vs. "no customer message" vs.
+    "AI unavailable"):
+
+    * ``rag_hit`` — RAG returned ≥1 chunk and the LLM produced a
+      reply. ``citations`` is populated; ``retrieval_score_max > 0``.
+    * ``no_rag`` — tenant has no KB OR RAG failed (fail-open).
+      ``citations`` is empty; ``suggested_text`` is still populated
+      from the LLM's unaugmented reply.
+    * ``no_customer_message`` — the conversation has no customer
+      turn to anchor a suggestion on. ``suggested_text`` is empty;
+      ``citations`` is empty; ``warning`` is ``None``.
+    * ``llm_unavailable`` — the LLM call failed (rate-limit,
+      provider down, etc.). ``suggested_text`` is
+      :data:`agent.graph.prompts.FALLBACK_MESSAGE`; ``warning``
+      carries ``"llm_unavailable"`` so the frontend can render a
+      retry button without parsing free-form error text.
+    """
+
+    conversation_id: str
+    suggested_text: str
+    citations: list[CitationOut]
+    retrieval_score_max: float
+    warning: str | None = None
+    turn_kind: SuggestionTurnKind
