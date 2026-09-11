@@ -475,11 +475,15 @@ async def upload_article(
         # (already PII-safe: format list + file_name only).
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
-        # The service's only ValueError path is KB-missing (the
-        # parser errors are caught ABOVE before reaching this
-        # branch — ValueError is the base class for the parser's
-        # custom exceptions, so we must catch them first).
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # The service raises ``ValueError`` for two reasons:
+        # 1. KB not visible to the tenant → 404.
+        # 2. ``source_uri`` exceeds the 2000-char cap → 422
+        #    (validation failure, not a missing resource).
+        # The distinguishing substring keeps the response accurate.
+        msg = str(exc)
+        if "knowledge base not found" in msg:
+            raise HTTPException(status_code=404, detail=msg) from exc
+        raise HTTPException(status_code=422, detail=msg) from exc
 
     # Fire-and-forget indexer. Same pattern as create_article —
     # ``_run_indexing`` captures its own exceptions so a failure
@@ -534,6 +538,12 @@ async def reupload_article(
     except OversizeDocumentError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except UnsupportedDocumentType as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        # The service's ValueError paths are all client-input
+        # validation failures (e.g. ``source_uri`` too long).
+        # ``result is None`` (cross-tenant / missing article)
+        # is handled separately below as 404.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if result is None:

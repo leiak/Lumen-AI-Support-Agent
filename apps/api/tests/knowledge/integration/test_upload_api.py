@@ -606,3 +606,118 @@ async def test_upload_requires_auth(
                 f"{path} should reject anonymous caller, got "
                 f"{resp.status_code}: {resp.text}"
             )
+
+
+@pytest.mark.integration
+async def test_reupload_article_concurrent_same_content_returns_skipped_for_loser(
+    tenant_factory: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent reuploads of the SAME content both succeed.
+
+    Regression test for Task 6.10 follow-up Fix 1. Before the fix,
+    :meth:`ArticleService.reupload_article` did a non-atomic
+    check-then-act (``latest_version`` → ``max_version_number`` →
+    ``append_version``). Two concurrent callers would both pass the
+    dedup short-circuit (it reads non-locked) and both try to
+    ``append_version(version_number=max+1)``; the loser's INSERT
+    trips the ``uq_article_versions_article_version`` UNIQUE
+    constraint and surfaces as a 500.
+
+    The fix wraps the read + write in a single transaction with
+    ``SELECT ... FOR UPDATE`` on the ``articles`` row, so the
+    second caller blocks on the row lock, observes the first
+    caller's freshly-committed ``latest_version``, and also
+    hits the dedup short-circuit.
+
+    Asserts:
+
+    * Both HTTP calls return 200 (no 500, no IntegrityError).
+    * Both response bodies have ``skipped=True`` (same content
+      against the same article).
+    * ``version_number`` is 1 in both responses (no new version
+      was minted by either caller).
+    * Exactly one ``ArticleVersion`` row exists in the DB
+      (neither caller duplicated it).
+    """
+    _patch_embed(monkeypatch)
+    await _ensure_collection_ready()
+    kb = await _kb_factory(
+        tenant_id=tenant_factory.id, slug="reupload-concurrent-same"
+    )
+    payload = b"identical body bytes for the concurrent race\n"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_build_app()), base_url="http://test"
+    ) as client:
+        # Seed an INDEXED v1 so both reuploads race against the
+        # same starting state.
+        first = await client.post(
+            f"/api/v1/knowledge/knowledge-bases/{kb.id}/articles/upload",
+            headers=_auth_headers(tenant_id=tenant_factory.id),
+            files=_file_upload(name="seed.txt", payload=payload),
+        )
+        assert first.status_code == 201, first.text
+        article_id = first.json()["id"]
+        await _wait_for_indexed(
+            client=client, tenant_id=tenant_factory.id, article_id=article_id
+        )
+
+        # Fire two concurrent reuploads with IDENTICAL bytes.
+        # ``asyncio.gather`` schedules them on the same loop; the
+        # server-side row lock on ``articles.id`` is what
+        # serializes them — the loser MUST end up at the dedup
+        # short-circuit, not at a UNIQUE-constraint violation.
+        async def _do_reupload(label: str) -> dict:
+            resp = await client.post(
+                f"/api/v1/knowledge/articles/{article_id}/upload",
+                headers=_auth_headers(tenant_id=tenant_factory.id),
+                files=_file_upload(name=f"{label}.txt", payload=payload),
+            )
+            # The bug under test is a 500 with no friendly JSON
+            # body, so surface the full response text for triage
+            # if the assertion below ever trips.
+            assert resp.status_code == 200, (
+                f"concurrent reupload {label!r} should not 500; "
+                f"got {resp.status_code}: {resp.text}"
+            )
+            return resp.json()
+
+        body_a, body_b = await asyncio.gather(
+            _do_reupload("a"),
+            _do_reupload("b"),
+        )
+
+    # Both callers observed the dedup short-circuit: no new
+    # version was minted, ``version_number`` stays at 1.
+    for label, body in (("a", body_a), ("b", body_b)):
+        assert body["skipped"] is True, (
+            f"concurrent reupload {label!r} should have hit the "
+            f"dedup short-circuit, got {body!r}"
+        )
+        assert body["version_number"] == 1, (
+            f"concurrent reupload {label!r} should keep version 1, "
+            f"got version_number={body['version_number']}"
+        )
+        assert body["chunks_indexed"] == 0
+
+    # DB invariant: exactly one ArticleVersion row. A UNIQUE-
+    # constraint failure on the loser would either leave the row
+    # count at 1 (the loser 500s before the INSERT — covered by
+    # the 200 assertion above) or, worse, race into a partial
+    # state with two rows.
+    from sqlalchemy import select
+
+    async with get_session() as session:
+        stmt = select(ArticleVersion).where(
+            ArticleVersion.article_id == article_id
+        )
+        rows = list((await session.execute(stmt)).scalars().all())
+    assert len(rows) == 1, (
+        f"expected exactly 1 ArticleVersion row after concurrent "
+        f"same-content reuploads, got {len(rows)}: "
+        f"version_numbers={[r.version_number for r in rows]}"
+    )
+    assert rows[0].version_number == 1
+
+    await _delete_qdrant_points_for_article(article_id=article_id)

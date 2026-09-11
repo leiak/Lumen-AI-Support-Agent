@@ -40,6 +40,7 @@ import re
 
 from sqlalchemy.exc import IntegrityError
 
+from core.database import get_sessionmaker
 from core.logging import get_logger
 from knowledge.enums import ArticleSourceType, ArticleStatus
 from knowledge.models import (
@@ -71,6 +72,16 @@ log = get_logger(__name__)
 # here for now because the two layers need to fail closed
 # independently.
 _SLUG_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
+
+# Service-layer duplicate of the ``articles.source_uri`` column cap.
+# FastAPI's ``Form()`` does NOT enforce Pydantic ``max_length`` so a
+# caller could otherwise POST a 10 MB ``source_uri`` and saturate the
+# request body / ORM string column before any validation fires. The
+# service is the right layer for this invariant — the API layer
+# delegates the byte cap to ``_read_upload_capped`` and the string
+# cap lives here next to the column-width it mirrors
+# (``knowledge.models.Article.source_uri = String(2000)``).
+SOURCE_URI_MAX_LEN = 2000
 
 
 class KnowledgeBaseService:
@@ -510,6 +521,13 @@ class ArticleService:
             )
             raise ValueError("knowledge base not found")
 
+        # FastAPI's ``Form()`` does NOT enforce Pydantic max_length,
+        # so a 10 MB ``source_uri`` would otherwise be accepted here.
+        # The column itself is ``String(2000)``, so the ORM would
+        # fail at INSERT with an unhelpful DB error — validate up
+        # front so the API can return a clean 422.
+        _validate_source_uri(source_uri)
+
         effective_title = _title_from_filename(file_name) if not title else title.strip()[:500]
 
         parsed = await parse_document(
@@ -551,30 +569,49 @@ class ArticleService:
 
         Flow:
 
-        1. Tenant-scope check (404 if not visible).
-        2. ``parse_document`` → ``ParsedDocument.text``.
+        1. ``parse_document`` → ``ParsedDocument.text``.
+        2. Open a single transaction; acquire a row lock on the
+           ``articles`` row via ``SELECT ... FOR UPDATE``. Two
+           concurrent reuploads of the same article therefore
+           serialize at the DB level — the second blocks until
+           the first commits, then reads the freshly-committed
+           ``latest_version`` and either hits the dedup
+           short-circuit or appends with the correct next
+           ``version_number``. Without this lock, both callers
+           could compute the same ``max + 1`` and the loser
+           would trip ``uq_article_versions_article_version``
+           and surface as a 500.
         3. Compute ``content_hash`` of the parsed text.
-        4. Compare against the latest ``ArticleVersion.content_hash``.
-           On match: return ``ReindexResult(skipped=True, ...)``
-           without minting a new version.
+        4. Compare against the latest ``ArticleVersion.content_hash``
+           in the same session. On match: return
+           ``ReindexResult(skipped=True, ...)`` without minting a
+           new version.
         5. On mismatch: mint ``version_number = max + 1``, append
            the new ``ArticleVersion``, point the article at it,
-           transition to ``INDEXING``. Then run ``index_article``
-           synchronously (mirrors ``reindex_article`` semantics —
-           the response carries the final status + chunk count).
+           transition to ``INDEXING``. Commit. Then run
+           ``index_article`` synchronously (mirrors
+           ``reindex_article`` semantics — the response carries
+           the final status + chunk count).
         6. Optionally patch the title + source_uri if the caller
-           supplied overrides.
+           supplied overrides (separate short transaction after
+           the lock is released — metadata is last-writer-wins,
+           which is the existing pre-fix behavior).
 
         Returns ``None`` when the article is not visible to the
         tenant (API maps to 404).
 
-        Raises ``ValueError`` on ``OversizeDocumentError`` /
-        ``UnsupportedDocumentType`` from the parser (API maps to
-        422).
+        Raises ``ValueError`` on:
+
+        * ``source_uri`` length exceeding :data:`SOURCE_URI_MAX_LEN`
+          (API maps to 422).
+        * ``OversizeDocumentError`` / ``UnsupportedDocumentType``
+          from the parser (API maps to 422).
         """
-        existing = await self.get_article(tenant_id=tenant_id, article_id=article_id)
-        if existing is None:
-            return None
+        # ``source_uri`` cap is enforced here (service layer) rather
+        # than in the API because ``Form()`` does not honour
+        # Pydantic ``max_length`` — the value flows in as a raw
+        # ``str`` and only the service knows the column width.
+        _validate_source_uri(source_uri)
 
         parsed = await parse_document(
             file_bytes=file_bytes,
@@ -583,55 +620,95 @@ class ArticleService:
         )
 
         new_hash = hashlib.sha256(parsed.text.encode("utf-8")).hexdigest()
-        latest = await self._repo.latest_version(article_id=article_id)
 
-        # Dedup short-circuit: identical content → no new version.
-        if latest is not None and latest.content_hash == new_hash:
-            log.info(
-                "knowledge.article.reupload_skipped",
+        # Open ONE session for the whole "read article under lock +
+        # read latest version + append new version" sequence. The
+        # sessionmaker comes from ``core.database`` (same instance
+        # the per-method helpers use, so connection-pool reuse is
+        # preserved). ``expire_on_commit=False`` means the
+        # ``existing`` ORM instance remains usable after commit
+        # for the log line below.
+        sm = get_sessionmaker()
+        async with sm() as session:
+            existing = await self._repo.get_by_id_for_update(
+                session=session,
                 tenant_id=tenant_id,
                 article_id=article_id,
-                version_number=latest.version_number,
             )
-            return ReindexResult(
+            if existing is None:
+                # Cross-tenant or missing — let the caller map to
+                # 404. Roll back so we don't leave an empty
+                # transaction pinned on the pool.
+                await session.rollback()
+                return None
+
+            latest = await self._repo.latest_version(
+                session=session,
                 article_id=article_id,
-                skipped=True,
-                version_number=latest.version_number,
-                status=existing.status,
-                chunks_indexed=0,
             )
 
-        # Mint a new version + flip the article to INDEXING. The
-        # append_version helper wires current_version_id + status
-        # in one transaction so the FK resolves cleanly.
-        max_v = await self._repo.max_version_number(article_id=article_id)
-        new_version_number = max_v + 1
-        new_version = await self._repo.append_version(
-            article_id=article_id,
-            raw_text=parsed.text,
-            content_hash=new_hash,
-            version_number=new_version_number,
-        )
+            # Dedup short-circuit: identical content → no new version.
+            # Because we hold the per-article row lock, a concurrent
+            # reupload of the SAME content will block here, then
+            # read the freshly-committed ``latest`` and ALSO
+            # short-circuit — no UNIQUE-constraint race.
+            if latest is not None and latest.content_hash == new_hash:
+                await session.commit()
+                log.info(
+                    "knowledge.article.reupload_skipped",
+                    tenant_id=tenant_id,
+                    article_id=article_id,
+                    version_number=latest.version_number,
+                )
+                return ReindexResult(
+                    article_id=article_id,
+                    skipped=True,
+                    version_number=latest.version_number,
+                    status=existing.status,
+                    chunks_indexed=0,
+                )
+
+            # Mismatch: compute next version_number from the
+            # latest_version row above (same transaction, so this
+            # can't see stale data) and append in the same session
+            # so the row lock is still held across the write.
+            max_v = (
+                latest.version_number if latest is not None else 0
+            )
+            new_version_number = max_v + 1
+            new_version = await self._repo.append_version(
+                session=session,
+                article_id=article_id,
+                raw_text=parsed.text,
+                content_hash=new_hash,
+                version_number=new_version_number,
+            )
+
+            log.info(
+                "knowledge.article.reuploaded",
+                tenant_id=tenant_id,
+                article_id=article_id,
+                article_version_id=new_version.id,
+                version_number=new_version_number,
+                source_format=parsed.format,
+                byte_count=len(file_bytes),
+            )
+
+            await session.commit()
+            # ``existing.status`` reflects INDEXING after append_version;
+            # ``expire_on_commit=False`` keeps it readable here.
 
         # Optional metadata overrides — only persist when the
         # caller actually passed a non-empty value so PATCH stays
-        # surgical.
+        # surgical. Separate short transaction after the lock is
+        # released; metadata is last-writer-wins (acceptable for
+        # the upload overlay surface).
         if title or source_uri is not None:
             await self._repo.update(
                 article=existing,
                 title=title.strip()[:500] if title else None,
                 source_uri=source_uri,
             )
-
-        log.info(
-            "knowledge.article.reuploaded",
-            tenant_id=tenant_id,
-            article_id=article_id,
-            article_version_id=new_version.id,
-            version_number=new_version_number,
-            source_format=parsed.format,
-            byte_count=len(file_bytes),
-        )
 
         # Run the indexer synchronously so the caller sees the
         # final status + chunk count in the response — same
@@ -682,6 +759,28 @@ def _title_from_filename(file_name: str) -> str:
     else:
         base = file_name
     return base.strip()[:500] or "upload"
+
+
+def _validate_source_uri(source_uri: str | None) -> None:
+    """Enforce the ``articles.source_uri`` length cap at the service layer.
+
+    ``FastAPI.Form()`` does not enforce Pydantic ``max_length``, so
+    without this check a caller could supply an arbitrarily long
+    ``source_uri`` (hundreds of MB) and the request would be
+    accepted up to whatever body cap the ASGI server imposes —
+    long before any Pydantic / ORM validator could refuse it.
+    The column itself is ``String(2000)`` (see
+    :class:`knowledge.models.Article`), so anything longer would
+    also fail at INSERT time with a confusing DB error.
+
+    Raises ``ValueError`` (which the API layer maps to 422) when
+    the input exceeds :data:`SOURCE_URI_MAX_LEN`. ``None`` is
+    allowed — the column is nullable.
+    """
+    if source_uri is not None and len(source_uri) > SOURCE_URI_MAX_LEN:
+        raise ValueError(
+            f"source_uri must be {SOURCE_URI_MAX_LEN} characters or fewer"
+        )
 
 
 # Re-export the parser exceptions so the API layer can catch them

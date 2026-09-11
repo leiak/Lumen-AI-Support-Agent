@@ -29,6 +29,7 @@ import hashlib
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.database import get_session
 from core.id_gen import new_id
@@ -285,6 +286,40 @@ class ArticleRepository:
             )
             return (await session.execute(stmt)).scalar_one_or_none()
 
+    async def get_by_id_for_update(
+        self,
+        *,
+        session: AsyncSession,
+        tenant_id: str,
+        article_id: str,
+    ) -> Article | None:
+        """Look up an Article scoped to ``tenant_id`` with ``SELECT ... FOR UPDATE``.
+
+        Used by the re-upload path (Task 6.10 follow-up) so two
+        concurrent reuploads of the same article serialize at the
+        DB level: the second caller blocks on the row lock until
+        the first commits, then reads the freshly-committed
+        ``latest_version`` and observes the dedup short-circuit
+        instead of racing to ``append_version`` and tripping the
+        ``uq_article_versions_article_version`` UNIQUE constraint.
+
+        The caller owns ``session`` and is responsible for
+        committing / rolling back — this method only acquires the
+        row lock within the caller's transaction.
+
+        Returns ``None`` if the row doesn't exist OR belongs to a
+        different tenant (same shape as :meth:`get_by_id`).
+        """
+        stmt = (
+            select(Article)
+            .where(
+                Article.id == article_id,
+                Article.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
+
     async def list_by_kb(
         self,
         *,
@@ -385,7 +420,7 @@ class ArticleRepository:
             return list((await session.execute(stmt)).scalars().all())
 
     async def max_version_number(
-        self, *, article_id: str
+        self, *, article_id: str, session: AsyncSession | None = None
     ) -> int:
         """Return the highest ``version_number`` for ``article_id``, or 0.
 
@@ -398,19 +433,31 @@ class ArticleRepository:
         No tenant scoping here: ``article_id`` is opaque (ULID) and
         the caller has already verified tenant ownership via
         :meth:`get_by_id`.
+
+        When ``session`` is supplied, the query runs inside the
+        caller's transaction (used by :meth:`ArticleService.reupload_article`
+        to share the per-article row lock with the article read).
+        Otherwise a fresh short-lived session is opened, matching
+        the per-method pattern used by the rest of the repo.
         """
-        async with get_session() as session:
-            stmt = (
-                select(ArticleVersion.version_number)
-                .where(ArticleVersion.article_id == article_id)
-                .order_by(ArticleVersion.version_number.desc())
-                .limit(1)
-            )
+        stmt = (
+            select(ArticleVersion.version_number)
+            .where(ArticleVersion.article_id == article_id)
+            .order_by(ArticleVersion.version_number.desc())
+            .limit(1)
+        )
+        if session is not None:
             row = (await session.execute(stmt)).scalar_one_or_none()
+            return int(row) if row is not None else 0
+        async with get_session() as own_session:
+            row = (await own_session.execute(stmt)).scalar_one_or_none()
             return int(row) if row is not None else 0
 
     async def latest_version(
-        self, *, article_id: str
+        self,
+        *,
+        article_id: str,
+        session: AsyncSession | None = None,
     ) -> ArticleVersion | None:
         """Return the highest-``version_number`` row for ``article_id``.
 
@@ -418,15 +465,22 @@ class ArticleRepository:
         the full row (e.g. to read ``content_hash`` for the re-upload
         dedup short-circuit) use this. Returns ``None`` when the
         article has no versions.
+
+        When ``session`` is supplied, the query runs inside the
+        caller's transaction so the read sees the locked article
+        row + any newly-committed sibling writes from the same
+        caller.
         """
-        async with get_session() as session:
-            stmt = (
-                select(ArticleVersion)
-                .where(ArticleVersion.article_id == article_id)
-                .order_by(ArticleVersion.version_number.desc())
-                .limit(1)
-            )
+        stmt = (
+            select(ArticleVersion)
+            .where(ArticleVersion.article_id == article_id)
+            .order_by(ArticleVersion.version_number.desc())
+            .limit(1)
+        )
+        if session is not None:
             return (await session.execute(stmt)).scalar_one_or_none()
+        async with get_session() as own_session:
+            return (await own_session.execute(stmt)).scalar_one_or_none()
 
     async def append_version(
         self,
@@ -435,6 +489,7 @@ class ArticleRepository:
         raw_text: str,
         content_hash: str,
         version_number: int,
+        session: AsyncSession | None = None,
     ) -> ArticleVersion:
         """Insert a new ``ArticleVersion`` row and wire it as the article's current.
 
@@ -448,6 +503,18 @@ class ArticleRepository:
         between doesn't leave the article pointing at a non-existent
         version.
 
+        When ``session`` is supplied, the caller owns the
+        transaction (used by
+        :meth:`ArticleService.reupload_article` so the article
+        row lock acquired by
+        :meth:`ArticleRepository.get_by_id_for_update` is held
+        across both the read and this write — preventing the
+        concurrent-reupload UNIQUE-constraint race on
+        ``uq_article_versions_article_version``). The caller is
+        then responsible for ``commit()``. When ``session`` is
+        omitted, this method opens its own short-lived session and
+        commits internally.
+
         Returns the freshly-inserted version row.
         """
         version_id = new_id()
@@ -458,7 +525,8 @@ class ArticleRepository:
             raw_text=raw_text,
             content_hash=content_hash,
         )
-        async with get_session() as session:
+
+        async def _do(session: AsyncSession) -> ArticleVersion:
             session.add(version)
             await session.flush()  # ensure version.id is populated
             # Wire the article at the new version. status=INDEXING
@@ -474,8 +542,14 @@ class ArticleRepository:
             await session.flush()
             await session.refresh(article)
             await session.refresh(version)
-            await session.commit()
             return version
+
+        if session is not None:
+            return await _do(session)
+        async with get_session() as own_session:
+            v = await _do(own_session)
+            await own_session.commit()
+            return v
 
 
 # ---------------------------------------------------------------------------
