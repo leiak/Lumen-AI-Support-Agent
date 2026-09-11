@@ -18,7 +18,7 @@
 | 5 | 会话 + 消息 (Conversation + Message + WS 推送) | ✅ | 289+ passed |
 | 6 | 知识库 + RAG (解析 → 切片 → embedding → 检索 → RAG 服务 + eval) | ✅ | 480 passed |
 | 7 | Agent Runtime (LangChain + LangGraph + escalate_to_human tool) | ✅ | 64 passed (52 unit + 12 integration) |
-| 8 | 坐席工作台 API | 🚧 in progress | — |
+| 8 | 坐席工作台 API (me / 发送消息 / queue / claim / suggest-reply) | ✅ | 168+ passed |
 | 9 | 前端 + Web Widget UI | ⏳ pending | — |
 | 10 | 集成 + 可观测性 | ⏳ pending | — |
 
@@ -215,14 +215,17 @@ export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 - `POST /api/v1/widget/token` — 颁发匿名 token
 - `GET /api/v1/widget/channels/{id}/ws` — WebSocket 长连
 
-### Agent (Stage 8, in progress)
+### Agent (Stage 8)
 - `GET /api/v1/agents/me` — 当前用户身份
 - `POST /api/v1/conversations/{id}/messages` — 坐席回复 (agent / admin)
+- `GET /api/v1/agents/queue` — 队列 (PENDING 未分配会话,可按 `status` 过滤)
+- `POST /api/v1/agents/conversations/{id}/claim` — 原子认领 (SELECT FOR UPDATE + status + assigned_agent_id 检查)
+- `POST /api/v1/agents/conversations/{id}/suggest-reply` — AI 建议回复 (READ-ONLY, 返回 suggested_text + citations + turn_kind)
 
 ## 已知技术债 / Stage 10+ 关注点
 
 1. **`_reset_db_singletons` autouse fixture** 在多个集成测试文件重复 — Stage 10 集中到 `apps/api/tests/conftest.py`
-2. **`require_admin` / `require_agent_or_admin` 历史 inline 副本** — Stage 8.1 整合到 `auth/dependencies.py`
+2. ~~**`require_admin` / `require_agent_or_admin` 历史 inline 副本**~~ — Stage 8.1 已整合到 `auth/dependencies.py`
 3. **真实 OpenAI M1 阈值校准** — `make eval-rag-real` 路径待 Stage 10 实施
 4. **多模态 RAG** — `_log_ocr_todo_once` 留待 Stage 7+ 接 vision model
 5. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
