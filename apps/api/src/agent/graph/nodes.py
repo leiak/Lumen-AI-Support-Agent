@@ -64,7 +64,14 @@ from agent.graph.tools import make_escalate_tool
 from conversation.service import ConversationService
 from core.logging import get_logger
 from knowledge.rag_service import RAGService
+from knowledge.retriever import KnowledgeBaseNotFoundError
 from llm_client.client import LLMClient
+from llm_client.exceptions import (
+    InvalidRequest,
+    OutputInvalid,
+    ProviderUnavailable,
+    RateLimited,
+)
 from llm_client.types import (
     ChatMessage as LLMChatMessage,
 )
@@ -74,6 +81,7 @@ from llm_client.types import (
 from llm_client.types import (
     MessageRole as LLMMessageRole,
 )
+from llm_client.types import EmbeddingError
 
 log = get_logger(__name__)
 
@@ -150,6 +158,19 @@ def make_retrieve_node(
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
+        # Defensive guard — Stage 7.1 review nit. A caller that
+        # forgets to populate ``state["messages"]`` (or passes
+        # ``None`` explicitly) should not crash the node with
+        # ``TypeError``; the LLM gets no RAG context and the
+        # turn proceeds with whatever the LLM already knows.
+        if state.get("messages") is None:
+            log.warning(
+                "agent.graph.retrieve_messages_none",
+                tenant_id=state["tenant_id"],
+                conversation_id=state["conversation_id"],
+            )
+            return {"rag_messages": []}
+
         query = _latest_customer_text(state["messages"])
         if query is None:
             return {"rag_messages": []}
@@ -160,12 +181,28 @@ def make_retrieve_node(
                 conversation_id=state["conversation_id"],
                 query=query,
             )
-        except Exception as exc:
-            # Defence-in-depth: RAGService already swallows its own
-            # exceptions, but a regression must never take down the
-            # AI auto-reply. Empty rag_messages + WARNING + error_type.
+        except (EmbeddingError, KnowledgeBaseNotFoundError) as exc:
+            # Typed catch — these are the structural RAG failure
+            # modes the retriever explicitly raises. Logged as
+            # WARNING so an operator can grep for them; the
+            # customer never sees a 500 because of a retrieval
+            # glitch. PII-safe payload — no chunk text, no query.
             log.warning(
                 "agent.graph.retrieve_failed",
+                tenant_id=state["tenant_id"],
+                conversation_id=state["conversation_id"],
+                error_type=type(exc).__name__,
+            )
+            return {"rag_messages": []}
+        except Exception as exc:
+            # Defence-in-depth safety net — should NEVER fire
+            # because RAGService already swallows its own
+            # exceptions, but if a regression sneaks in we
+            # refuse to crash the AI auto-reply. Empty
+            # rag_messages + WARNING + error_type. PII-safe:
+            # no exc_info, no repr, no customer text.
+            log.warning(
+                "agent.graph.retrieve_failed_unexpected",
                 tenant_id=state["tenant_id"],
                 conversation_id=state["conversation_id"],
                 error_type=type(exc).__name__,
@@ -232,25 +269,47 @@ def make_llm_node(
     conv_service:
         Optional conversation service. When ``tools`` is not
         provided and ``conv_service`` is set, the LLM node
-        builds the Stage 7.2 ``escalate_to_human`` tool per
-        turn using the active state's ``tenant_id`` +
+        builds the Stage 7.2 ``escalate_to_human`` tool PER
+        TURN using the active state's ``tenant_id`` +
         ``conversation_id``. This is the production wiring.
+
+        Stage 7.4 update — the LLM node uses
+        :func:`agent.graph.tools.make_escalate_tool` (which
+        reads tenant / conversation IDs from the module-level
+        ``ContextVar`` set by ``SimpleResponder.respond``).
+        When ``conv_service`` is provided and ``tools`` is not,
+        the node constructs a fresh tool per turn; the
+        ContextVar plumbing keeps tenant isolation intact and
+        per-turn rebuild cost is dominated by the LLM round-trip
+        (~500-2000ms vs <1ms for the tool build). Tests that
+        want to spy on tool calls pass a pre-built ``tools``
+        list and bypass the ``ContextVar`` entirely.
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
         tenant_id = state["tenant_id"]
 
+        # Defensive guard — mirrors the retrieve_node guard.
+        # LangGraph fills missing keys with None; an absent
+        # ``messages`` list would crash ``_to_llm_chat_message``
+        # below, so we short-circuit to the fallback before
+        # that happens.
+        if state.get("messages") is None:
+            log.warning(
+                "agent.graph.llm_messages_none",
+                tenant_id=tenant_id,
+                conversation_id=state["conversation_id"],
+            )
+            return {"final_text": FALLBACK_MESSAGE}
+
         # Resolve the per-turn toolset. Test wiring passes a
         # pre-built ``tools`` list; production lets the node
-        # construct the escalation tool from state.
+        # construct the escalation tool per turn (cheap; see
+        # docstring).
         active_tools: list[BaseTool] = list(tools) if tools else []
         if not active_tools and conv_service is not None:
             active_tools = [
-                make_escalate_tool(
-                    tenant_id=tenant_id,
-                    conversation_id=state["conversation_id"],
-                    conv_service=conv_service,
-                )
+                make_escalate_tool(conv_service=conv_service)
             ]
         elif not active_tools:
             # No tools available: this happens when neither
@@ -286,9 +345,32 @@ def make_llm_node(
                 tools=tool_schemas or None,
             )
             response = await client.chat(request)
-        except Exception as exc:
+        except (
+            RateLimited,
+            ProviderUnavailable,
+            OutputInvalid,
+            InvalidRequest,
+        ) as exc:
+            # Typed catch — these are the LLM client's documented
+            # error modes. ``RateLimited`` and ``ProviderUnavailable``
+            # are transient; ``OutputInvalid`` is a parse failure;
+            # ``InvalidRequest`` is a programmer error. None of
+            # them should ever take down the customer turn.
             log.warning(
                 "agent.graph.llm_failed",
+                tenant_id=tenant_id,
+                conversation_id=state["conversation_id"],
+                error_type=type(exc).__name__,
+            )
+            return {"final_text": FALLBACK_MESSAGE}
+        except Exception as exc:
+            # Defence-in-depth safety net — should NEVER fire
+            # because the typed set above covers every documented
+            # LLM-client error mode, but if a regression sneaks
+            # in we refuse to crash the AI auto-reply. PII-safe:
+            # no exc_info, no repr, no customer text.
+            log.warning(
+                "agent.graph.llm_failed_unexpected",
                 tenant_id=tenant_id,
                 conversation_id=state["conversation_id"],
                 error_type=type(exc).__name__,
@@ -303,66 +385,100 @@ def make_llm_node(
         # 7.1's plain-text fakes (``_StubChatResponse`` without
         # ``tool_calls``) working without modification.
         tool_calls = getattr(response, "tool_calls", None) or []
-        for call in tool_calls:
-            if not isinstance(call, dict):
-                continue
-            name = call.get("name")
-            if name != ESCALATION_TOOL_NAME:
-                log.info(
-                    "agent.graph.unknown_tool_call",
-                    tenant_id=tenant_id,
-                    conversation_id=state["conversation_id"],
-                    tool_name=name or "<missing>",
+        if not tool_calls:
+            # No tool calls — fall through to the normal text path.
+            pass
+        else:
+            # Single-tool-call dispatch (Stage 7.4 hardening).
+            # M1's tool surface has exactly one entry point
+            # (``escalate_to_human``); dispatching more than one
+            # would invite inconsistent state transitions. We
+            # honour the FIRST tool call and log a WARNING for
+            # any extras so an operator can detect a misbehaving
+            # provider without taking the customer's turn down.
+            first = tool_calls[0]
+            for extra in tool_calls[1:]:
+                extra_name = (
+                    extra.get("name") if isinstance(extra, dict) else "<unparsed>"
                 )
-                continue
-            tool_obj = tool_by_name.get(name)
-            if tool_obj is None:
-                # Should not happen — factory built tools only
-                # for names it knows. Defensive log + fallback.
                 log.warning(
-                    "agent.graph.tool_not_registered",
+                    "agent.graph.extra_tool_calls_ignored",
                     tenant_id=tenant_id,
                     conversation_id=state["conversation_id"],
-                    tool_name=name,
+                    tool_name=str(extra_name or "<missing>"),
                 )
-                return _fallback_to_text(response, tenant_id, state)
 
-            # The Anthropic provider returns raw ``tool_use`` blocks
-            # with the args under ``input``. OpenAI-style payloads
-            # nest them under ``args`` / ``function.arguments``.
-            # We accept either to keep the dispatcher provider-agnostic.
-            args = _extract_tool_args(call)
-            try:
-                tool_result = await tool_obj.ainvoke(args)
-            except Exception as exc:
-                # Tool failure MUST NOT take down the turn. Fall
-                # back to whatever the LLM originally returned.
+            if not isinstance(first, dict):
                 log.warning(
-                    "agent.graph.tool_call_failed",
+                    "agent.graph.tool_call_unparseable",
                     tenant_id=tenant_id,
                     conversation_id=state["conversation_id"],
-                    tool_name=name,
-                    error_type=type(exc).__name__,
+                    error_type=type(first).__name__,
                 )
-                return _fallback_to_text(response, tenant_id, state)
+            else:
+                name = first.get("name")
+                if name != ESCALATION_TOOL_NAME:
+                    log.info(
+                        "agent.graph.unknown_tool_call",
+                        tenant_id=tenant_id,
+                        conversation_id=state["conversation_id"],
+                        tool_name=name or "<missing>",
+                    )
+                else:
+                    tool_obj = tool_by_name.get(name)
+                    if tool_obj is None:
+                        # Should not happen — factory built
+                        # tools only for names it knows.
+                        # Defensive log + fallback.
+                        log.warning(
+                            "agent.graph.tool_not_registered",
+                            tenant_id=tenant_id,
+                            conversation_id=state["conversation_id"],
+                            tool_name=name,
+                        )
+                        return _fallback_to_text(response, tenant_id, state)
 
-            # The tool returned ``{"escalated": True, "reason": "..."}``.
-            # The customer-facing message is the ``reason`` text
-            # (the same text the LLM would have surfaced anyway).
-            message = _tool_result_to_message(tool_result)
-            if message is None:
-                log.warning(
-                    "agent.graph.tool_result_unparseable",
-                    tenant_id=tenant_id,
-                    conversation_id=state["conversation_id"],
-                    tool_name=name,
-                )
-                return _fallback_to_text(response, tenant_id, state)
+                    # The Anthropic provider returns raw
+                    # ``tool_use`` blocks with the args under
+                    # ``input``. OpenAI-style payloads nest them
+                    # under ``args`` / ``function.arguments``.
+                    # We accept either to keep the dispatcher
+                    # provider-agnostic.
+                    args = _extract_tool_args(first)
+                    try:
+                        tool_result = await tool_obj.ainvoke(args)
+                    except Exception as exc:
+                        # Tool failure MUST NOT take down the
+                        # turn. Fall back to whatever the LLM
+                        # originally returned.
+                        log.warning(
+                            "agent.graph.tool_call_failed",
+                            tenant_id=tenant_id,
+                            conversation_id=state["conversation_id"],
+                            tool_name=name,
+                            error_type=type(exc).__name__,
+                        )
+                        return _fallback_to_text(response, tenant_id, state)
 
-            return {
-                "escalated": True,
-                "escalation_message": message,
-            }
+                    # The tool returned
+                    # ``{"escalated": True, "reason": "..."}``.
+                    # The customer-facing message is the
+                    # ``reason`` text (the same text the LLM
+                    # would have surfaced anyway).
+                    message = _tool_result_to_message(tool_result)
+                    if message is None:
+                        log.warning(
+                            "agent.graph.tool_result_unparseable",
+                            tenant_id=tenant_id,
+                            conversation_id=state["conversation_id"],
+                            tool_name=name,
+                        )
+                        return _fallback_to_text(response, tenant_id, state)
+
+                    return {
+                        "escalated": True,
+                        "escalation_message": message,
+                    }
 
         # ---- Normal text path ---------------------------------------
         text = response.content.strip()
@@ -391,7 +507,7 @@ def make_escalation_node() -> Callable[
     its only purpose is to make the post-escalation step
     auditable in the graph topology. The conversation-side
     effects (status flip, ``ai_handling=False``) were already
-    applied by the tool's ``assign_to_agent`` call.
+    applied by the tool's ``escalate_to_human_queue`` call.
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:

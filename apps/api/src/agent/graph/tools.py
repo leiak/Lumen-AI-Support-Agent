@@ -5,15 +5,45 @@ Stage 7.2. Tools are returned by closure factories that bind
 tenant-scoped state from the outer graph state so the LLM cannot
 smuggle cross-tenant IDs through tool arguments.
 
-Why a closure factory (not runtime injection)?
-----------------------------------------------
+Stage 7.4 — per-turn context dict via ``ContextVar``
+---------------------------------------------------
 
-M1 has one agent process per request and never re-enters the
-graph; the per-tenant services do not change inside a turn.
-Closing them over the factory keeps the tool surface minimal
-and avoids dragging ``langchain.runtime.Runtime`` /
-``InjectedState`` annotations into call sites. The trade-off
-is that every graph run rebuilds the tool — cheap for M1.
+In Stage 7.2 the escalation tool was rebuilt per-turn inside the
+LLM node, with ``tenant_id`` + ``conversation_id`` bound by the
+factory's constructor kwargs. Stage 7.4 hoists tool construction
+out of the per-turn hot path so the graph can build its toolset
+once at ``build_agent_graph`` time. With hoisting, the per-turn
+``tenant_id`` / ``conversation_id`` are no longer available at
+construction; they are only known once ``respond()`` is called.
+
+We solve this with a module-level :class:`contextvars.ContextVar`
+that ``SimpleResponder.respond`` writes just before invoking the
+graph. The tool's closure reads from that ``ContextVar``, NEVER
+from LLM-supplied arguments, so tenant isolation is preserved.
+
+Why ``ContextVar`` (and not a plain ``dict``)?
+---------------------------------------------
+
+* ``ContextVar`` is the asyncio-correct primitive for
+  per-task ambient context. Each :func:`asyncio.create_task`
+  gets its own copy automatically; a plain ``dict`` would
+  cross-contaminate concurrent turns.
+* It survives across ``await`` boundaries without explicit
+  plumbing through every function signature.
+
+Thread-safety caveat
+--------------------
+
+``ContextVar`` is per-task in asyncio. FastAPI handles each
+request in its own task, so request isolation is structural.
+If Stage 7+ adds multi-tenant concurrent graphs in the same
+process (e.g. a worker pool running several agents in parallel
+under one event loop), each task's ``set`` / ``get`` is
+independent and the design still holds. If the codebase ever
+moves to threaded workers, the ``ContextVar`` approach will
+need revisiting — but M1 has a single asyncio event loop and
+we never run agents in worker threads. Stage 7+ should migrate
+to ``langgraph.runtime.Runtime`` for the formal binding.
 
 PII contract
 ------------
@@ -26,7 +56,8 @@ the LLM never sees again.
 """
 from __future__ import annotations
 
-from typing import Any, cast
+import contextvars
+from typing import Any
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
@@ -37,13 +68,60 @@ from core.logging import get_logger
 log = get_logger(__name__)
 
 
+# Per-turn escalation context. ``SimpleResponder.respond`` sets
+# this BEFORE invoking the graph; the escalation tool's closure
+# reads from it. Default sentinel is the empty string so a missed
+# ``set`` (e.g. a test that forgets the wiring) fails loudly in
+# the tool's body rather than silently binding to ``""``.
+_escalation_ctx: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "agent_escalation_ctx", default=("", "")
+)
+
+
+def bind_escalation_context(*, tenant_id: str, conversation_id: str) -> Any:
+    """Bind the current asyncio task's escalation context.
+
+    Called by :meth:`SimpleResponder.respond` before invoking the
+    graph. Returns a token that the caller MUST pass to
+    :func:`reset_escalation_context` after the turn completes —
+    this keeps context state from leaking across requests even
+    though FastAPI's per-task scheduling already isolates them.
+
+    PII-safe: only opaque ULIDs are stored.
+    """
+    return _escalation_ctx.set((tenant_id, conversation_id))
+
+
+def reset_escalation_context(token: Any) -> None:
+    """Restore the previous escalation context.
+
+    Called by :meth:`SimpleResponder.respond` after the graph
+    completes (success OR failure). Symmetric with
+    :func:`bind_escalation_context` — without this, every
+    ``respond()`` call would push another context frame and
+    the chain would grow unbounded over a long-lived responder.
+    """
+    _escalation_ctx.reset(token)
+
+
+def _current_escalation_ids() -> tuple[str, str]:
+    """Return ``(tenant_id, conversation_id)`` for the active turn.
+
+    Falls back to the empty-string sentinel if no caller has bound
+    the context yet — the tool body treats that as a fatal
+    misconfiguration and logs an error.
+    """
+    return _escalation_ctx.get()
+
+
 class EscalateArgs(BaseModel):
     """Pydantic schema for the ``escalate_to_human`` tool arguments.
 
     LangChain's ``@tool`` decorator inspects ``args_schema`` to
     build the JSON Schema sent to the model. ``tenant_id`` and
     ``conversation_id`` are intentionally NOT in this schema —
-    they are bound by the closure factory below.
+    they are bound via the module-level ``ContextVar`` rather
+    than via the tool's constructor kwargs (Stage 7.4 hoisting).
     """
 
     reason: str = Field(
@@ -63,24 +141,19 @@ class EscalateArgs(BaseModel):
 
 def make_escalate_tool(
     *,
-    conversation_id: str,
-    tenant_id: str,
     conv_service: ConversationService | None = None,
 ) -> BaseTool:
-    """Build a configured ``escalate_to_human`` tool bound to one conversation.
+    """Build a configured ``escalate_to_human`` tool.
 
-    The factory pattern mirrors :func:`agent.graph.nodes.make_llm_node`
-    — every per-turn resource is closed over the tool factory so
-    the LLM cannot influence tenant scoping.
+    Stage 7.4 — the tool reads ``tenant_id`` / ``conversation_id``
+    from the module-level :data:`_escalation_ctx` ``ContextVar``
+    instead of from constructor kwargs. This lets
+    :func:`agent.graph.graph.build_agent_graph` construct the
+    tool ONCE at graph-compile time and reuse it across every
+    turn in the responder's lifetime.
 
     Parameters
     ----------
-    conversation_id:
-        Opaque conversation ULID. Bound into the closure; the
-        tool never reads it from the LLM's arguments.
-    tenant_id:
-        Opaque tenant ULID. Same as above — tenant isolation is
-        enforced by closure capture, not by trusting tool args.
     conv_service:
         Conversation service. When ``None`` a fresh
         :class:`ConversationService` is constructed; tests pass
@@ -96,22 +169,19 @@ def make_escalate_tool(
     Notes
     -----
     The returned tool's ``ainvoke`` calls
-    :meth:`ConversationService.assign_to_agent` with
-    ``agent_id=None``. ``assign_to_agent`` is typed as
-    ``agent_id: str`` but semantically treats ``None`` as
-    "no agent assigned yet — waiting in queue". We use
-    :func:`typing.cast` to document this intentional widening;
-    the column itself is nullable, so the assignment is safe
-    at runtime.
+    :meth:`ConversationService.escalate_to_human_queue` — a
+    dedicated service method that flips the conversation to
+    ``PENDING`` with ``assigned_agent_id=None`` and
+    ``ai_handling=False``. We deliberately do NOT call
+    :meth:`ConversationService.assign_to_agent` because that
+    method's contract is "move the conversation to a SPECIFIC
+    agent" (typed ``agent_id: str``); the queue-wait semantic
+    of escalation is its own state transition and deserves its
+    own service surface.
     """
     if conv_service is None:
         conv_service = ConversationService()
 
-    # Bind these so the inner function closes over them. Renaming
-    # to ``_bound_*`` makes accidental reuse from another tool
-    # obvious in stack traces.
-    _bound_tenant_id = tenant_id
-    _bound_conversation_id = conversation_id
     _bound_conv_service = conv_service
 
     @tool("escalate_to_human", args_schema=EscalateArgs)
@@ -129,11 +199,25 @@ def make_escalate_tool(
         customer. Do NOT include any internal IDs in the
         response.
         """
+        tenant_id, conversation_id = _current_escalation_ids()
+        if not tenant_id or not conversation_id:
+            # No caller has bound the per-turn context. This
+            # is a wiring bug — the graph was invoked without
+            # ``SimpleResponder.respond`` setting the context
+            # first. We log at WARNING (operator-visible) and
+            # re-raise so the LLM node falls back to text.
+            log.warning(
+                "agent.graph.escalation_context_missing",
+                error_type="EscalationContextMissing",
+            )
+            raise RuntimeError(
+                "escalate_to_human invoked without a bound escalation context"
+            )
+
         try:
-            await _bound_conv_service.assign_to_agent(
-                tenant_id=_bound_tenant_id,
-                conversation_id=_bound_conversation_id,
-                agent_id=cast(str, None),
+            await _bound_conv_service.escalate_to_human_queue(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
             )
         except Exception as exc:
             # The tool MUST NOT crash the LLM turn. A failed
@@ -142,8 +226,8 @@ def make_escalate_tool(
             # LLM's normal text response. PII-safe log line.
             log.warning(
                 "agent.graph.escalation_failed",
-                tenant_id=_bound_tenant_id,
-                conversation_id=_bound_conversation_id,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
                 error_type=type(exc).__name__,
             )
             # Re-raise so the llm_node's tool-ainvoke path
@@ -153,8 +237,8 @@ def make_escalate_tool(
 
         log.info(
             "agent.graph.escalated_to_human",
-            tenant_id=_bound_tenant_id,
-            conversation_id=_bound_conversation_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
             has_summary=1 if summary else 0,
         )
         # Customer-facing payload. The caller turns this into
@@ -171,5 +255,7 @@ def make_escalate_tool(
 # Public surface for tests / future tool additions.
 __all__ = [
     "EscalateArgs",
+    "bind_escalation_context",
     "make_escalate_tool",
+    "reset_escalation_context",
 ]

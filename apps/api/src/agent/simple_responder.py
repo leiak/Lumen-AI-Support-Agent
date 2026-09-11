@@ -39,6 +39,10 @@ from agent.graph.prompts import (
     SUMMARY_MAX_TOKENS,
     SUMMARY_TEMPERATURE,
 )
+from agent.graph.tools import (
+    bind_escalation_context,
+    reset_escalation_context,
+)
 from agent.llm_factory import _default_llm_client_factory
 from conversation.enums import MessageRole
 from conversation.models import Message
@@ -183,20 +187,64 @@ class SimpleResponder:
         )
 
         graph = self._ensure_graph()
-        # ``ainvoke`` accepts a dict that conforms to ``AgentState``.
-        # LangGraph fills any missing keys with ``None``; we pass all
-        # of them explicitly so the TypedDict contract is met.
-        result_state: dict[str, Any] = await graph.ainvoke(
-            {
-                "tenant_id": tenant_id,
-                "conversation_id": conversation_id,
-                "messages": messages,
-                "rag_messages": [],
-                "final_text": None,
-                "escalated": False,
-                "escalation_message": None,
-            }
+
+        # Stage 7.4 — bind the per-turn escalation context BEFORE
+        # invoking the graph. The hoisted ``escalate_to_human`` tool
+        # reads tenant_id / conversation_id from this ContextVar;
+        # without it, the tool would raise (and the LLM node would
+        # fall back to text). The token MUST be reset on every
+        # exit path — see the ``finally`` block below.
+        ctx_token = bind_escalation_context(
+            tenant_id=tenant_id, conversation_id=conversation_id
         )
+        try:
+            # ``ainvoke`` accepts a dict that conforms to
+            # ``AgentState``. LangGraph fills any missing keys with
+            # ``None``; we pass all of them explicitly so the
+            # TypedDict contract is met.
+            #
+            # Stage 7.4 — wrap ``graph.ainvoke`` in a single
+            # ``except Exception`` so a graph-level bug never
+            # propagates to the caller. The nodes already fail-safe
+            # individually, but a wiring regression (e.g. a bad
+            # conditional edge) would otherwise escape as an
+            # unhandled exception and 500 the conversation endpoint.
+            try:
+                result_state: dict[str, Any] = await graph.ainvoke(
+                    {
+                        "tenant_id": tenant_id,
+                        "conversation_id": conversation_id,
+                        "messages": messages,
+                        "rag_messages": [],
+                        "final_text": None,
+                        "escalated": False,
+                        "escalation_message": None,
+                    }
+                )
+            except Exception as exc:
+                logger.warning(
+                    "agent.graph_invoke_failed",
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    error_type=type(exc).__name__,
+                )
+                return AgentResponse(
+                    content_text=FALLBACK_MESSAGE,
+                    role=MessageRole.AI,
+                )
+        finally:
+            reset_escalation_context(ctx_token)
+
+        # Stage 7.4 — operator-visible escalation breadcrumb.
+        # WARNING level so it stands out in metrics dashboards. We
+        # NEVER log the escalation ``reason`` / ``summary`` text —
+        # those are customer-facing PII and stay in the DB only.
+        if bool(result_state.get("escalated")):
+            logger.warning(
+                "agent.turn.escalated",
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+            )
 
         final_text = result_state.get("final_text")
         if not isinstance(final_text, str) or not final_text.strip():

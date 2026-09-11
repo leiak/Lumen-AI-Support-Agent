@@ -1,23 +1,37 @@
-"""Compiled agent graph for the M1 LangChain + LangGraph integration.
+r"""Compiled agent graph for the M1 LangChain + LangGraph integration.
 
-Stage 7.2 graph topology::
+Stage 7.4 graph topology::
 
     START -> retrieve -> llm -> conditional
                                   |- escalated=True  -> escalation_node -> END
                                   \- escalated=False -> END
 
-Tools (Stage 7.2 ships ``escalate_to_human`` only) are built
-per-turn inside the LLM node using
-:func:`agent.graph.tools.make_escalate_tool` — the
-``conv_service`` parameter is plumbed through the graph builder
-into the LLM node closure so the tool can bind ``tenant_id`` +
-``conversation_id`` from the runtime state. The compiled graph
-is intended to be invoked *once per AI turn* via
-``await graph.ainvoke({...})`` — there is no checkpointing and
-no streaming yet.
+Stage 7.4 changes
+-----------------
+
+1. **Tool construction hoisted out of the per-turn hot path.**
+   :func:`build_agent_graph` builds the ``escalate_to_human``
+   tool ONCE (when ``conv_service`` is provided) and threads it
+   into :func:`make_llm_node`. Per-turn ``tenant_id`` +
+   ``conversation_id`` are bound via the module-level
+   :class:`contextvars.ContextVar` in
+   :mod:`agent.graph.tools`, set by :class:`SimpleResponder` at
+   the start of each turn.
+
+2. **Per-graph-flow timing metrics.** Each ``ainvoke`` emits a
+   pair of ``log.info`` events (``agent.graph.invoke.started``
+   / ``agent.graph.invoke.completed``) with ``duration_ms`` and
+   ``turn_kind`` (``"rag_hit"`` / ``"no_rag"`` / ``"escalated"``)
+   so an operator can grep the structured logs for retrieval /
+   LLM latency and the escalation rate.
+
+The compiled graph is intended to be invoked *once per AI turn*
+via ``await graph.ainvoke({...})`` — there is no checkpointing
+and no streaming yet.
 """
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -29,9 +43,13 @@ from agent.graph.nodes import (
     make_retrieve_node,
 )
 from agent.graph.state import AgentState
+from agent.graph.tools import make_escalate_tool
 from conversation.service import ConversationService
+from core.logging import get_logger
 from knowledge.rag_service import RAGService
 from llm_client.client import LLMClient
+
+log = get_logger(__name__)
 
 # Local type alias matching the per-tenant LLMClient factory used
 # elsewhere in the agent package.
@@ -58,6 +76,22 @@ def _route_after_llm(state: AgentState) -> str:
     return END
 
 
+def _classify_turn_kind(state: AgentState) -> str:
+    """Return one of ``"rag_hit"`` / ``"no_rag"`` / ``"escalated"``
+    based on the merged post-graph state.
+
+    Used for the per-turn ``log.info`` so an operator can group
+    latency / failure metrics by turn kind without parsing
+    message content.
+    """
+    if bool(state.get("escalated")):
+        return "escalated"
+    rag_messages = state.get("rag_messages") or []
+    if rag_messages:
+        return "rag_hit"
+    return "no_rag"
+
+
 def build_agent_graph(
     *,
     rag_service: RAGService,
@@ -82,16 +116,17 @@ def build_agent_graph(
         Model identifier forwarded to ``LLMClient.chat``.
     conv_service:
         Stage 7.2 — conversation service threaded into the LLM
-        node's closure so the ``escalate_to_human`` tool factory
-        can call :meth:`ConversationService.assign_to_agent` at
-        runtime. When ``None`` the LLM node defaults to a fresh
-        :class:`ConversationService` for the escalation tool.
+        node's closure. When provided, the graph hoists
+        ``escalate_to_human`` tool construction to graph-build
+        time (Stage 7.4). The tool reads its tenant / conversation
+        IDs from the module-level ``ContextVar`` bound by
+        :class:`SimpleResponder` at the start of each turn.
 
     Returns
     -------
     langgraph.graph.state.CompiledStateGraph
         A compiled graph object exposing ``.ainvoke(...)`` and
-        ``.invoke(...)``. Stage 7.2 uses ``ainvoke`` only.
+        ``.invoke(...)``. Stage 7.4 uses ``ainvoke`` only.
 
     Notes
     -----
@@ -104,6 +139,18 @@ def build_agent_graph(
     """
     graph: Any = StateGraph(AgentState)
 
+    # ---- Stage 7.4: hoist tool construction --------------------------
+    # Build the escalation tool ONCE here (when conv_service is
+    # provided) so the per-turn hot path doesn't rebuild the
+    # LangChain ``@tool`` decorator's StructuredTool each time.
+    # Per-turn tenant / conversation IDs flow through the
+    # module-level ``ContextVar`` set by SimpleResponder.
+    hoisted_tools = (
+        [make_escalate_tool(conv_service=conv_service)]
+        if conv_service is not None
+        else None
+    )
+
     # Nodes ----------------------------------------------------------
     graph.add_node("retrieve", make_retrieve_node(rag_service=rag_service))
     graph.add_node(
@@ -111,7 +158,7 @@ def build_agent_graph(
         make_llm_node(
             llm_client_factory=llm_client_factory,
             model=model,
-            conv_service=conv_service,
+            tools=hoisted_tools,
         ),
     )
     graph.add_node(_ESCALATION_NODE, make_escalation_node())
@@ -135,7 +182,70 @@ def build_agent_graph(
     )
     graph.add_edge(_ESCALATION_NODE, END)
 
-    return graph.compile()
+    compiled = graph.compile()
+    return _wrap_with_metrics(compiled)
+
+
+def _wrap_with_metrics(compiled: Any) -> Any:
+    """Wrap a compiled graph's ``ainvoke`` with timing metrics.
+
+    Stage 7.4 — emits ``agent.graph.invoke.started`` and
+    ``agent.graph.invoke.completed`` ``log.info`` events with
+    ``duration_ms`` and ``turn_kind`` so an operator can
+    compute retrieval / LLM latency and the escalation rate
+    from structured logs alone. PII-safe: only opaque IDs and
+    counts; never message content.
+
+    Errors raised by ``ainvoke`` propagate (the caller —
+    :class:`SimpleResponder` — catches them and returns the
+    fallback). We do NOT swallow graph exceptions here; the
+    safety-net ``except Exception`` belongs at the node level.
+    """
+    ainvoke = compiled.ainvoke
+
+    async def _instrumented_ainvoke(
+        state: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        tenant_id = state.get("tenant_id") if isinstance(state, dict) else None
+        conversation_id = (
+            state.get("conversation_id") if isinstance(state, dict) else None
+        )
+        log.info(
+            "agent.graph.invoke.started",
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+        )
+        start = time.perf_counter()
+        try:
+            result = await ainvoke(state, **kwargs)
+        except BaseException:
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            log.warning(
+                "agent.graph.invoke.failed",
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                duration_ms=round(duration_ms, 3),
+            )
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        turn_kind: str
+        if isinstance(result, dict):
+            # Cast to the strict TypedDict only for the classifier;
+            # the caller's contract is still a plain dict.
+            turn_kind = _classify_turn_kind(result)  # type: ignore[arg-type]
+        else:
+            turn_kind = "unknown"
+        log.info(
+            "agent.graph.invoke.completed",
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            duration_ms=round(duration_ms, 3),
+            turn_kind=turn_kind,
+        )
+        return result  # type: ignore[no-any-return]
+
+    compiled.ainvoke = _instrumented_ainvoke
+    return compiled
 
 
 __all__ = ["build_agent_graph"]

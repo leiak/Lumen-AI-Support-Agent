@@ -597,16 +597,16 @@ async def test_responder_does_not_inject_rag_twice() -> None:
 
 
 class _ConvServiceSpy:
-    """Spy capturing ``assign_to_agent`` invocations.
+    """Spy capturing ``escalate_to_human_queue`` invocations.
 
     Records kwargs so tests can assert tenant / conversation ID
-    binding and the ``agent_id=None`` semantics without touching
-    the DB. Used to wire the Stage 7.2 escalation path through
+    binding and the queue-wait semantic without touching the DB.
+    Used to wire the Stage 7.2 escalation path through
     :class:`SimpleResponder`.
     """
 
     def __init__(self) -> None:
-        self.assign_calls: list[dict[str, object]] = []
+        self.escalate_calls: list[dict[str, object]] = []
 
     async def get(
         self, *, tenant_id: str, conversation_id: str
@@ -634,14 +634,13 @@ class _ConvServiceSpy:
             )
         ]
 
-    async def assign_to_agent(
-        self, *, tenant_id: str, conversation_id: str, agent_id: str
+    async def escalate_to_human_queue(
+        self, *, tenant_id: str, conversation_id: str
     ) -> MagicMock:
-        self.assign_calls.append(
+        self.escalate_calls.append(
             {
                 "tenant_id": tenant_id,
                 "conversation_id": conversation_id,
-                "agent_id": agent_id,
             }
         )
         m = MagicMock()
@@ -670,11 +669,11 @@ def _fake_llm_client_with_tool_call(
 
 
 @pytest.mark.asyncio
-async def test_simple_responder_calls_assign_to_agent_on_escalation() -> None:
+async def test_simple_responder_calls_escalate_to_human_queue_on_escalation() -> None:
     """End-to-end via :class:`SimpleResponder`: when the LLM fires
     ``escalate_to_human``, the responder's conversation service
-    must see ``assign_to_agent`` invoked with the bound
-    ``tenant_id`` + ``conversation_id`` and ``agent_id=None``."""
+    must see ``escalate_to_human_queue`` invoked with the bound
+    ``tenant_id`` + ``conversation_id``."""
     from agent.graph.prompts import ESCALATION_TOOL_NAME
 
     conv_service = _ConvServiceSpy()
@@ -701,12 +700,11 @@ async def test_simple_responder_calls_assign_to_agent_on_escalation() -> None:
     assert result.role == MessageRole.AI
     assert result.content_text == "Customer asked for a human"
     # Escalation mutated conversation state — but NOT through a
-    # new DB message. The spy captured exactly one assign call.
-    assert conv_service.assign_calls == [
+    # new DB message. The spy captured exactly one escalate call.
+    assert conv_service.escalate_calls == [
         {
             "tenant_id": "t-simple",
             "conversation_id": "c-simple",
-            "agent_id": None,
         }
     ]
 
@@ -768,6 +766,121 @@ async def test_simple_responder_does_not_persist_synthetic_messages() -> None:
     # initial ``respond`` history fetch. No second read after
     # the tool path, no synthetic persistence call.
     assert pre_count == 1
-    # The escalation went through ``assign_to_agent`` (the
-    # only sanctioned side effect).
-    assert len(conv_service.assign_calls) == 1
+    # The escalation went through ``escalate_to_human_queue``
+    # (the only sanctioned side effect).
+    assert len(conv_service.escalate_calls) == 1
+
+
+# ----- Stage 7.4: SimpleResponder entry-point polish --------------------
+
+
+@pytest.mark.asyncio
+async def test_simple_responder_logs_escalation_event(capsys: object) -> None:
+    """Stage 7.4 — when the graph returns ``escalated=True``,
+    :class:`SimpleResponder` MUST emit an ``agent.turn.escalated``
+    WARNING (operator-visible). The event MUST NOT contain any
+    customer-facing text (no ``reason`` / ``summary``).
+    """
+    from agent.graph.prompts import ESCALATION_TOOL_NAME
+
+    conv_service = _ConvServiceSpy()
+    fake_client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-metric-sr",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "Customer asked for a human"},
+            }
+        ]
+    )
+
+    responder = SimpleResponder(
+        conv_service=conv_service,  # type: ignore[arg-type]
+        llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+
+    result = await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    assert result is not None
+    # Capture stdout where structlog writes.
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "agent.turn.escalated" in out
+    # PII-safe: no customer-facing text leaks into the log line.
+    assert "Customer asked for a human" not in out
+
+
+@pytest.mark.asyncio
+async def test_simple_responder_returns_fallback_on_graph_exception(
+    capsys: object,
+) -> None:
+    """Stage 7.4 — if ``graph.ainvoke`` raises (wiring regression,
+    conditional-edge bug, etc.), :class:`SimpleResponder` MUST
+    return an ``AgentResponse`` with ``FALLBACK_MESSAGE`` rather
+    than propagating the exception to the caller.
+    """
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(
+        return_value=[_msg(MessageRole.CUSTOMER, "hi")]
+    )
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: AsyncMock(),
+        rag_service=_empty_rag_service(),
+    )
+
+    # Force ``graph.ainvoke`` to raise on the next call. The
+    # responder MUST catch it and return ``FALLBACK_MESSAGE``.
+    graph = responder._ensure_graph()  # type: ignore[attr-defined]
+    original_ainvoke = graph.ainvoke
+
+    async def _boom(_state: object) -> object:
+        raise RuntimeError("graph wiring regression")
+
+    graph.ainvoke = _boom
+    try:
+        result = await responder.respond(tenant_id="t1", conversation_id="c1")
+    finally:
+        graph.ainvoke = original_ainvoke
+
+    assert result is not None
+    assert result.content_text == FALLBACK_MESSAGE
+    assert result.role == MessageRole.AI
+    # An operator-visible WARNING was logged with the exception
+    # class name. PII-safe: no exc_info, no repr.
+    out = capsys.readouterr().out  # type: ignore[attr-defined]
+    assert "agent.graph_invoke_failed" in out
+    assert "RuntimeError" in out
+
+
+@pytest.mark.asyncio
+async def test_simple_responder_resets_escalation_context_on_success() -> None:
+    """Stage 7.4 — ``respond()`` resets the per-turn
+    ``ContextVar`` after a successful turn so a subsequent turn
+    in the same task doesn't inherit stale IDs.
+    """
+    from agent.graph.tools import _escalation_ctx
+
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(
+        return_value=[_msg(MessageRole.CUSTOMER, "hi")]
+    )
+
+    fake_client = _fake_client(content="ok")
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    # After the turn, the ContextVar is reset to its default
+    # sentinel (empty strings).
+    assert _escalation_ctx.get() == ("", "")

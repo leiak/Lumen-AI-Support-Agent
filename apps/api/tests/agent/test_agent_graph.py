@@ -494,29 +494,27 @@ async def test_llm_node_threads_tenant_id_to_factory() -> None:
 
 
 class _ConvServiceSpy:
-    """Spy for ``ConversationService.assign_to_agent``.
+    """Spy for ``ConversationService.escalate_to_human_queue``.
 
     Records calls so tests can assert tenant / conversation ID
-    binding without touching the real DB. ``assign_to_agent`` is
-    the only surface the escalation tool calls, so spying on it
+    binding without touching the real DB. ``escalate_to_human_queue``
+    is the only surface the escalation tool calls, so spying on it
     is sufficient.
     """
 
     def __init__(self) -> None:
-        self.assign_calls: list[dict[str, Any]] = []
+        self.escalate_calls: list[dict[str, Any]] = []
 
-    async def assign_to_agent(
+    async def escalate_to_human_queue(
         self,
         *,
         tenant_id: str,
         conversation_id: str,
-        agent_id: Any,
     ) -> Any:
-        self.assign_calls.append(
+        self.escalate_calls.append(
             {
                 "tenant_id": tenant_id,
                 "conversation_id": conversation_id,
-                "agent_id": agent_id,
             }
         )
         return None
@@ -546,24 +544,37 @@ def _fake_llm_client_with_tool_call(
 
 @pytest.mark.asyncio
 async def test_escalate_tool_factory_binds_tenant_and_conversation() -> None:
-    """Tool's ``ainvoke`` MUST forward the closed-over
-    ``tenant_id`` / ``conversation_id`` to
-    :meth:`ConversationService.assign_to_agent`, not whatever the
-    LLM claims in its tool arguments."""
-    spy = _ConvServiceSpy()
-    tool_obj = make_escalate_tool(
-        tenant_id="t-escalate",
-        conversation_id="c-escalate",
-        conv_service=spy,  # type: ignore[arg-type]
+    """Tool's ``ainvoke`` MUST forward the bound
+    ``tenant_id`` / ``conversation_id`` (read from the per-turn
+    ``ContextVar``) to
+    :meth:`ConversationService.escalate_to_human_queue`, not
+    whatever the LLM claims in its tool arguments.
+
+    Stage 7.4 — the tool factory no longer takes tenant / conv
+    kwargs directly. The test binds them via
+    :func:`bind_escalation_context` (the same entry point
+    ``SimpleResponder.respond`` uses) and cleans up via
+    :func:`reset_escalation_context`.
+    """
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
     )
 
-    result = await tool_obj.ainvoke({"reason": "I need a human"})
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(conv_service=spy)  # type: ignore[arg-type]
+    token = bind_escalation_context(
+        tenant_id="t-escalate", conversation_id="c-escalate"
+    )
+    try:
+        result = await tool_obj.ainvoke({"reason": "I need a human"})
+    finally:
+        reset_escalation_context(token)
 
-    assert spy.assign_calls == [
+    assert spy.escalate_calls == [
         {
             "tenant_id": "t-escalate",
             "conversation_id": "c-escalate",
-            "agent_id": None,
         }
     ]
     assert result == {"escalated": True, "reason": "I need a human"}
@@ -576,16 +587,20 @@ async def test_escalate_tool_returns_escalated_dict() -> None:
     The ``summary`` arg is internal-only — must NOT appear in the
     returned payload (which becomes the customer-facing message).
     """
-    spy = _ConvServiceSpy()
-    tool_obj = make_escalate_tool(
-        tenant_id="t1",
-        conversation_id="c1",
-        conv_service=spy,  # type: ignore[arg-type]
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
     )
 
-    result = await tool_obj.ainvoke(
-        {"reason": "Out of scope", "summary": "internal-only note"}
-    )
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(conv_service=spy)  # type: ignore[arg-type]
+    token = bind_escalation_context(tenant_id="t1", conversation_id="c1")
+    try:
+        result = await tool_obj.ainvoke(
+            {"reason": "Out of scope", "summary": "internal-only note"}
+        )
+    finally:
+        reset_escalation_context(token)
 
     assert result == {"escalated": True, "reason": "Out of scope"}
     assert "summary" not in result
@@ -596,36 +611,47 @@ async def test_llm_node_invokes_escalation_tool_on_tool_call() -> None:
     """When the LLM fires ``escalate_to_human``, the node MUST
     invoke the tool with the parsed args, set
     ``state["escalated"]=True``, and surface the customer-facing
-    message in ``state["escalation_message"]``."""
-    spy = _ConvServiceSpy()
-    tool_obj = make_escalate_tool(
-        tenant_id="t1",
-        conversation_id="c1",
-        conv_service=spy,  # type: ignore[arg-type]
-    )
-    client = _fake_llm_client_with_tool_call(
-        tool_calls=[
-            {
-                "type": "tool_use",
-                "id": "toolu-1",
-                "name": ESCALATION_TOOL_NAME,
-                "input": {"reason": "Customer asked for a human"},
-            }
-        ],
-    )
-    node = make_llm_node(
-        llm_client_factory=_make_factory(client),
-        model=DEFAULT_MODEL,
-        tools=[tool_obj],
-    )
-    state = _state(messages=[HumanMessage(content="transfer me to a human")])
+    message in ``state["escalation_message"]``.
 
-    result = await node(state)
+    Stage 7.4 — the test passes a pre-built ``tools=[tool_obj]``
+    (so it bypasses the LLM node's per-turn ContextVar path)
+    AND binds the ContextVar so the tool body resolves its
+    tenant / conversation IDs.
+    """
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
+    )
+
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(conv_service=spy)  # type: ignore[arg-type]
+    token = bind_escalation_context(tenant_id="t1", conversation_id="c1")
+    try:
+        client = _fake_llm_client_with_tool_call(
+            tool_calls=[
+                {
+                    "type": "tool_use",
+                    "id": "toolu-1",
+                    "name": ESCALATION_TOOL_NAME,
+                    "input": {"reason": "Customer asked for a human"},
+                }
+            ],
+        )
+        node = make_llm_node(
+            llm_client_factory=_make_factory(client),
+            model=DEFAULT_MODEL,
+            tools=[tool_obj],
+        )
+        state = _state(messages=[HumanMessage(content="transfer me to a human")])
+
+        result = await node(state)
+    finally:
+        reset_escalation_context(token)
 
     assert result["escalated"] is True
     assert result["escalation_message"] == "Customer asked for a human"
     # Spy was invoked exactly once with the bound IDs.
-    assert len(spy.assign_calls) == 1
+    assert len(spy.escalate_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -688,7 +714,19 @@ async def test_llm_node_tool_call_failure_falls_back_to_text() -> None:
 @pytest.mark.asyncio
 async def test_graph_routes_to_escalation_node_when_escalated() -> None:
     """End-to-end: ``ainvoke`` returns state with ``escalated=True``
-    and the escalation message in ``final_text``."""
+    and the escalation message in ``final_text``.
+
+    Stage 7.4 — the hoisted ``escalate_to_human`` tool reads its
+    tenant / conversation IDs from the per-turn ``ContextVar``
+    that ``SimpleResponder`` would normally bind. This test
+    binds the ContextVar directly because it bypasses the
+    responder.
+    """
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
+    )
+
     spy = _ConvServiceSpy()
     client = _fake_llm_client_with_tool_call(
         tool_calls=[
@@ -711,13 +749,18 @@ async def test_graph_routes_to_escalation_node_when_escalated() -> None:
         conversation_id="c-route",
         messages=[HumanMessage(content="transfer me")],
     )
-
-    result = await graph.ainvoke(dict(state))
+    token = bind_escalation_context(
+        tenant_id="t-route", conversation_id="c-route"
+    )
+    try:
+        result = await graph.ainvoke(dict(state))
+    finally:
+        reset_escalation_context(token)
 
     assert result["escalated"] is True
     assert result["final_text"] == "Escalation reason"
     assert result["escalation_message"] == "Escalation reason"
-    assert len(spy.assign_calls) == 1
+    assert len(spy.escalate_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -763,3 +806,257 @@ async def test_graph_escalation_node_is_trivial_passthrough() -> None:
     result = await node(state)
 
     assert result == {"final_text": "Connecting you with a colleague"}
+
+
+# ----- Stage 7.4: state-machine polish + metrics -------------------------
+
+
+import contextlib
+import io
+
+
+class _StructlogCapture:
+    """Captures structlog events emitted during a code block.
+
+    The M1 logger config (``core.logging.configure_logging``)
+    uses a ``PrintLoggerFactory`` that writes to ``sys.stdout``.
+    We :func:`contextlib.redirect_stdout` to a buffer for the
+    duration of the test, then expose the captured text so
+    tests can assert on event names.
+
+    Note: the test environment does NOT invoke
+    ``configure_logging`` (that's a process-startup concern),
+    so structlog falls back to its default ``ConsoleRenderer``
+    which produces plain-text lines like
+    ``2026-09-11 12:00:00 [info] event_name key=value``.
+    We do NOT parse JSON; we just substring-match.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = io.StringIO()
+        self.text: str = ""
+        self._redirect_cm: Any = None
+
+    def __enter__(self) -> "_StructlogCapture":
+        self._redirect_cm = contextlib.redirect_stdout(self.buffer)
+        self._redirect_cm.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        assert self._redirect_cm is not None
+        self._redirect_cm.__exit__(*exc)
+        self.text = self.buffer.getvalue()
+
+    def has_event(self, event_name: str) -> bool:
+        """Return True if ``event_name`` appears as a token in
+        any captured log line."""
+        return event_name in self.text
+
+    def count_event(self, event_name: str) -> int:
+        """Return the number of captured lines that contain
+        ``event_name`` as a token."""
+        return sum(1 for line in self.text.splitlines() if event_name in line)
+
+
+@pytest.mark.asyncio
+async def test_retrieve_node_handles_none_messages() -> None:
+    """Stage 7.4 — ``state["messages"] is None`` MUST NOT crash
+    the retrieve node; it short-circuits to an empty rag list.
+    """
+    rag_service = _capturing_rag_service()
+    node = make_retrieve_node(rag_service=rag_service)
+    state: AgentState = {
+        "tenant_id": "t1",
+        "conversation_id": "c1",
+        "messages": None,  # type: ignore[typeddict-item]
+        "rag_messages": [],
+        "final_text": None,
+        "escalated": False,
+        "escalation_message": None,
+    }
+
+    result = await node(state)
+
+    assert result == {"rag_messages": []}
+    # RAG service is NOT called when there are no messages to
+    # anchor the query on — the node short-circuits earlier.
+    rag_service.build_context_for_query.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llm_node_handles_multiple_tool_calls_first_wins() -> None:
+    """Stage 7.4 — when the LLM returns 2+ tool calls, the node
+    dispatches ONLY the first and logs a WARNING for the rest.
+    """
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
+    )
+
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(conv_service=spy)  # type: ignore[arg-type]
+    token = bind_escalation_context(tenant_id="t1", conversation_id="c1")
+    try:
+        client = _fake_llm_client_with_tool_call(
+            tool_calls=[
+                {
+                    "type": "tool_use",
+                    "id": "toolu-first",
+                    "name": ESCALATION_TOOL_NAME,
+                    "input": {"reason": "first wins"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu-second",
+                    "name": ESCALATION_TOOL_NAME,
+                    "input": {"reason": "second ignored"},
+                },
+            ],
+        )
+        node = make_llm_node(
+            llm_client_factory=_make_factory(client),
+            model=DEFAULT_MODEL,
+            tools=[tool_obj],
+        )
+        state = _state(messages=[HumanMessage(content="transfer me")])
+
+        with _StructlogCapture() as capture:
+            result = await node(state)
+    finally:
+        reset_escalation_context(token)
+
+    assert result["escalated"] is True
+    assert result["escalation_message"] == "first wins"
+    # Exactly one escalation was performed — the second tool call
+    # was logged but not dispatched.
+    assert len(spy.escalate_calls) == 1
+    # The "extras ignored" WARNING was emitted with the second
+    # tool name.
+    assert capture.has_event("agent.graph.extra_tool_calls_ignored")
+
+
+@pytest.mark.asyncio
+async def test_llm_node_handles_typed_llm_exceptions() -> None:
+    """Stage 7.4 — typed LLM exceptions (``RateLimited``,
+    ``ProviderUnavailable``) downgrade to ``FALLBACK_MESSAGE``
+    with a WARNING + ``error_type``. The node never raises."""
+    from llm_client.exceptions import ProviderUnavailable, RateLimited
+
+    for exception_cls in (RateLimited, ProviderUnavailable):
+        client = _capturing_llm_client(raises=exception_cls("boom"))
+        node = make_llm_node(
+            llm_client_factory=_make_factory(client),
+            model=DEFAULT_MODEL,
+        )
+        state = _state(messages=[HumanMessage(content="hi")])
+
+        with _StructlogCapture() as capture:
+            result = await node(state)
+
+        assert result == {"final_text": FALLBACK_MESSAGE}
+        # The typed-catch path logged a WARNING carrying
+        # ``error_type`` matching the exception class name.
+        assert capture.has_event("agent.graph.llm_failed")
+        assert exception_cls.__name__ in capture.text
+
+
+@pytest.mark.asyncio
+async def test_graph_emits_timing_metrics() -> None:
+    """Stage 7.4 — ``build_agent_graph`` wraps ``ainvoke`` so each
+    invocation emits ``agent.graph.invoke.started`` AND
+    ``agent.graph.invoke.completed`` with ``duration_ms`` and
+    ``turn_kind``.
+    """
+    rag_service = _capturing_rag_service()
+    client = _capturing_llm_client(content="ok")
+    graph = build_agent_graph(
+        rag_service=rag_service,
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+    )
+    state = _state(messages=[HumanMessage(content="hi")])
+
+    with _StructlogCapture() as capture:
+        await graph.ainvoke(dict(state))
+
+    assert capture.has_event("agent.graph.invoke.started")
+    assert capture.has_event("agent.graph.invoke.completed")
+    # The completed event carries duration_ms + turn_kind.
+    completed_lines = [
+        line for line in capture.text.splitlines()
+        if "agent.graph.invoke.completed" in line
+    ]
+    assert len(completed_lines) == 1
+    assert "duration_ms" in completed_lines[0]
+    assert "turn_kind" in completed_lines[0]
+    assert "no_rag" in completed_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_graph_emits_timing_metrics_with_rag() -> None:
+    """Stage 7.4 — RAG-hitting turn is classified ``rag_hit``."""
+    rag_service = _capturing_rag_service(chunks=["chunk-1"])
+    client = _capturing_llm_client(content="ok")
+    graph = build_agent_graph(
+        rag_service=rag_service,
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+    )
+    state = _state(messages=[HumanMessage(content="hi")])
+
+    with _StructlogCapture() as capture:
+        await graph.ainvoke(dict(state))
+
+    completed_lines = [
+        line for line in capture.text.splitlines()
+        if "agent.graph.invoke.completed" in line
+    ]
+    assert len(completed_lines) == 1
+    assert "rag_hit" in completed_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_graph_emits_timing_metrics_with_escalation() -> None:
+    """Stage 7.4 — escalated turn is classified ``escalated``."""
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
+    )
+
+    spy = _ConvServiceSpy()
+    client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-metric",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "metric reason"},
+            }
+        ],
+    )
+    graph = build_agent_graph(
+        rag_service=_capturing_rag_service(),
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+        conv_service=spy,  # type: ignore[arg-type]
+    )
+    state = _state(
+        tenant_id="t-metric",
+        conversation_id="c-metric",
+        messages=[HumanMessage(content="transfer me")],
+    )
+    token = bind_escalation_context(
+        tenant_id="t-metric", conversation_id="c-metric"
+    )
+    try:
+        with _StructlogCapture() as capture:
+            await graph.ainvoke(dict(state))
+    finally:
+        reset_escalation_context(token)
+
+    completed_lines = [
+        line for line in capture.text.splitlines()
+        if "agent.graph.invoke.completed" in line
+    ]
+    assert len(completed_lines) == 1
+    assert "escalated" in completed_lines[0]
