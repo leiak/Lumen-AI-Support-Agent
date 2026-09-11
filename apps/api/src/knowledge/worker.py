@@ -44,9 +44,11 @@ Design constraints
   key) would need an extra round-trip to find existing IDs; delete +
   insert is simpler and the chunk count is small.
 * **No raw error text in DB / logs.** ``Article.error_message``
-  stores ONLY ``type(exc).__name__``. The full ``repr(exc)`` is logged
-  separately at WARNING level for operator debug — never returned to
-  the caller in any user-facing surface.
+  stores ONLY ``type(exc).__name__``. No ``repr(exc)`` is ever
+  emitted — exception args can carry PII (e.g. OpenAI keys, file
+  paths, infra hints), and structured debug logging is a Stage 7+
+  concern. Operators rely on ``error_type`` (class name) plus the
+  stack trace from the surrounding log handler.
 * **PII-safe logs.** Logs carry opaque IDs (ULIDs), counts, status
   names, and ``error_type``. NEVER raw text, chunk text, error
   messages, or embedding vectors.
@@ -190,13 +192,14 @@ async def index_article(*, article_id: str) -> IndexResult:
 
     On ANY exception after the article has been moved to ``INDEXING``,
     we transition to ``FAILED`` and store ONLY the exception class
-    name in ``error_message``. The full ``repr(exc)`` is logged
-    separately at WARNING level so operators have a debug trail
-    without exposing PII or infra hints in the database.
+    name in ``error_message``. The full ``repr(exc)`` is NEVER logged
+    — exception args can carry PII (OpenAI keys, file paths, infra
+    hints) and structured debug logging is a Stage 7+ concern.
 
-    A failure in the FINAL status update is swallowed + ERROR-logged
+    A failure in the FINAL status update is surfaced at ERROR level
     because we already did the work — a flaky commit must not mask a
-    successful index.
+    successful index, but operators MUST see that the article is in
+    an inconsistent state so they can investigate.
     """
     # Step 1. Load article + version + KB.
     async with get_session() as session:
@@ -475,9 +478,9 @@ async def index_article(*, article_id: str) -> IndexResult:
 
 
 # ``error_type_only`` — we deliberately store ONLY the exception
-# class name in Article.error_message. The full repr is logged at
-# WARNING level so operators can debug without exposing PII / infra
-# hints in the database.
+# class name in Article.error_message. No repr(exc) is ever logged
+# (exception args can carry PII / infra hints). Operators rely on the
+# class name plus the surrounding log handler's stack trace.
 def _qdrant_point_id(chunk_id: str) -> str:
     """Compute a deterministic Qdrant point ID from a chunk ULID.
 
@@ -592,36 +595,50 @@ async def _fail_and_return(
     exc: BaseException,
     chunks_indexed: int,
 ) -> IndexResult:
-    """Common failure path: log full repr, persist class name, return FAILED.
+    """Common failure path: log class name, persist class name, return FAILED.
 
     Steps:
 
-    1. Emit a WARNING log with the FULL repr (PII-safe because
-       ``repr(exc)`` only carries exception class + args; the
-       underlying message is the caller's responsibility to keep
-       short and non-PII).
+    1. Emit a WARNING log carrying ONLY ``type(exc).__name__``. The
+       full ``repr(exc)`` is NEVER logged — exception args can carry
+       PII (OpenAI keys, file paths, infra hints). Operators rely on
+       the class name plus the surrounding log handler's stack
+       trace. Structured debug logging is a Stage 7+ concern.
     2. Persist ONLY ``type(exc).__name__`` to ``Article.error_message``.
     3. Transition ``Article.status`` to ``FAILED``.
-    4. Return ``IndexResult`` with ``status=FAILED``.
+    4. If step 2 + 3 fails (transient DB error during the FAILED
+       transition itself), emit a distinct ERROR-level event so the
+       stale ``INDEXING`` state is visible to operators. We do NOT
+       swallow silently — a stale ``INDEXING`` blocks retries.
+    5. Return ``IndexResult`` with ``status=FAILED``.
     """
     error_type = type(exc).__name__
 
-    # 1. Operator-facing log: carries full repr for debug.
+    # 1. Operator-facing log: ONLY the exception class name. Never
+    # repr(exc) — exception args can leak PII.
     log.warning(
         "knowledge.index.failed",
         article_id=article_id,
         error_type=error_type,
-        error_repr=repr(exc),
     )
 
     # 2 + 3. Persist class name + FAILED status. We use
     # _set_status with the explicit error_message so the column is
-    # updated atomically with the status change. We swallow any DB
-    # failure here — see _set_status for the rationale.
-    await _set_status(
+    # updated atomically with the status change.
+    persisted = await _set_status(
         article_id,
         ArticleStatus.FAILED,
         error_message=error_type,
     )
+    if not persisted:
+        # The FAILED transition itself failed (e.g. transient DB
+        # error). The article is likely stuck in INDEXING — that's
+        # a visible bug, not something to swallow. Surface it with a
+        # distinct event name so operators can search for it.
+        log.error(
+            "knowledge.index.failed_status_persist_failed",
+            article_id=article_id,
+            target_status=ArticleStatus.FAILED.value,
+        )
 
     return IndexResult(chunks_indexed=chunks_indexed, status=ArticleStatus.FAILED)

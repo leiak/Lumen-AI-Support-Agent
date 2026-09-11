@@ -561,8 +561,9 @@ async def test_index_article_failure_sets_failed_status(
         article_after = await _get_article(article.id)
         assert article_after.status == ArticleStatus.FAILED
         assert article_after.error_message is not None
-        # error_message starts with the class name (no raw exception text).
-        assert article_after.error_message.startswith("EmbeddingError")
+        # error_message is EXACTLY the exception class name — no raw
+        # exception text is ever persisted (PII / infra hints).
+        assert article_after.error_message == "EmbeddingError"
         # Must not contain the secret we seeded in the original exc.
         assert "sk-test-12345" not in (article_after.error_message or "")
 
@@ -599,7 +600,7 @@ async def test_index_article_oversize_text_marks_failed(
         assert article_after.status == ArticleStatus.FAILED
         # chunker raises ValueError; class name is stored.
         assert article_after.error_message is not None
-        assert article_after.error_message.startswith("ValueError")
+        assert article_after.error_message == "ValueError"
 
         chunks = await _list_chunks_for_version(version.id)
         assert chunks == []
@@ -630,7 +631,7 @@ async def test_index_article_missing_version_marks_failed(
         article_after = await _get_article(article.id)
         assert article_after.status == ArticleStatus.FAILED
         assert article_after.error_message is not None
-        assert article_after.error_message.startswith("ValueError")
+        assert article_after.error_message == "ValueError"
     finally:
         await _delete_qdrant_points_for_article(article_id=article.id)
 
@@ -661,7 +662,7 @@ async def test_qdrant_upsert_failure_marks_failed(
         assert article_after.status == ArticleStatus.FAILED
         # The worker raises RuntimeError when upsert returns 0.
         assert article_after.error_message is not None
-        assert article_after.error_message.startswith("RuntimeError")
+        assert article_after.error_message == "RuntimeError"
 
         # No chunks were persisted (we never reached step 8).
         chunks = await _list_chunks_for_version(version.id)
