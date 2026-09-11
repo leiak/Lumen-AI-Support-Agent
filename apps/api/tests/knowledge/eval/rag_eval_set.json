@@ -1,0 +1,282 @@
+{
+  "version": "1.0",
+  "description": "M1 RAG eval set: 20 synthetic articles across 10 topics, 50 standard queries (5 per topic), and 4 edge-case queries (2 out-of-domain + 2 cross-tenant). Each article embeds a unique MAGIC_PHRASE_<TOPIC>_<N> token so assertions can grep for it. The dataset is plain JSON so it round-trips through git cleanly and is editable without code changes. All text is synthetic — no real customer data, no real company names.",
+  "metadata": {
+    "schema_version": "1.0",
+    "article_count": 20,
+    "query_count": 54,
+    "topics": [
+      "shipping_policy",
+      "return_policy",
+      "payment_methods",
+      "account_management",
+      "product_warranty",
+      "technical_support",
+      "pricing_tiers",
+      "enterprise_sales",
+      "security_compliance",
+      "integrations_api"
+    ],
+    "edge_cases": {
+      "out_of_domain": 2,
+      "cross_tenant": 2
+    },
+    "embedding_model": "text-embedding-3-small",
+    "notes": [
+      "Article text lengths are tuned to ~200-300 words so each article produces exactly one chunk at the default chunk_size=800/overlap=100 settings. The runner does not assert chunk counts but the eval expects a clean 1-chunk-per-article baseline.",
+      "Each topic has 2 articles that are semantically related but distinguishable, so a query can ask about either. expected_top_hit_position records which article should rank first for that query.",
+      "Cross-tenant queries use tenant_id=tenant_eval_other with knowledge_base_id=kb_eval_main. The retriever's KB-existence check fires BEFORE the embedding call, so the runner treats KnowledgeBaseNotFoundError as 'no result' for metric purposes.",
+      "Out-of-domain queries carry expected_relevant_article_ids=[] and expected_top_hit_position=0. The metrics treat these as 0 hits at every depth (a correct 'no relevant document' result is hit_rate=0, MRR=0, nDCG=0). They are included in the aggregate so the eval surfaces their behavior in the report."
+    ]
+  },
+  "tenants": {
+    "tenant_eval_main": {
+      "name": "Eval Main Tenant",
+      "description": "Primary tenant that owns all eval articles and most eval queries."
+    },
+    "tenant_eval_other": {
+      "name": "Eval Other Tenant",
+      "description": "Secondary tenant used ONLY by the cross-tenant isolation queries. This tenant has no KBs, so a cross-tenant query against kb_eval_main must return empty / raise KnowledgeBaseNotFoundError."
+    }
+  },
+  "knowledge_bases": {
+    "kb_eval_main": {
+      "tenant_id": "tenant_eval_main",
+      "name": "Eval Main KB",
+      "slug": "kb-eval-main",
+      "embedding_model": "text-embedding-3-small",
+      "chunk_size": 800,
+      "chunk_overlap": 100,
+      "description": "Single KB holding all 20 eval articles. One KB keeps the eval simple; per-KB scoping is exercised by other tests in test_retriever.py."
+    }
+  },
+  "articles": [
+    {
+      "id": "article_seed_0001",
+      "title": "Standard Shipping Policy",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "shipping_policy",
+      "text": "We ship standard orders via trusted ground carriers across all fifty states. Standard delivery typically arrives within five to seven business days after the order leaves our fulfillment center. Orders placed before 2:00 PM Eastern Time on a weekday are usually dispatched the same day; orders placed after the cutoff or on weekends ship the following business day. Free standard shipping is available on any order totaling fifty dollars or more before taxes and after discounts. For orders below the free-shipping threshold, a flat rate of seven dollars and ninety-nine cents applies. Tracking numbers are emailed to the customer as soon as the label is generated. MAGIC_PHRASE_SHIPPING_001"
+    },
+    {
+      "id": "article_seed_0002",
+      "title": "Express and International Shipping",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "shipping_policy",
+      "text": "Customers who need their order faster can choose express shipping at checkout. Express delivery arrives within one to two business days for domestic addresses and ships via overnight air carriers. The express option is not eligible for free shipping regardless of order value. International shipping is available to most countries and is fulfilled by global freight partners. International delivery times vary by destination and typically range from seven to fourteen business days. Customers are responsible for any applicable import duties, taxes, and customs fees, which are collected by the carrier at the time of delivery. Orders shipping outside the United States cannot be returned to a domestic address and must follow the international returns process. MAGIC_PHRASE_SHIPPING_002"
+    },
+    {
+      "id": "article_seed_0003",
+      "title": "Standard Return Policy",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "return_policy",
+      "text": "Most items can be returned within thirty days of the delivery date for a full refund to the original payment method. To start a return, the customer visits the returns portal and enters the order number plus the email address used at checkout. A prepaid return label is generated and emailed within one business day. Items must be returned in their original packaging with all included accessories and documentation. Refunds are issued within five to seven business days after the warehouse receives and inspects the returned merchandise. A restocking fee of fifteen percent applies to returns of items that show signs of use or that are returned without original packaging. MAGIC_PHRASE_RETURNS_001"
+    },
+    {
+      "id": "article_seed_0004",
+      "title": "Damaged and Defective Returns",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "return_policy",
+      "text": "Items that arrive damaged, defective, or incorrect qualify for a free return with no restocking fee. The customer should contact support within seven days of delivery and include photographs of the issue. Once the claim is approved, a replacement is dispatched at no additional cost, or a full refund is issued if the customer prefers. Items damaged by the customer after delivery, including cosmetic damage from drops or spills, are not eligible for the damaged-item return path. The standard thirty-day window still applies to damaged and defective returns, so customers have time to test the product and report issues. MAGIC_PHRASE_RETURNS_002"
+    },
+    {
+      "id": "article_seed_0005",
+      "title": "Accepted Payment Methods",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "payment_methods",
+      "text": "We accept all major credit and debit cards including Visa, Mastercard, American Express, and Discover. Digital wallets such as Apple Pay, Google Pay, and Shop Pay are supported at checkout for eligible devices. Bank transfers and ACH payments are available for orders above five hundred dollars and may qualify for an additional volume discount. Payment is captured at the time the order is placed, and a confirmation email with the invoice is sent within minutes. For subscription products, the payment method on file is charged automatically on the renewal date, and customers can update the method at any time from the account settings page. MAGIC_PHRASE_PAYMENT_001"
+    },
+    {
+      "id": "article_seed_0006",
+      "title": "Buy Now Pay Later Options",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "payment_methods",
+      "text": "Customers can split eligible purchases into four interest-free payments using a buy now pay later provider. The first payment is due at checkout and the remaining three are billed every two weeks. The option is offered at checkout for orders between fifty dollars and two thousand dollars. Late fees and eligibility decisions are determined entirely by the buy now pay later provider, not by our store. Customers who miss a scheduled payment should contact the provider directly to bring the account current. The buy now pay later option is not available for subscription products, gift cards, or orders shipping to certain restricted regions. MAGIC_PHRASE_PAYMENT_002"
+    },
+    {
+      "id": "article_seed_0007",
+      "title": "Creating and Managing Your Account",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "account_management",
+      "text": "Creating an account is free and only takes a minute. Customers provide a valid email address, choose a password, and confirm the registration via the verification email. Once registered, the customer can save shipping addresses, view order history, track active shipments, store preferred payment methods, and manage email notification preferences. The account dashboard shows loyalty points balance, active subscriptions, and saved items in the wishlist. Account credentials can be updated at any time from the security settings page. Customers who wish to delete their account permanently can submit a deletion request from the privacy section, and the request is processed within thirty days. MAGIC_PHRASE_ACCOUNTS_001"
+    },
+    {
+      "id": "article_seed_0008",
+      "title": "Password Recovery and Two-Factor Authentication",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "account_management",
+      "text": "Customers who forget their password can request a reset link from the login page. The reset link is valid for sixty minutes and can only be used once. For added security, customers can enable two-factor authentication on their account using an authenticator app or SMS codes. Once two-factor authentication is enabled, a one-time code is required at every login from a new device. Trusted devices can be remembered for thirty days so the customer is not prompted on every visit. If the customer loses access to both their password and their two-factor device, identity verification through support is required to restore access. MAGIC_PHRASE_ACCOUNTS_002"
+    },
+    {
+      "id": "article_seed_0009",
+      "title": "Limited Product Warranty",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "product_warranty",
+      "text": "Every product carries a limited manufacturer warranty that covers defects in materials and workmanship under normal use. The standard warranty period is one year from the date of delivery for most products. Premium products in the pro line carry an extended three-year warranty that begins on the same delivery date. The warranty does not cover damage caused by accidents, misuse, unauthorized modification, or normal cosmetic wear. Warranty claims are submitted through the support center and require a proof of purchase plus a description of the issue. Approved claims are resolved by repair, replacement with an equivalent unit, or store credit at the company's discretion. MAGIC_PHRASE_WARRANTY_001"
+    },
+    {
+      "id": "article_seed_0010",
+      "title": "Extended Warranty and Protection Plans",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "product_warranty",
+      "text": "Customers can purchase an extended protection plan at checkout that extends the standard warranty by an additional two years and adds accidental damage coverage. The extended plan must be purchased within thirty days of the original delivery date. Accidental damage claims are subject to a small deductible per incident and are limited to two claims per product per year. Protection plans are non-transferable and tied to the original purchaser. Customers can cancel an extended protection plan within the first sixty days for a full refund; after sixty days the unused portion is refunded on a prorated basis. MAGIC_PHRASE_WARRANTY_002"
+    },
+    {
+      "id": "article_seed_0011",
+      "title": "Getting Technical Support",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "technical_support",
+      "text": "Technical support is available seven days a week via live chat, email, and phone. Live chat operates from 8:00 AM to 10:00 PM Eastern Time. Email inquiries receive a response within one business day. Phone support is available for urgent issues during business hours. Before contacting support, customers should have the product model number and serial number ready, plus a brief description of the issue. The support team can help with setup, troubleshooting, software configuration, and warranty-related questions. Most issues are resolved on the first contact, but escalation paths exist for complex problems. MAGIC_PHRASE_SUPPORT_001"
+    },
+    {
+      "id": "article_seed_0012",
+      "title": "Self-Service Troubleshooting Guides",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "technical_support",
+      "text": "The help center hosts hundreds of step-by-step articles covering common setup, configuration, and troubleshooting topics. Each guide includes screenshots, video walkthroughs, and a printable PDF version. Popular guides cover the first-time setup, factory reset, firmware update, and pairing with common devices. Guides are searchable by product model and by keyword, and a guided troubleshooter walks customers through diagnostic questions to surface the right article. Customers can rate each guide and leave feedback, which is reviewed weekly by the documentation team. New guides are added whenever a recurring customer issue is identified. MAGIC_PHRASE_SUPPORT_002"
+    },
+    {
+      "id": "article_seed_0013",
+      "title": "Consumer Pricing Tiers",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "pricing_tiers",
+      "text": "The consumer pricing structure has three tiers. The free tier includes basic product browsing, the community knowledge base, and standard customer support response times. The plus tier is fifteen dollars per month and adds priority support, free standard shipping on every order, and members-only promotions. The family tier is twenty-five dollars per month and extends the plus benefits to up to five additional household members. All tiers can be canceled at any time, and cancellations take effect at the end of the current billing period. Annual subscribers receive a fifteen percent discount compared to the monthly rate. MAGIC_PHRASE_PRICING_001"
+    },
+    {
+      "id": "article_seed_0014",
+      "title": "Volume Discounts and Bulk Pricing",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "pricing_tiers",
+      "text": "Customers placing large or recurring orders can apply for volume pricing. Orders between fifty and two hundred units receive a five percent discount. Orders between two hundred and one thousand units receive a ten percent discount plus free freight shipping. Orders above one thousand units receive a custom quote that includes negotiated pricing, dedicated account management, and flexible payment terms. Volume pricing is available to both consumer and business customers. Quotes are typically returned within two business days and remain valid for thirty days from the issue date. MAGIC_PHRASE_PRICING_002"
+    },
+    {
+      "id": "article_seed_0015",
+      "title": "Enterprise Sales Process",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "enterprise_sales",
+      "text": "Companies with more than fifty employees or specialized deployment needs are routed to the enterprise sales team. The first step is a discovery call where a sales engineer learns about the use case, the desired rollout timeline, and any integration requirements. Following the discovery call, the customer receives a written proposal with pricing tiers, service-level commitments, and a draft master agreement. The sales cycle for an enterprise engagement typically ranges from four to twelve weeks depending on procurement complexity. Existing customers expanding to new regions or business units can fast-track the process using a streamlined amendment. MAGIC_PHRASE_ENTERPRISE_001"
+    },
+    {
+      "id": "article_seed_0016",
+      "title": "Enterprise Onboarding and Implementation",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "enterprise_sales",
+      "text": "After an enterprise agreement is signed, a dedicated implementation manager is assigned for the duration of the rollout. The implementation manager coordinates technical onboarding, user provisioning, and training sessions tailored to the customer's role taxonomy. Standard onboarding includes a kickoff workshop, two role-based training sessions, and a thirty-day post-launch check-in. Customers with a phased rollout plan can opt for additional training cohorts at no extra cost. The implementation team remains available for the first ninety days to address any adoption friction before transitioning ownership to the standard customer success team. MAGIC_PHRASE_ENTERPRISE_002"
+    },
+    {
+      "id": "article_seed_0017",
+      "title": "Data Security and Privacy Practices",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "security_compliance",
+      "text": "All customer data is encrypted in transit using TLS 1.2 or higher and at rest using AES-256. Access to production data is restricted to a small group of engineers with documented business need, and every access is logged and reviewed. The infrastructure is hosted in SOC 2 Type II audited data centers with redundant power, cooling, and network connectivity. Quarterly third-party penetration tests are performed, and the executive summary of the latest report is available on request under a non-disclosure agreement. The privacy policy describes in detail how customer data is collected, used, retained, and deleted, and the policy is reviewed annually by outside counsel. MAGIC_PHRASE_SECURITY_001"
+    },
+    {
+      "id": "article_seed_0018",
+      "title": "Compliance Certifications and Audits",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "security_compliance",
+      "text": "The platform is certified against SOC 2 Type II, ISO 27001, and HIPAA. Customers in regulated industries can request the latest audit reports, control matrices, and sub-processor lists through the compliance portal. The company undergoes an annual SOC 2 audit performed by a Big Four accounting firm, with no exceptions noted in the most recent report. For customers with GDPR obligations, a data processing addendum is available and can be countersigned electronically. Regional data residency is available in the United States, the European Union, and the Asia-Pacific region for an additional fee. MAGIC_PHRASE_SECURITY_002"
+    },
+    {
+      "id": "article_seed_0019",
+      "title": "REST API Overview and Authentication",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "integrations_api",
+      "text": "The REST API lets developers read and write resources programmatically using familiar HTTP verbs and JSON payloads. Every API request must be authenticated using a bearer token issued from the developer dashboard. Tokens can be scoped to specific resources and can be rotated independently of each other. Rate limits default to one thousand requests per minute per token, and customers on the enterprise plan can request higher limits by contacting support. The base URL is the same for every environment, and the desired environment is selected via the X-Environment header. Sandbox tokens are completely isolated from production tokens. MAGIC_PHRASE_API_001"
+    },
+    {
+      "id": "article_seed_0020",
+      "title": "Webhooks and Event Streaming",
+      "knowledge_base_id": "kb_eval_main",
+      "tenant_id": "tenant_eval_main",
+      "topic": "integrations_api",
+      "text": "Webhooks let customer systems react to events in near real time without polling the REST API. The customer registers a webhook endpoint URL plus a list of subscribed event types from the developer dashboard. Every event delivery includes an HMAC signature header that the customer can use to verify the payload was not tampered with in transit. Failed deliveries are retried with exponential backoff for up to twenty-four hours. For customers who need to stream events into a data warehouse, a managed Kafka connector is available in beta and can be enabled per environment. Event payloads follow a consistent envelope with a stable schema that is versioned independently of the REST API. MAGIC_PHRASE_API_002"
+    }
+  ],
+  "queries": [
+    {"id": "query_0001", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "How long does standard shipping take?", "expected_relevant_article_ids": ["article_seed_0001"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0002", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "Do you offer free shipping on orders over fifty dollars?", "expected_relevant_article_ids": ["article_seed_0001"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0003", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "What is the cutoff time for same-day dispatch?", "expected_relevant_article_ids": ["article_seed_0001"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0004", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "Can I get my order delivered overnight?", "expected_relevant_article_ids": ["article_seed_0002"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0005", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "Do you ship to countries outside the United States?", "expected_relevant_article_ids": ["article_seed_0002"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0006", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "return_policy", "text": "How many days do I have to return an item?", "expected_relevant_article_ids": ["article_seed_0003"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0007", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "return_policy", "text": "Is there a restocking fee for returns?", "expected_relevant_article_ids": ["article_seed_0003"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0008", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "return_policy", "text": "How do I get a prepaid return shipping label?", "expected_relevant_article_ids": ["article_seed_0003"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0009", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "return_policy", "text": "What do I do if my product arrived damaged?", "expected_relevant_article_ids": ["article_seed_0004"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0010", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "return_policy", "text": "Can I get a replacement for a defective item?", "expected_relevant_article_ids": ["article_seed_0004"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0011", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "payment_methods", "text": "Do you accept American Express?", "expected_relevant_article_ids": ["article_seed_0005"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0012", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "payment_methods", "text": "Can I pay with Apple Pay?", "expected_relevant_article_ids": ["article_seed_0005"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0013", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "payment_methods", "text": "When is my credit card charged for a subscription?", "expected_relevant_article_ids": ["article_seed_0005"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0014", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "payment_methods", "text": "Can I pay for my order in four installments?", "expected_relevant_article_ids": ["article_seed_0006"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0015", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "payment_methods", "text": "Is buy now pay later available for gift cards?", "expected_relevant_article_ids": ["article_seed_0006"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0016", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "How do I create an account on your site?", "expected_relevant_article_ids": ["article_seed_0007"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0017", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "Where can I see my past orders?", "expected_relevant_article_ids": ["article_seed_0007"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0018", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "Can I delete my account permanently?", "expected_relevant_article_ids": ["article_seed_0007"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0019", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "I forgot my password and lost my two-factor device. What now?", "expected_relevant_article_ids": ["article_seed_0008"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0020", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "How do I turn on two-factor authentication?", "expected_relevant_article_ids": ["article_seed_0008"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0021", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "product_warranty", "text": "How long is the standard warranty on your products?", "expected_relevant_article_ids": ["article_seed_0009"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0022", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "product_warranty", "text": "Does the warranty cover accidental drops?", "expected_relevant_article_ids": ["article_seed_0009", "article_seed_0010"], "expected_top_hit_position": 2, "category": "standard"},
+    {"id": "query_0023", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "product_warranty", "text": "What does the pro line three-year warranty cover?", "expected_relevant_article_ids": ["article_seed_0009"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0024", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "product_warranty", "text": "How much does an extended protection plan cost?", "expected_relevant_article_ids": ["article_seed_0010"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0025", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "product_warranty", "text": "Can I cancel an extended warranty and get a refund?", "expected_relevant_article_ids": ["article_seed_0010"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0026", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "technical_support", "text": "What are the hours for live chat support?", "expected_relevant_article_ids": ["article_seed_0011"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0027", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "technical_support", "text": "How quickly will I get a reply to an email inquiry?", "expected_relevant_article_ids": ["article_seed_0011"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0028", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "technical_support", "text": "What information do I need before contacting support?", "expected_relevant_article_ids": ["article_seed_0011"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0029", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "technical_support", "text": "How do I factory reset my device?", "expected_relevant_article_ids": ["article_seed_0012"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0030", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "technical_support", "text": "Are there video walkthroughs for the first-time setup?", "expected_relevant_article_ids": ["article_seed_0012"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0031", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "pricing_tiers", "text": "What is included in the free tier?", "expected_relevant_article_ids": ["article_seed_0013"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0032", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "pricing_tiers", "text": "How much does the plus tier cost per month?", "expected_relevant_article_ids": ["article_seed_0013"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0033", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "pricing_tiers", "text": "How many people can be on a family tier plan?", "expected_relevant_article_ids": ["article_seed_0013"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0034", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "pricing_tiers", "text": "Do you offer a discount for large quantity orders?", "expected_relevant_article_ids": ["article_seed_0014"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0035", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "pricing_tiers", "text": "What discount do I get for ordering over one thousand units?", "expected_relevant_article_ids": ["article_seed_0014"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0036", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "enterprise_sales", "text": "How do I get in touch with the enterprise sales team?", "expected_relevant_article_ids": ["article_seed_0015"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0037", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "enterprise_sales", "text": "What does the enterprise sales discovery call cover?", "expected_relevant_article_ids": ["article_seed_0015"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0038", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "enterprise_sales", "text": "How long does a typical enterprise sales cycle take?", "expected_relevant_article_ids": ["article_seed_0015"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0039", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "enterprise_sales", "text": "Who handles onboarding once an enterprise deal is signed?", "expected_relevant_article_ids": ["article_seed_0016"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0040", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "enterprise_sales", "text": "How many training sessions are included with enterprise onboarding?", "expected_relevant_article_ids": ["article_seed_0016"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0041", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "security_compliance", "text": "How is my data encrypted at rest?", "expected_relevant_article_ids": ["article_seed_0017"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0042", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "security_compliance", "text": "Do you perform third-party penetration testing?", "expected_relevant_article_ids": ["article_seed_0017"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0043", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "security_compliance", "text": "Are you SOC 2 certified?", "expected_relevant_article_ids": ["article_seed_0018"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0044", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "security_compliance", "text": "Can I get a copy of your latest audit report?", "expected_relevant_article_ids": ["article_seed_0018"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0045", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "security_compliance", "text": "Do you offer data residency in the European Union?", "expected_relevant_article_ids": ["article_seed_0018"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0046", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "integrations_api", "text": "How do I authenticate requests to your REST API?", "expected_relevant_article_ids": ["article_seed_0019"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0047", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "integrations_api", "text": "What are the default rate limits for API calls?", "expected_relevant_article_ids": ["article_seed_0019"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0048", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "integrations_api", "text": "How can I switch between sandbox and production environments?", "expected_relevant_article_ids": ["article_seed_0019"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0049", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "integrations_api", "text": "How do I set up a webhook to receive events?", "expected_relevant_article_ids": ["article_seed_0020"], "expected_top_hit_position": 1, "category": "standard"},
+    {"id": "query_0050", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": "integrations_api", "text": "Can I verify the signature on a webhook payload?", "expected_relevant_article_ids": ["article_seed_0020"], "expected_top_hit_position": 1, "category": "standard"},
+
+    {"id": "query_0051", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": null, "text": "What is the meaning of life, the universe, and everything?", "expected_relevant_article_ids": [], "expected_top_hit_position": 0, "category": "out_of_domain"},
+    {"id": "query_0052", "tenant_id": "tenant_eval_main", "knowledge_base_id": "kb_eval_main", "topic": null, "text": "Tell me about the fall of the Roman Empire.", "expected_relevant_article_ids": [], "expected_top_hit_position": 0, "category": "out_of_domain"},
+
+    {"id": "query_0053", "tenant_id": "tenant_eval_other", "knowledge_base_id": "kb_eval_main", "topic": "shipping_policy", "text": "How long does standard shipping take?", "expected_relevant_article_ids": [], "expected_top_hit_position": 0, "category": "cross_tenant"},
+    {"id": "query_0054", "tenant_id": "tenant_eval_other", "knowledge_base_id": "kb_eval_main", "topic": "account_management", "text": "How do I create an account on your site?", "expected_relevant_article_ids": [], "expected_top_hit_position": 0, "category": "cross_tenant"}
+  ]
+}
