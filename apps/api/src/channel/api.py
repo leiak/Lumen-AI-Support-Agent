@@ -8,53 +8,25 @@ Five endpoints under `/api/v1/channels`, all behind admin JWT auth:
 - PATCH  /api/v1/channels/{channel_id}  — update name/status/credentials
 - DELETE /api/v1/channels/{channel_id}  — soft-disable (status=DISABLED)
 
-The `require_admin` dependency decodes the JWT and rejects any caller
-whose `role` is not `admin` or `owner`. Tenant context is taken from the
-JWT's `tenant_id` claim; there is no way for a caller to act on a
-different tenant's channels.
+The ``require_admin`` dependency is imported from ``auth.dependencies`` so
+the JWT decode + role enforcement logic lives in one place. Tenant
+context is taken from the JWT's ``tenant_id`` claim; there is no way
+for a caller to act on a different tenant's channels.
 """
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
-from auth.jwt import TokenError, decode_token
+from auth.dependencies import require_admin
 from channel.enums import ChannelStatus, ChannelType
 from channel.models import Channel
 from channel.service import ChannelService
 
-logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/v1/channels", tags=["channels"])
-
-
-# ---- Auth dependency ----------------------------------------------------
-async def require_admin(
-    authorization: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
-    """Decode the Bearer JWT, enforce an admin/owner role, return claims.
-
-    Raises:
-        401 if missing/malformed/invalid.
-        403 if the role is not `admin` or `owner`.
-    """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    token = authorization[len("Bearer "):]
-    try:
-        claims: dict[str, Any] = decode_token(token)
-    except TokenError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    role = claims.get("role")
-    if role not in ("admin", "owner"):
-        raise HTTPException(status_code=403, detail="admin role required")
-    if "tenant_id" not in claims:
-        raise HTTPException(status_code=401, detail="token missing tenant_id")
-    return claims
 
 
 # ---- Schemas ------------------------------------------------------------

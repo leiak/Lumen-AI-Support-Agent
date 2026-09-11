@@ -3,65 +3,65 @@
 All routes under /api/v1/conversations, all behind JWT auth:
 - admin (or owner) role required for state-changing and most read endpoints
 - agent role can hit /inbox to see their assigned conversations
+- agent role can POST /conversations/{id}/messages (Stage 8.1)
+
+Role-gating dependencies are imported from ``auth.dependencies`` so the
+JWT decode + role enforcement logic lives in one place.
 """
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from auth.jwt import TokenError, decode_token
+from auth.dependencies import require_admin, require_agent_or_admin
+from agent.schemas import AgentMessageCreate
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
 from conversation.service import ConversationService
-
-logger = logging.getLogger(__name__)
+from core.logging import get_logger
+from widget.ws.manager import manager as _ws_manager
 
 router = APIRouter(prefix="/api/v1/conversations", tags=["conversations"])
 
+log = get_logger(__name__)
 
-# ---- Auth dependencies --------------------------------------------------
 
-async def _decode_jwt(authorization: str | None) -> dict[str, Any]:
-    """Decode Bearer JWT or raise 401."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
-    token = authorization[len("Bearer "):]
+async def _broadcast_agent_message(
+    *,
+    channel_id: str,
+    conversation_id: str,
+    message_id: str,
+    sender_id: str | None,
+) -> None:
+    """Best-effort WS broadcast of an agent ``message.created`` event.
+
+    Mirrors the Stage 5.3 ``message.complete`` fan-out used by the
+    customer-inbound path. Wrapped in try/except so a dead socket
+    never aborts the agent-reply hot path — the message is already
+    durably persisted and the client can refetch via REST.
+    """
     try:
-        return decode_token(token)
-    except TokenError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-
-
-async def require_admin(
-    authorization: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
-    """JWT auth — admin or owner role required."""
-    claims = await _decode_jwt(authorization)
-    role = claims.get("role")
-    if role not in ("admin", "owner"):
-        raise HTTPException(status_code=403, detail="admin role required")
-    if "tenant_id" not in claims:
-        raise HTTPException(status_code=401, detail="token missing tenant_id")
-    return claims
-
-
-async def require_agent_or_admin(
-    authorization: Annotated[str | None, Header()] = None,
-) -> dict[str, Any]:
-    """JWT auth — agent, admin, or owner allowed."""
-    claims = await _decode_jwt(authorization)
-    role = claims.get("role")
-    if role not in ("agent", "admin", "owner"):
-        raise HTTPException(status_code=403, detail="agent or admin role required")
-    if "tenant_id" not in claims:
-        raise HTTPException(status_code=401, detail="token missing tenant_id")
-    if not claims.get("sub"):
-        raise HTTPException(status_code=401, detail="token missing sub claim")
-    return claims
+        await _ws_manager.broadcast_to_channel(
+            channel_id=channel_id,
+            payload={
+                "type": "message.created",
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "role": MessageRole.AGENT.value,
+                "sender_id": sender_id,
+            },
+        )
+    except Exception as exc:
+        log.warning(
+            "agent message broadcast failed",
+            conversation_id=conversation_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            error_type=type(exc).__name__,
+        )
 
 
 # ---- Schemas ------------------------------------------------------------
@@ -215,6 +215,72 @@ async def list_messages(
     if msgs is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     return MessageListOut(items=[_msg_out(m) for m in msgs])
+
+
+@router.post(
+    "/{conversation_id}/messages",
+    response_model=MessageOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_agent_message(
+    conversation_id: str,
+    body: AgentMessageCreate,
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
+) -> MessageOut:
+    """Post a message AS the calling agent (Stage 8.1 reply box).
+
+    Accepts the ``agent`` role in addition to admin/owner so assigned
+    agents can reply from the workspace. Tenant isolation is enforced
+    inside ``ConversationService.record_message`` — cross-tenant or
+    unknown conversation ids raise ``ValueError`` which we map to 404
+    to keep the anti-enumeration contract.
+
+    Persisting the message also advances ``last_activity_at`` via the
+    service. Broadcasting a ``message.created`` WS event happens AFTER
+    persist so subscribers never see an event for a non-durable row.
+    """
+    stripped = body.stripped_text
+    if not stripped:
+        # Pydantic ``min_length`` would also catch this but only for the
+        # raw string; an all-whitespace payload passes schema validation.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="content_text must not be empty",
+        )
+    tenant_id = claims["tenant_id"]
+    sender_id = claims["sub"]
+    try:
+        msg = await _service().record_message(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            role=MessageRole.AGENT,
+            content_text=stripped,
+            sender_id=sender_id,
+        )
+    except ValueError:
+        # Cross-tenant or unknown — same 404 the rest of the API uses
+        # to prevent enumeration via response differentiation.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="conversation not found"
+        ) from None
+    # Look up the channel so we know where to broadcast. Done after
+    # persist so a broadcast failure cannot turn into a missing message.
+    conv = await _service().get(tenant_id=tenant_id, conversation_id=conversation_id)
+    if conv is not None:
+        await _broadcast_agent_message(
+            channel_id=conv.channel_id,
+            conversation_id=conversation_id,
+            message_id=msg.id,
+            sender_id=sender_id,
+        )
+    log.info(
+        "agent message recorded",
+        conversation_id=conversation_id,
+        tenant_id=tenant_id,
+        sender_id=sender_id,
+        message_id=msg.id,
+    )
+    return _msg_out(msg)
 
 
 @router.post("/{conversation_id}/assign", response_model=ConversationOut)
