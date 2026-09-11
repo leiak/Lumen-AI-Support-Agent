@@ -309,3 +309,134 @@ async def delete_points_by_article_version(
         collection=collection,
     )
     return 1
+
+
+# ---------------------------------------------------------------------------
+# Tenant-scoped search helper used by the retriever (Task 6.11)
+# ---------------------------------------------------------------------------
+
+
+async def search_chunks(
+    *,
+    collection: str,
+    query_vector: list[float],
+    tenant_id: str,
+    knowledge_base_id: str,
+    top_k: int,
+) -> list[qmodels.ScoredPoint]:
+    """Run a Qdrant similarity search with mandatory tenant + KB payload filters.
+
+    Returns a list of :class:`qmodels.ScoredPoint` (highest score first).
+    Returns ``[]`` on no match or on any error — never raises.
+
+    The two MUST-filter payload conditions make this the
+    single, canonical tenant-isolation boundary for vector reads:
+
+    * ``tenant_id`` — prevents cross-tenant leakage at the vector
+      layer. Defense-in-depth alongside the DB-side WHERE clause
+      added by :meth:`knowledge.repository.ChunkRepository.list_by_point_ids`.
+    * ``knowledge_base_id`` — scopes the search to one KB within a
+      tenant (the same tenant may host multiple KBs).
+
+    qdrant-client API note
+    ----------------------
+
+    qdrant-client >= 1.14 unified the old ``search`` /
+    ``search_batch`` / ``recommend`` / ``discover`` / ``scroll``
+    entry points into a single ``query_points`` method that takes a
+    ``query`` parameter (one of the supported query types — for our
+    plain-vector case, the bare ``list[float]`` is interpreted as a
+    nearest-neighbor query against the default vector). The older
+    ``search`` method was removed in 1.19. We call ``query_points``
+    directly so the helper works across the 1.14+ client range and
+    so a future Stage 7+ provider switch (e.g. to ``recommend``)
+    only changes this one call site.
+
+    PII discipline
+    --------------
+
+    On error we log ``collection`` + ``top_k`` + ``error_type`` only.
+    NEVER the query vector (high-dimensional floats are not PII per
+    se, but logging them bloats the log line and risks leaking
+    embedding artifacts) and NEVER the query text (passed in by the
+    caller — the retriever already takes care to not log it).
+    """
+    flt = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="tenant_id",
+                match=qmodels.MatchValue(value=tenant_id),
+            ),
+            qmodels.FieldCondition(
+                key="knowledge_base_id",
+                match=qmodels.MatchValue(value=knowledge_base_id),
+            ),
+        ]
+    )
+
+    try:
+        client = get_qdrant_client()
+    except Exception as exc:  # pragma: no cover - defensive; singleton rarely raises
+        log.warning(
+            "qdrant.search.client_unavailable",
+            collection=collection,
+            top_k=top_k,
+            error_type=type(exc).__name__,
+        )
+        return []
+
+    try:
+        response = await client.query_points(
+            collection_name=collection,
+            # A bare ``list[float]`` is the nearest-neighbor form —
+            # equivalent to the old ``search(query_vector=...)``
+            # call. qdrant-client >= 1.14 unifies all query types
+            # behind this single entry point.
+            query=query_vector,
+            query_filter=flt,
+            limit=top_k,
+            # We hydrate Chunk rows from the DB; Qdrant payload is
+            # redundant for this call path and would only inflate the
+            # wire payload (the worker writes it for scroll /
+            # admin-side debugging).
+            with_payload=False,
+            with_vectors=False,
+            # Score threshold is applied in :func:`retrieve_chunks` so
+            # the operator-facing filter logic stays in one place.
+            score_threshold=None,
+        )
+    except UnexpectedResponse as exc:
+        log.warning(
+            "qdrant.search.failed",
+            collection=collection,
+            top_k=top_k,
+            status_code=getattr(exc, "status_code", None),
+            error_type=type(exc).__name__,
+        )
+        return []
+    except Exception as exc:
+        # ConnectionError / timeout / anything that bubbled up as a
+        # non-UnexpectedResponse. Never raise — the retriever treats
+        # an empty result as "no hits", and we don't want a flaky
+        # Qdrant to fail the whole request.
+        log.warning(
+            "qdrant.search.error",
+            collection=collection,
+            top_k=top_k,
+            error_type=type(exc).__name__,
+        )
+        return []
+
+    # ``query_points`` returns a QueryResponse; the ``points``
+    # attribute holds the scored list (highest first). Defensive
+    # ``list(...)`` so callers always get a real list even if a
+    # future client version returns a generator.
+    scored_points = list(response.points) if response.points else []
+
+    log.info(
+        "qdrant.search.success",
+        collection=collection,
+        top_k=top_k,
+        hit_count=len(scored_points),
+    )
+    return scored_points

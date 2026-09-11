@@ -37,6 +37,7 @@ from knowledge.enums import ArticleSourceType, ArticleStatus
 from knowledge.models import (
     Article,
     ArticleVersion,
+    Chunk,
     KnowledgeBase,
 )
 
@@ -557,7 +558,69 @@ class ArticleRepository:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# ChunkRepository (Task 6.11)
+# ---------------------------------------------------------------------------
+
+
+class ChunkRepository:
+    """Read access to ``chunks`` rows.
+
+    Today this only exposes the single read path the retriever needs.
+    The 6.11 retriever hydrates Chunk rows from the DB by
+    ``qdrant_point_id`` — the worker (Task 6.7) writes the rows, the
+    retriever reads them. Writes stay in :mod:`knowledge.worker` for
+    now.
+
+    Tenant isolation: every read takes ``tenant_id`` as a keyword arg
+    and includes it in the WHERE clause. The service layer is the
+    gatekeeper that decides WHICH ``tenant_id`` to pass; this layer
+    is permissive about NULLs but strict about scoping.
+    """
+
+    async def list_by_point_ids(
+        self,
+        *,
+        tenant_id: str,
+        point_ids: list[str],
+    ) -> dict[str, Chunk]:
+        """Return map of ``qdrant_point_id`` -> Chunk for the given ULIDs.
+
+        Filters by ``tenant_id`` as defense-in-depth even though Qdrant
+        already filtered. Missing chunks (e.g. Qdrant out of sync with
+        the DB after a partial upsert) are simply absent from the
+        returned map; the caller (the retriever) decides how to
+        handle — typically by skipping the orphaned hit so its
+        score doesn't end up surfaced to the user.
+
+        Returns ``{}`` (empty dict) when ``point_ids`` is empty —
+        guards against a useless ``IN ()`` query that some drivers
+        reject.
+
+        PII discipline: logs carry only the count of requested IDs
+        and the count of hits, NEVER the IDs themselves (they are
+        opaque but a log full of them is noise).
+        """
+        if not point_ids:
+            return {}
+
+        async with get_session() as session:
+            stmt = select(Chunk).where(
+                Chunk.tenant_id == tenant_id,
+                Chunk.qdrant_point_id.in_(point_ids),
+            )
+            chunks = list((await session.execute(stmt)).scalars().all())
+
+        # Build the map at the end so we can release the session
+        # before returning — the ORM rows are detached via the
+        # ``expire_on_commit=False`` sessionmaker config (see
+        # core.database.get_sessionmaker), so they're safe to read
+        # outside the session.
+        return {chunk.qdrant_point_id: chunk for chunk in chunks if chunk.qdrant_point_id}
+
+
 __all__ = [
     "ArticleRepository",
+    "ChunkRepository",
     "KnowledgeBaseRepository",
 ]
