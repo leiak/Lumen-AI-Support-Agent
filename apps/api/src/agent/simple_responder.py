@@ -1,33 +1,51 @@
-"""M1 minimal AI auto-reply. Stage 7 will replace this with a LangGraph agent.
+"""M1 minimal AI auto-reply. Stage 7 wraps this around a LangGraph agent.
 
-Builds a chat history from the most recent messages in the conversation
-and calls ``LLMClient.chat()`` with a hardcoded system prompt. The
-response is returned as an ``AgentResponse`` for the caller to persist.
+Public surface (``SimpleResponder.respond``) is unchanged from the
+pre-LangGraph version so the conversation router and all existing
+tests keep working. Internally, ``respond()`` now:
 
-Design constraints:
-- Synchronous-ish (no background queue in Stage 5).
-- Single LLM call per customer message.
-- RAG-augmented (Task 6.12): retrieved context is injected as a
-  synthetic system message at the start of the history when the
-  tenant has a knowledge base. RAG failures degrade silently — the
-  AI still responds without context.
-- No tools (those are Stage 7 / LangGraph).
-- The interface is small enough that Stage 7's LangGraph implementer
-  can ship a drop-in replacement.
+1. Fetches the conversation + recent messages via the existing
+   :class:`ConversationService` calls.
+2. Maps the ORM ``Message`` rows to LangChain ``BaseMessage`` and
+   applies the existing history-trimming + summarization logic
+   (kept in :meth:`SimpleResponder._build_messages`, renamed from
+   ``_build_history`` because the return type is now
+   ``list[BaseMessage]``).
+3. Compiles the LangGraph agent graph (memoized on first call) and
+   invokes it with the assembled state.
+4. Wraps ``state["final_text"]`` into an ``AgentResponse``.
+
+The graph itself is defined in :mod:`agent.graph.graph` —
+``SimpleResponder`` is just the conversation-aware adapter that
+bridges the existing DB layer to the LangGraph state schema.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+
+from agent.graph.graph import build_agent_graph
+from agent.graph.prompts import (
+    _SUMMARIZE_SYSTEM_PROMPT,
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
+    FALLBACK_MESSAGE,
+    FALLBACK_SUMMARY_CHARS,
+    FALLBACK_TRANSCRIPT_CHARS,
+    M1_SYSTEM_PROMPT,
+    SUMMARY_MAX_TOKENS,
+    SUMMARY_TEMPERATURE,
+)
 from agent.llm_factory import _default_llm_client_factory
 from conversation.enums import MessageRole
 from conversation.models import Message
 from conversation.service import ConversationService
-from knowledge.rag_service import RAGService, RagContext
+from knowledge.rag_service import RAGService
 from llm_client.client import LLMClient
-from llm_client.types import ChatMessage as LLMChatMessage
 from llm_client.types import ChatRequest
 from llm_client.types import MessageRole as LLMMessageRole
 
@@ -44,29 +62,32 @@ MAX_HISTORY_MESSAGES = 20  # keep prompts bounded
 # rather than regenerating each turn.
 MAX_HISTORY_BEFORE_SUMMARY = 50
 
-M1_SYSTEM_PROMPT = """You are a friendly customer-service agent for an AI-customer platform.
-Answer the customer's question concisely. If you don't know, say so honestly
-and suggest escalating to a human agent. Reply in the customer's language."""
-
-_SUMMARIZE_SYSTEM_PROMPT = (
-    "You are a helpful assistant. Summarize the following customer service "
-    "conversation in 2-3 sentences. Preserve customer questions, key facts "
-    "(order numbers, products, etc.), and the current state of the issue. "
-    "Be concise."
-)
-
-FALLBACK_MESSAGE = "抱歉,AI 助手暂时无法回复,请稍后再试或联系人工客服。"
-CHAT_TEMPERATURE = 0.7
-CHAT_MAX_TOKENS = 512
-SUMMARY_TEMPERATURE = 0.3
-SUMMARY_MAX_TOKENS = 200
-FALLBACK_TRANSCRIPT_CHARS = 1000
-FALLBACK_SUMMARY_CHARS = 500
-
 
 # Type alias for the per-tenant LLMClient factory. Stage 7+ may swap
 # this for a config-driven resolver that picks model + provider per tenant.
 LLMClientFactory = Callable[[str], LLMClient]
+
+# Re-export the prompt / fallback constants from
+# :mod:`agent.graph.prompts` for backward compatibility. The
+# pre-Stage-7.1 public surface imported these directly from
+# ``agent.simple_responder`` (see ``tests/agent/test_simple_responder.py``
+# and any out-of-tree callers); keep that contract working.
+__all__ = [
+    "CHAT_MAX_TOKENS",
+    "CHAT_TEMPERATURE",
+    "DEFAULT_MODEL",
+    "FALLBACK_MESSAGE",
+    "FALLBACK_SUMMARY_CHARS",
+    "FALLBACK_TRANSCRIPT_CHARS",
+    "M1_SYSTEM_PROMPT",
+    "MAX_HISTORY_BEFORE_SUMMARY",
+    "MAX_HISTORY_MESSAGES",
+    "SUMMARY_MAX_TOKENS",
+    "SUMMARY_TEMPERATURE",
+    "AgentResponse",
+    "LLMClientFactory",
+    "SimpleResponder",
+]
 
 
 @dataclass(frozen=True)
@@ -78,7 +99,13 @@ class AgentResponse:
 
 
 class SimpleResponder:
-    """Minimal M1 agent: single-turn LLM call with RAG context injection."""
+    """Minimal M1 agent: single-turn LLM call with RAG context injection.
+
+    Internally delegates to the LangGraph agent graph defined in
+    :mod:`agent.graph.graph`. The graph is compiled lazily on the
+    first :meth:`respond` call (or eagerly via :meth:`_ensure_graph`)
+    and memoized for the responder's lifetime.
+    """
 
     def __init__(
         self,
@@ -94,9 +121,24 @@ class SimpleResponder:
         )
         # Lazy RAG service so the SimpleResponder can be instantiated
         # in tests that don't need retrieval — the RAG service is only
-        # touched when ``_build_history`` runs.
+        # touched when ``_build_messages`` runs.
         self._rag_service = rag_service or RAGService()
         self._model = model
+        # Compiled LangGraph agent graph. Built lazily on first
+        # ``respond()`` and reused thereafter. ``Any`` because
+        # ``langgraph`` is not fully typed; the public surface we
+        # touch is ``.ainvoke(state_dict)``.
+        self._graph: Any | None = None
+
+    def _ensure_graph(self) -> Any:
+        """Compile the LangGraph agent graph on first use."""
+        if self._graph is None:
+            self._graph = build_agent_graph(
+                rag_service=self._rag_service,
+                llm_client_factory=self._llm_client_factory,
+                model=self._model,
+            )
+        return self._graph
 
     async def respond(
         self,
@@ -110,9 +152,10 @@ class SimpleResponder:
         (e.g., it was transferred to a human agent, or closed). Caller
         should NOT persist anything in that case.
 
-        On LLM failure, logs a WARNING and returns a generic fallback
-        response (so the customer gets *something*). Stage 7+ will
-        replace this with proper escalation.
+        On LLM failure, the graph's ``llm_node`` swallows the exception
+        and writes ``FALLBACK_MESSAGE`` into ``state["final_text"]``, so
+        the customer always gets *something*. Stage 7.2+ will replace
+        this with proper escalation.
         """
         conv = await self._conv_service.get(
             tenant_id=tenant_id, conversation_id=conversation_id
@@ -130,71 +173,70 @@ class SimpleResponder:
             )
             return None
 
-        history = await self._build_history(
+        messages = await self._build_messages(
             tenant_id=tenant_id, conversation_id=conversation_id
         )
-        try:
-            client = self._llm_client_factory(tenant_id)
-            request = ChatRequest(
-                model=self._model,
-                messages=[
-                    LLMChatMessage(
-                        role=LLMMessageRole.SYSTEM, content=M1_SYSTEM_PROMPT
-                    ),
-                    *history,
-                ],
-                temperature=CHAT_TEMPERATURE,
-                max_tokens=CHAT_MAX_TOKENS,
-            )
-            response = await client.chat(request)
-            if not response.content.strip():
-                logger.warning(
-                    "agent: LLM returned empty content, sending fallback",
-                    extra={"conversation_id": conversation_id, "tenant_id": tenant_id},
-                )
-                return AgentResponse(
-                    content_text=FALLBACK_MESSAGE,
-                    role=MessageRole.AI,
-                )
-            return AgentResponse(
-                content_text=response.content,
-                role=MessageRole.AI,
-            )
-        except Exception:
+
+        graph = self._ensure_graph()
+        # ``ainvoke`` accepts a dict that conforms to ``AgentState``.
+        # LangGraph fills any missing keys with ``None``; we pass all
+        # of them explicitly so the TypedDict contract is met.
+        result_state: dict[str, Any] = await graph.ainvoke(
+            {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation_id,
+                "messages": messages,
+                "rag_messages": [],
+                "final_text": None,
+            }
+        )
+
+        final_text = result_state.get("final_text")
+        if not isinstance(final_text, str) or not final_text.strip():
+            # The graph's llm_node already downgrades empty / failed
+            # responses to ``FALLBACK_MESSAGE``, but defend against a
+            # future graph change that yields ``None`` instead.
             logger.warning(
-                "agent: LLM call failed, sending fallback",
+                "agent: graph returned empty final_text, sending fallback",
                 extra={"conversation_id": conversation_id, "tenant_id": tenant_id},
-                exc_info=True,
             )
             return AgentResponse(
                 content_text=FALLBACK_MESSAGE,
                 role=MessageRole.AI,
             )
 
-    async def _build_history(
-        self, *, tenant_id: str, conversation_id: str
-    ) -> list[LLMChatMessage]:
-        """Build the LLM chat history from the most recent messages.
+        return AgentResponse(
+            content_text=final_text,
+            role=MessageRole.AI,
+        )
 
-        Maps our ``MessageRole`` (CUSTOMER/AGENT/AI/SYSTEM/TOOL) to the
-        LLM client's role vocabulary (user/assistant/system). TOOL
-        payloads are skipped because the simple responder does not
-        consume them.
+    async def _build_messages(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> list[BaseMessage]:
+        """Build the LangChain message list from the most recent messages.
+
+        Maps our ``MessageRole`` (CUSTOMER/AGENT/AI/SYSTEM/TOOL) to
+        LangChain's ``BaseMessage`` subclasses. TOOL payloads are
+        skipped because the simple responder does not consume them.
 
         **RAG (Task 6.12).** When the conversation has at least one
         customer message, run :meth:`RAGService.build_context_for_query`
         against the most recent customer message and prepend the
-        formatted chunk block as a synthetic ``system`` message at
-        the start of the history. If retrieval yields no chunks
-        (no KB, no hits, or retrieval error), the history is
-        unchanged — backward-compatible with the no-RAG behaviour.
+        formatted chunk block as a synthetic ``SystemMessage`` at the
+        start of the history. If retrieval yields no chunks (no KB,
+        no hits, or retrieval error), the history is unchanged —
+        backward-compatible with the no-RAG behaviour. (The graph's
+        ``retrieve_node`` does the same RAG lookup independently;
+        we *also* run it here so the summary prompt — when invoked —
+        already has the same RAG context. The graph's lookup is the
+        one used by the LLM.)
 
         When the conversation has more than ``MAX_HISTORY_BEFORE_SUMMARY``
         messages, the oldest overflowing messages are summarized via a
-        separate LLM call and the summary is prepended as a ``system``
-        message. The latest ``MAX_HISTORY_MESSAGES`` are kept verbatim.
-        Stage 7+ should persist the summary on the conversation rather
-        than regenerating it every turn.
+        separate LLM call and the summary is prepended as a
+        ``SystemMessage``. The latest ``MAX_HISTORY_MESSAGES`` are
+        kept verbatim. Stage 7+ should persist the summary on the
+        conversation rather than regenerating it every turn.
 
         The history is defensively capped at ``MAX_HISTORY_MESSAGES +
         MAX_HISTORY_BEFORE_SUMMARY + 1`` so a misbehaving repository
@@ -232,9 +274,8 @@ class SimpleResponder:
                 summary_text = await self._summarize_history(
                     tenant_id=tenant_id, messages=to_summarize
                 )
-                summary_message = LLMChatMessage(
-                    role=LLMMessageRole.SYSTEM,
-                    content=f"Previous conversation summary:\n{summary_text}",
+                summary_message: BaseMessage = SystemMessage(
+                    content=f"Previous conversation summary:\n{summary_text}"
                 )
             except Exception:
                 logger.warning(
@@ -248,9 +289,8 @@ class SimpleResponder:
                 transcript = "\n".join(
                     f"{m.role}: {m.content_text}" for m in to_summarize
                 )[:FALLBACK_TRANSCRIPT_CHARS]
-                summary_message = LLMChatMessage(
-                    role=LLMMessageRole.SYSTEM,
-                    content=f"Earlier conversation (truncated):\n{transcript}",
+                summary_message = SystemMessage(
+                    content=f"Earlier conversation (truncated):\n{transcript}"
                 )
             mapped = [self._map_message(m) for m in to_keep]
             return [
@@ -268,22 +308,18 @@ class SimpleResponder:
             return [rag_message, *tail]
         return tail
 
-    def _map_message(self, m: Message) -> LLMChatMessage | None:
-        """Map our ``Message`` ORM to an LLM ``ChatMessage``.
+    def _map_message(self, m: Message) -> BaseMessage | None:
+        """Map our ``Message`` ORM to a LangChain ``BaseMessage``.
 
         Returns ``None`` for roles we do not forward to the LLM
         (currently only ``TOOL``).
         """
         if m.role == MessageRole.CUSTOMER:
-            return LLMChatMessage(role=LLMMessageRole.USER, content=m.content_text)
+            return HumanMessage(content=m.content_text)
         if m.role in (MessageRole.AGENT, MessageRole.AI):
-            return LLMChatMessage(
-                role=LLMMessageRole.ASSISTANT, content=m.content_text
-            )
+            return AIMessage(content=m.content_text)
         if m.role == MessageRole.SYSTEM:
-            return LLMChatMessage(
-                role=LLMMessageRole.SYSTEM, content=m.content_text
-            )
+            return SystemMessage(content=m.content_text)
         # TOOL — skipped; not consumed by the simple responder
         return None
 
@@ -295,6 +331,8 @@ class SimpleResponder:
         On LLM failure, returns a truncated transcript as a fallback so
         the caller still has *some* context to work with.
         """
+        from llm_client.types import ChatMessage as LLMChatMessage
+
         transcript = "\n".join(
             f"{m.role}: {m.content_text}" for m in messages
         )
@@ -330,7 +368,7 @@ class SimpleResponder:
         tenant_id: str,
         conversation_id: str,
         messages: list[Message],
-    ) -> LLMChatMessage | None:
+    ) -> BaseMessage | None:
         """Build a synthetic RAG system message, or return ``None``.
 
         Looks for the most recent customer message in ``messages``;
@@ -360,12 +398,10 @@ class SimpleResponder:
             return None
 
         try:
-            rag_context: RagContext = (
-                await self._rag_service.build_context_for_query(
-                    tenant_id=tenant_id,
-                    conversation_id=conversation_id,
-                    query=latest_customer.content_text,
-                )
+            rag_context = await self._rag_service.build_context_for_query(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                query=latest_customer.content_text,
             )
         except Exception:
             # Defence-in-depth: the RAG service itself catches
@@ -385,7 +421,4 @@ class SimpleResponder:
         if rag_context.chunk_count == 0 or not rag_context.system_message:
             return None
 
-        return LLMChatMessage(
-            role=LLMMessageRole.SYSTEM,
-            content=rag_context.system_message,
-        )
+        return SystemMessage(content=rag_context.system_message)
