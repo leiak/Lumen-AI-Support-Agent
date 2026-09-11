@@ -49,10 +49,18 @@ SUMMARY_MAX_TOKENS = 200
 FALLBACK_TRANSCRIPT_CHARS = 1000
 FALLBACK_SUMMARY_CHARS = 500
 
+# Tool name for the ``escalate_to_human`` tool. Kept as a single
+# constant so :mod:`agent.graph.nodes` and
+# :mod:`agent.graph.tools` agree on the identifier. The LLM
+# provider surfaces tool calls as raw dicts; matching against
+# this constant is the LLM node's routing rule.
+ESCALATION_TOOL_NAME = "escalate_to_human"
+
 
 __all__ = [
     "CHAT_MAX_TOKENS",
     "CHAT_TEMPERATURE",
+    "ESCALATION_TOOL_NAME",
     "FALLBACK_MESSAGE",
     "FALLBACK_SUMMARY_CHARS",
     "FALLBACK_TRANSCRIPT_CHARS",

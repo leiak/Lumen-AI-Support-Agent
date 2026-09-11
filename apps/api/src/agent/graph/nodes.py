@@ -26,6 +26,13 @@ Design contract
   construction time; the returned coroutine is the actual
   LangGraph node.
 
+* **Tool call failure is non-fatal.** Stage 7.2's
+  ``make_llm_node`` may invoke LangChain tools when the LLM
+  decides to escalate. If the tool raises, the node logs a
+  WARNING and falls back to ``escalated=False`` — the
+  customer always gets *some* answer, even when escalation
+  itself blows up.
+
 Why factories (not LangGraph runtime injection)?
 -----------------------------------------------
 
@@ -43,9 +50,18 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.tools import BaseTool
 
-from agent.graph.prompts import FALLBACK_MESSAGE, M1_SYSTEM_PROMPT
+from agent.graph.prompts import (
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
+    ESCALATION_TOOL_NAME,
+    FALLBACK_MESSAGE,
+    M1_SYSTEM_PROMPT,
+)
 from agent.graph.state import AgentState
+from agent.graph.tools import make_escalate_tool
+from conversation.service import ConversationService
 from core.logging import get_logger
 from knowledge.rag_service import RAGService
 from llm_client.client import LLMClient
@@ -170,24 +186,87 @@ def make_llm_node(
     *,
     llm_client_factory: LLMClientFactory,
     model: str,
+    tools: list[BaseTool] | None = None,
+    conv_service: ConversationService | None = None,
 ) -> Callable[[AgentState], Coroutine[Any, Any, dict[str, Any]]]:
     """Build a configured LLM node bound to ``llm_client_factory`` and ``model``.
 
     The returned coroutine:
       1. Assembles the message list:
          ``[SystemMessage(M1_SYSTEM_PROMPT), *rag_messages, *messages]``.
-      2. Calls ``LLMClient.chat()``.
-      3. Returns ``{"final_text": response.content}`` on success or
+      2. Calls ``LLMClient.chat()`` — with ``tools=[...]`` schema
+         dicts if ``tools`` was provided to the factory or built
+         from ``conv_service`` + state.
+      3. Dispatches any ``escalate_to_human`` tool call back to the
+         matching LangChain tool. On success sets
+         ``state["escalated"] = True`` and stores the customer-facing
+         message in ``state["escalation_message"]``.
+      4. Returns ``{"final_text": response.content}`` on success or
          ``{"final_text": FALLBACK_MESSAGE}`` on any exception /
          empty content (fail-safe).
 
     This node is the last node in the graph and **must never
     raise** — a raise here would crash the graph and leave the
     customer without a response.
+
+    Tool-call failure semantics
+    ---------------------------
+
+    If ``tool.ainvoke(...)`` raises (network blip, transient DB
+    error, etc.) the node logs a WARNING with ``error_type`` and
+    falls back to ``escalated=False`` so the LLM's normal text
+    response (or :data:`FALLBACK_MESSAGE`) is preserved. A failed
+    escalation MUST NOT take down the customer turn.
+
+    Parameters
+    ----------
+    llm_client_factory:
+        Per-tenant ``LLMClient`` factory.
+    model:
+        Model identifier forwarded to ``LLMClient.chat``.
+    tools:
+        Optional pre-built LangChain ``BaseTool`` list. When
+        provided, these tools are advertised to the LLM and
+        used for dispatch. Used by unit tests that want to spy
+        on tool calls without wiring a real ``conv_service``.
+    conv_service:
+        Optional conversation service. When ``tools`` is not
+        provided and ``conv_service`` is set, the LLM node
+        builds the Stage 7.2 ``escalate_to_human`` tool per
+        turn using the active state's ``tenant_id`` +
+        ``conversation_id``. This is the production wiring.
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
         tenant_id = state["tenant_id"]
+
+        # Resolve the per-turn toolset. Test wiring passes a
+        # pre-built ``tools`` list; production lets the node
+        # construct the escalation tool from state.
+        active_tools: list[BaseTool] = list(tools) if tools else []
+        if not active_tools and conv_service is not None:
+            active_tools = [
+                make_escalate_tool(
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    conv_service=conv_service,
+                )
+            ]
+        elif not active_tools:
+            # No tools available: this happens when neither
+            # ``tools`` nor ``conv_service`` were wired. M1 has
+            # a default conv_service via SimpleResponder so this
+            # branch should only fire in unit tests that
+            # explicitly opt out.
+            active_tools = []
+
+        tool_schemas = (
+            [_tool_to_anthropic_schema(t) for t in active_tools]
+            if active_tools
+            else []
+        )
+        tool_by_name = {t.name: t for t in active_tools}
+
         try:
             client = llm_client_factory(tenant_id)
             request = ChatRequest(
@@ -202,6 +281,9 @@ def make_llm_node(
                         )
                     ],
                 ],
+                temperature=CHAT_TEMPERATURE,
+                max_tokens=CHAT_MAX_TOKENS,
+                tools=tool_schemas or None,
             )
             response = await client.chat(request)
         except Exception as exc:
@@ -213,6 +295,76 @@ def make_llm_node(
             )
             return {"final_text": FALLBACK_MESSAGE}
 
+        # ---- Tool call dispatch (Stage 7.2) -------------------------
+        # The LLM may have decided to escalate. We only dispatch
+        # tools we recognise — anything else is logged and
+        # ignored so the customer's turn is never blocked by a
+        # hallucinated tool name. ``getattr`` with a default keeps
+        # 7.1's plain-text fakes (``_StubChatResponse`` without
+        # ``tool_calls``) working without modification.
+        tool_calls = getattr(response, "tool_calls", None) or []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = call.get("name")
+            if name != ESCALATION_TOOL_NAME:
+                log.info(
+                    "agent.graph.unknown_tool_call",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    tool_name=name or "<missing>",
+                )
+                continue
+            tool_obj = tool_by_name.get(name)
+            if tool_obj is None:
+                # Should not happen — factory built tools only
+                # for names it knows. Defensive log + fallback.
+                log.warning(
+                    "agent.graph.tool_not_registered",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    tool_name=name,
+                )
+                return _fallback_to_text(response, tenant_id, state)
+
+            # The Anthropic provider returns raw ``tool_use`` blocks
+            # with the args under ``input``. OpenAI-style payloads
+            # nest them under ``args`` / ``function.arguments``.
+            # We accept either to keep the dispatcher provider-agnostic.
+            args = _extract_tool_args(call)
+            try:
+                tool_result = await tool_obj.ainvoke(args)
+            except Exception as exc:
+                # Tool failure MUST NOT take down the turn. Fall
+                # back to whatever the LLM originally returned.
+                log.warning(
+                    "agent.graph.tool_call_failed",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    tool_name=name,
+                    error_type=type(exc).__name__,
+                )
+                return _fallback_to_text(response, tenant_id, state)
+
+            # The tool returned ``{"escalated": True, "reason": "..."}``.
+            # The customer-facing message is the ``reason`` text
+            # (the same text the LLM would have surfaced anyway).
+            message = _tool_result_to_message(tool_result)
+            if message is None:
+                log.warning(
+                    "agent.graph.tool_result_unparseable",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    tool_name=name,
+                )
+                return _fallback_to_text(response, tenant_id, state)
+
+            return {
+                "escalated": True,
+                "escalation_message": message,
+            }
+
+        # ---- Normal text path ---------------------------------------
         text = response.content.strip()
         if not text:
             log.warning(
@@ -225,6 +377,164 @@ def make_llm_node(
         return {"final_text": response.content}
 
     return _node
+
+
+def make_escalation_node() -> Callable[
+    [AgentState], Coroutine[Any, Any, dict[str, Any]]
+]:
+    """Build the trivial escalation terminal node.
+
+    Reads ``state["escalation_message"]`` (written by
+    :func:`make_llm_node` when the LLM fired the
+    ``escalate_to_human`` tool) and writes it into
+    ``state["final_text"]``. The node is intentionally tiny —
+    its only purpose is to make the post-escalation step
+    auditable in the graph topology. The conversation-side
+    effects (status flip, ``ai_handling=False``) were already
+    applied by the tool's ``assign_to_agent`` call.
+    """
+
+    async def _node(state: AgentState) -> dict[str, Any]:
+        message = state.get("escalation_message")
+        if not isinstance(message, str) or not message.strip():
+            # Defensive: if the upstream node failed to populate
+            # ``escalation_message``, degrade to the generic
+            # fallback so the customer is never left without a
+            # response. The conversation has already been
+            # flipped out of AI handling by the tool.
+            log.warning(
+                "agent.graph.escalation_message_missing",
+                tenant_id=state["tenant_id"],
+                conversation_id=state["conversation_id"],
+            )
+            return {"final_text": FALLBACK_MESSAGE}
+        return {"final_text": message}
+
+    return _node
+
+
+def _fallback_to_text(
+    response: Any,
+    tenant_id: str,
+    state: AgentState,
+) -> dict[str, Any]:
+    """Reduce a successful LLM response to its text portion when
+    tool dispatch fails.
+
+    Returns ``{"final_text": <response.content or FALLBACK_MESSAGE>}``
+    — we deliberately do NOT include ``escalated: False`` so the
+    state default propagates. Never raises.
+    """
+    text = getattr(response, "content", None) or ""
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        log.warning(
+            "agent.graph.tool_fallback_empty",
+            tenant_id=tenant_id,
+            conversation_id=state["conversation_id"],
+        )
+        return {"final_text": FALLBACK_MESSAGE}
+    return {"final_text": text}
+
+
+def _extract_tool_args(call: dict[str, Any]) -> dict[str, Any]:
+    """Extract the args dict from a provider-agnostic ``tool_call`` entry.
+
+    Handles the three payload shapes we have seen across
+    providers:
+
+    * Anthropic ``tool_use``: ``{"input": {...}}``
+    * OpenAI function-call: ``{"function": {"arguments": str | dict}}``
+    * Generic: ``{"args": {...}}``
+
+    Returns ``{}`` when no recognised shape is found — LangChain's
+    tool will then complain about a missing required field and
+    surface the error through the standard tool-ainvoke failure
+    path, which the node logs + falls back from.
+    """
+    if "input" in call and isinstance(call["input"], dict):
+        return call["input"]
+    if "args" in call and isinstance(call["args"], dict):
+        return call["args"]
+    fn = call.get("function")
+    if isinstance(fn, dict):
+        arguments = fn.get("arguments")
+        if isinstance(arguments, dict):
+            return arguments
+        if isinstance(arguments, str):
+            import json
+
+            try:
+                parsed = json.loads(arguments)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+    return {}
+
+
+def _tool_result_to_message(result: Any) -> str | None:
+    """Convert a LangChain tool's ainvoke result into the customer-facing
+    escalation message string.
+
+    The ``escalate_to_human`` tool returns
+    ``{"escalated": True, "reason": "..."}``. We pull out
+    ``reason`` (the customer-facing text) and return it. For any
+    other shape (str, ToolMessage, None) we apply a best-effort
+    coercion so the test suite's plain-dict spy contract still
+    works.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        reason = result.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason
+        # ``ToolMessage`` content may also be a string; some
+        # tool wrappers wrap the result in a content attribute.
+        content = result.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    content_attr = getattr(result, "content", None)
+    if isinstance(content_attr, str) and content_attr.strip():
+        return content_attr
+    return None
+
+
+def _tool_to_anthropic_schema(tool: BaseTool) -> dict[str, Any]:
+    """Build an Anthropic-compatible ``tools`` payload entry from a
+    LangChain ``BaseTool``.
+
+    Anthropic expects::
+
+        {
+            "name": "...",
+            "description": "...",
+            "input_schema": {"type": "object", "properties": {...}}
+        }
+
+    The LangChain tool's ``.args`` exposes the ``properties``
+    half of the JSON Schema only; we wrap it into a full
+    ``input_schema`` here. Required-field extraction is omitted
+    intentionally — the LangChain tool's own validator catches
+    missing args at dispatch time, and Anthropic accepts
+    properties without ``required`` as "all optional".
+    """
+    # ``getattr`` keeps this resilient to duck-typed fakes in
+    # tests (some test tools implement only ``ainvoke`` + ``name``
+    # and skip the JSON-Schema args surface).
+    properties = getattr(tool, "args", None)
+    if not isinstance(properties, dict):
+        properties = {}
+    description = getattr(tool, "description", "") or ""
+    return {
+        "name": tool.name,
+        "description": description,
+        "input_schema": {
+            "type": "object",
+            "properties": properties,
+        },
+    }
 
 
 def _to_llm_chat_message(msg: BaseMessage) -> LLMChatMessage:
@@ -285,6 +595,7 @@ def _to_llm_role(msg: BaseMessage) -> LLMMessageRole:
 
 __all__ = [
     "llm_node",
+    "make_escalation_node",
     "make_llm_node",
     "make_retrieve_node",
     "retrieve_node",

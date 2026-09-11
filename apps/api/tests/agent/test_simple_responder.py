@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.graph.prompts import CHAT_MAX_TOKENS, CHAT_TEMPERATURE
 from agent.simple_responder import (
     DEFAULT_MODEL,
     FALLBACK_MESSAGE,
@@ -514,3 +515,259 @@ async def test_responder_summary_keeps_latest_unchanged() -> None:
     assert len(non_system) == MAX_HISTORY_MESSAGES
     assert "msg 59" in non_system[-1].content
     assert "msg 40" in non_system[0].content
+
+
+# ----- Stage 7.1 silent-behavior-change regression guards --------------------
+
+
+@pytest.mark.asyncio
+async def test_responder_applies_chat_temperature_and_max_tokens_to_llm_request() -> None:
+    """Concern #3: CHAT_TEMPERATURE / CHAT_MAX_TOKENS MUST reach the LLM
+    request. Pre-7.1 the values were passed explicitly; the graph
+    refactor must preserve them.
+    """
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(
+        return_value=[_msg(MessageRole.CUSTOMER, "hi")]
+    )
+
+    fake_client = _fake_client(content="ok")
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    request = fake_client.chat.await_args.args[0]
+    assert request.temperature == CHAT_TEMPERATURE
+    assert request.max_tokens == CHAT_MAX_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_responder_does_not_inject_rag_twice() -> None:
+    """Concern #2: The simple responder must NOT inject RAG into
+    ``messages`` — the graph's ``retrieve_node`` does it. Without
+    this guard, the LLM sees the same retrieved chunk text twice
+    in one request.
+    """
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(
+        return_value=[_msg(MessageRole.CUSTOMER, "how do I reset?")]
+    )
+
+    distinctive = "RAG-MARKER-FOO-BAR-12345"
+    rag_service = MagicMock()
+    rag_service.build_context_for_query = AsyncMock(
+        return_value=RagContext(
+            system_message=distinctive,
+            chunk_count=1,
+            knowledge_base_id="kb1",
+            knowledge_base_name="kb1",
+            retrieval_score_max=0.9,
+        )
+    )
+
+    fake_client = _fake_client(content="ok")
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda t: fake_client,
+        rag_service=rag_service,
+    )
+
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+
+    request = fake_client.chat.await_args.args[0]
+    full_request = "\n".join(m.content for m in request.messages)
+    occurrences = full_request.count(distinctive)
+    assert occurrences == 1, (
+        f"retrieved chunk text appears {occurrences} times in the "
+        f"final LLM request — should be exactly 1"
+    )
+
+
+# ----- Stage 7.2: escalation tool through SimpleResponder ---------------
+
+
+class _ConvServiceSpy:
+    """Spy capturing ``assign_to_agent`` invocations.
+
+    Records kwargs so tests can assert tenant / conversation ID
+    binding and the ``agent_id=None`` semantics without touching
+    the DB. Used to wire the Stage 7.2 escalation path through
+    :class:`SimpleResponder`.
+    """
+
+    def __init__(self) -> None:
+        self.assign_calls: list[dict[str, object]] = []
+
+    async def get(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> MagicMock:
+        from conversation.enums import ConversationStatus
+
+        m = MagicMock()
+        m.id = conversation_id
+        m.tenant_id = tenant_id
+        m.status = ConversationStatus.OPEN
+        m.ai_handling = True
+        m.assigned_agent_id = None
+        return m
+
+    async def list_messages(
+        self, *, tenant_id: str, conversation_id: str, limit: int
+    ) -> list[MagicMock]:
+        from conversation.enums import MessageRole
+
+        return [
+            MagicMock(
+                role=MessageRole.CUSTOMER,
+                content_text="please transfer me to a human",
+                conversation_id=conversation_id,
+            )
+        ]
+
+    async def assign_to_agent(
+        self, *, tenant_id: str, conversation_id: str, agent_id: str
+    ) -> MagicMock:
+        self.assign_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation_id,
+                "agent_id": agent_id,
+            }
+        )
+        m = MagicMock()
+        m.tenant_id = tenant_id
+        m.ai_handling = False
+        return m
+
+
+def _fake_llm_client_with_tool_call(
+    *, tool_calls: list[dict[str, object]] | None
+) -> MagicMock:
+    """LLM stub returning a ``ChatResponse``-shaped object that
+    includes ``tool_calls``. Drives the escalation path through
+    the LLM node without needing a real provider."""
+    client = MagicMock()
+    response = MagicMock()
+    response.content = ""
+    response.tool_calls = tool_calls
+    response.model = DEFAULT_MODEL
+    response.prompt_tokens = 10
+    response.completion_tokens = 5
+    response.finish_reason = "tool_use"
+    response.raw = {}
+    client.chat = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_simple_responder_calls_assign_to_agent_on_escalation() -> None:
+    """End-to-end via :class:`SimpleResponder`: when the LLM fires
+    ``escalate_to_human``, the responder's conversation service
+    must see ``assign_to_agent`` invoked with the bound
+    ``tenant_id`` + ``conversation_id`` and ``agent_id=None``."""
+    from agent.graph.prompts import ESCALATION_TOOL_NAME
+
+    conv_service = _ConvServiceSpy()
+    fake_client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-simple",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "Customer asked for a human"},
+            }
+        ]
+    )
+
+    responder = SimpleResponder(
+        conv_service=conv_service,  # type: ignore[arg-type]
+        llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+
+    result = await responder.respond(tenant_id="t-simple", conversation_id="c-simple")
+
+    assert result is not None
+    assert result.role == MessageRole.AI
+    assert result.content_text == "Customer asked for a human"
+    # Escalation mutated conversation state — but NOT through a
+    # new DB message. The spy captured exactly one assign call.
+    assert conv_service.assign_calls == [
+        {
+            "tenant_id": "t-simple",
+            "conversation_id": "c-simple",
+            "agent_id": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_simple_responder_does_not_persist_synthetic_messages() -> None:
+    """Pre-existing invariant: the escalation tool path must NOT
+    write a new DB message. The conversation's ``ai_handling``
+    flip is the sole side effect. This test counts messages
+    before and after to catch any accidental persistence."""
+    from agent.graph.prompts import ESCALATION_TOOL_NAME
+
+    conv_service = _ConvServiceSpy()
+    # Override ``list_messages`` to record message counts so the
+    # test can assert no new row was written.
+    pre_count = 0
+    post_count_holder: dict[str, int] = {"count": 0}
+
+    async def _list_messages(
+        *, tenant_id: str, conversation_id: str, limit: int
+    ) -> list[MagicMock]:
+        from conversation.enums import MessageRole
+
+        nonlocal pre_count
+        pre_count = pre_count + 1
+        return [
+            MagicMock(
+                role=MessageRole.CUSTOMER,
+                content_text="please transfer me",
+                conversation_id=conversation_id,
+            )
+        ]
+
+    conv_service.list_messages = _list_messages  # type: ignore[method-assign]
+    # Count ``list_messages`` calls before/after to detect any
+    # post-turn persistence (a hidden second write would surface
+    # as extra reads).
+    fake_client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-persist",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "Escalation"},
+            }
+        ]
+    )
+
+    responder = SimpleResponder(
+        conv_service=conv_service,  # type: ignore[arg-type]
+        llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+
+    await responder.respond(tenant_id="t1", conversation_id="c1")
+    post_count_holder["count"] = pre_count
+
+    # ``list_messages`` was called exactly once — only by the
+    # initial ``respond`` history fetch. No second read after
+    # the tool path, no synthetic persistence call.
+    assert pre_count == 1
+    # The escalation went through ``assign_to_agent`` (the
+    # only sanctioned side effect).
+    assert len(conv_service.assign_calls) == 1

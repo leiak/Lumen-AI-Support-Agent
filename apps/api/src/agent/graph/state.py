@@ -27,6 +27,16 @@ final_text:
     The final assistant text produced by the LLM node. ``None``
     until ``llm_node`` runs; the caller (``respond()``) wraps it
     into an ``AgentResponse``.
+escalated:
+    Stage 7.2 — set to ``True`` by the LLM node when the model
+    invokes the ``escalate_to_human`` tool and the tool succeeds.
+    Drives the conditional edge in :mod:`agent.graph.graph`:
+    ``True`` routes to ``escalation_node``; ``False`` routes to
+    ``END`` via the normal text path. Default ``False``.
+escalation_message:
+    Stage 7.2 — the customer-facing message written by
+    ``escalation_node`` into ``final_text``. Populated only when
+    ``escalated`` is ``True``; ``None`` on the normal text path.
 
 Why ``TypedDict`` (not Pydantic)?
 ---------------------------------
@@ -55,6 +65,8 @@ class AgentState(TypedDict):
     messages: list[BaseMessage]
     rag_messages: list[BaseMessage]
     final_text: str | None
+    escalated: bool
+    escalation_message: str | None
 
 
 __all__ = ["AgentState"]

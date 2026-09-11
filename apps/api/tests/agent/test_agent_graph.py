@@ -17,8 +17,15 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from agent.graph.graph import build_agent_graph
 from agent.graph.nodes import make_llm_node, make_retrieve_node
-from agent.graph.prompts import FALLBACK_MESSAGE, M1_SYSTEM_PROMPT
+from agent.graph.prompts import (
+    CHAT_MAX_TOKENS,
+    CHAT_TEMPERATURE,
+    ESCALATION_TOOL_NAME,
+    FALLBACK_MESSAGE,
+    M1_SYSTEM_PROMPT,
+)
 from agent.graph.state import AgentState
+from agent.graph.tools import make_escalate_tool
 from agent.simple_responder import DEFAULT_MODEL
 from knowledge.rag_service import RagContext
 from llm_client.client import LLMClient
@@ -235,6 +242,8 @@ async def test_llm_node_assembles_messages_in_order() -> None:
         # touch .messages and .model.
         captured["messages"] = list(request.messages)  # type: ignore[attr-defined]
         captured["model"] = request.model  # type: ignore[attr-defined]
+        captured["temperature"] = request.temperature  # type: ignore[attr-defined]
+        captured["max_tokens"] = request.max_tokens  # type: ignore[attr-defined]
         return _StubChatResponse(content="ok")
 
     client = MagicMock()
@@ -260,6 +269,37 @@ async def test_llm_node_assembles_messages_in_order() -> None:
     assert msgs[1].content == "rag ctx"
     assert msgs[2].role == "user"
     assert msgs[3].role == "assistant"
+    # CHAT_TEMPERATURE / CHAT_MAX_TOKENS must be applied to the
+    # request — falling back to Pydantic defaults would drop the
+    # max_tokens cap the M1 spec pinned.
+    assert captured["temperature"] == CHAT_TEMPERATURE
+    assert captured["max_tokens"] == CHAT_MAX_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_llm_node_applies_chat_temperature_and_max_tokens() -> None:
+    """Concern #3 regression guard: max_tokens MUST be pinned, not None."""
+    captured: dict[str, Any] = {}
+
+    async def _capture(request: object) -> object:
+        captured["temperature"] = request.temperature  # type: ignore[attr-defined]
+        captured["max_tokens"] = request.max_tokens  # type: ignore[attr-defined]
+        return _StubChatResponse(content="ok")
+
+    client = MagicMock()
+    client.chat = _capture
+    node = make_llm_node(llm_client_factory=_make_factory(client), model=DEFAULT_MODEL)
+
+    await node(
+        _state(messages=[HumanMessage(content="hi")])
+    )
+
+    assert captured["temperature"] == CHAT_TEMPERATURE
+    # max_tokens must be a positive int, NOT the Pydantic default of None.
+    # Without this, the LLM could spend unlimited tokens per reply.
+    assert captured["max_tokens"] == CHAT_MAX_TOKENS
+    assert isinstance(captured["max_tokens"], int)
+    assert captured["max_tokens"] > 0
 
 
 @pytest.mark.asyncio
@@ -373,3 +413,353 @@ async def test_end_to_end_graph_flow_rag_failure_yields_no_rag_block() -> None:
     sent = client.chat.await_args.args[0]
     roles = [m.role for m in sent.messages]
     assert roles == ["system", "user"]
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_rag_chunk_appears_exactly_once() -> None:
+    """Concern #2 regression guard: retrieved chunks must NOT be duplicated.
+
+    Pre-fix, the simple responder injected RAG into the ``messages``
+    list *and* the graph's retrieve_node injected it again into
+    ``rag_messages``. The LLM would then see the same chunk text
+    twice in a single request. This test pins the dedup invariant
+    by counting occurrences of a distinctive substring.
+    """
+    distinctive = "MARKER-RESET-INSTRUCTIONS-XYZ"
+    rag_service = _capturing_rag_service(
+        chunks=[distinctive, "Another chunk"]
+    )
+    client = _capturing_llm_client(content="ok")
+    graph = build_agent_graph(
+        rag_service=rag_service,
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+    )
+    state = _state(
+        tenant_id="t-iso",
+        conversation_id="c-iso",
+        messages=[HumanMessage(content="how do I reset?")],
+    )
+
+    await graph.ainvoke(dict(state))
+
+    sent = client.chat.await_args.args[0]
+    full_request = "\n".join(m.content for m in sent.messages)
+    assert full_request.count(distinctive) == 1, (
+        f"RAG chunk text appears more than once in the LLM request: "
+        f"{full_request.count(distinctive)} occurrences"
+    )
+
+
+@pytest.mark.asyncio
+async def test_retrieve_node_threads_tenant_id_to_rag_service() -> None:
+    """Tenant isolation: retrieve_node forwards state['tenant_id'] to RAG."""
+    rag_service = _capturing_rag_service()
+    node = make_retrieve_node(rag_service=rag_service)
+    state = _state(
+        tenant_id="tenant-42",
+        conversation_id="conv-7",
+        messages=[HumanMessage(content="hi")],
+    )
+
+    await node(state)
+
+    kwargs = rag_service.build_context_for_query.await_args.kwargs
+    assert kwargs["tenant_id"] == "tenant-42"
+    assert kwargs["conversation_id"] == "conv-7"
+    assert kwargs["query"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_llm_node_threads_tenant_id_to_factory() -> None:
+    """Tenant isolation: llm_node passes state['tenant_id'] to the factory."""
+    captured_tenant: dict[str, str] = {}
+
+    def _factory(tenant_id: str) -> LLMClient:
+        captured_tenant["value"] = tenant_id
+        return _capturing_llm_client(content="ok")
+
+    node = make_llm_node(llm_client_factory=_factory, model=DEFAULT_MODEL)
+    state = _state(
+        tenant_id="tenant-99",
+        messages=[HumanMessage(content="hi")],
+    )
+
+    await node(state)
+
+    assert captured_tenant["value"] == "tenant-99"
+
+
+# ----- Stage 7.2: escalate_to_human tool --------------------------------
+
+
+class _ConvServiceSpy:
+    """Spy for ``ConversationService.assign_to_agent``.
+
+    Records calls so tests can assert tenant / conversation ID
+    binding without touching the real DB. ``assign_to_agent`` is
+    the only surface the escalation tool calls, so spying on it
+    is sufficient.
+    """
+
+    def __init__(self) -> None:
+        self.assign_calls: list[dict[str, Any]] = []
+
+    async def assign_to_agent(
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        agent_id: Any,
+    ) -> Any:
+        self.assign_calls.append(
+            {
+                "tenant_id": tenant_id,
+                "conversation_id": conversation_id,
+                "agent_id": agent_id,
+            }
+        )
+        return None
+
+
+def _fake_llm_client_with_tool_call(
+    *,
+    tool_calls: list[dict[str, Any]] | None,
+    content: str = "",
+) -> MagicMock:
+    """LLM stub that returns a ``ChatResponse``-shaped object with
+    ``tool_calls``. Used to drive the tool-dispatch path without
+    hitting a real provider.
+    """
+    client = MagicMock()
+    response = MagicMock()
+    response.content = content
+    response.tool_calls = tool_calls
+    response.model = DEFAULT_MODEL
+    response.prompt_tokens = 10
+    response.completion_tokens = 5
+    response.finish_reason = "tool_use"
+    response.raw = {}
+    client.chat = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_escalate_tool_factory_binds_tenant_and_conversation() -> None:
+    """Tool's ``ainvoke`` MUST forward the closed-over
+    ``tenant_id`` / ``conversation_id`` to
+    :meth:`ConversationService.assign_to_agent`, not whatever the
+    LLM claims in its tool arguments."""
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(
+        tenant_id="t-escalate",
+        conversation_id="c-escalate",
+        conv_service=spy,  # type: ignore[arg-type]
+    )
+
+    result = await tool_obj.ainvoke({"reason": "I need a human"})
+
+    assert spy.assign_calls == [
+        {
+            "tenant_id": "t-escalate",
+            "conversation_id": "c-escalate",
+            "agent_id": None,
+        }
+    ]
+    assert result == {"escalated": True, "reason": "I need a human"}
+
+
+@pytest.mark.asyncio
+async def test_escalate_tool_returns_escalated_dict() -> None:
+    """Tool return shape: ``{"escalated": True, "reason": ...}``.
+
+    The ``summary`` arg is internal-only — must NOT appear in the
+    returned payload (which becomes the customer-facing message).
+    """
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(
+        tenant_id="t1",
+        conversation_id="c1",
+        conv_service=spy,  # type: ignore[arg-type]
+    )
+
+    result = await tool_obj.ainvoke(
+        {"reason": "Out of scope", "summary": "internal-only note"}
+    )
+
+    assert result == {"escalated": True, "reason": "Out of scope"}
+    assert "summary" not in result
+
+
+@pytest.mark.asyncio
+async def test_llm_node_invokes_escalation_tool_on_tool_call() -> None:
+    """When the LLM fires ``escalate_to_human``, the node MUST
+    invoke the tool with the parsed args, set
+    ``state["escalated"]=True``, and surface the customer-facing
+    message in ``state["escalation_message"]``."""
+    spy = _ConvServiceSpy()
+    tool_obj = make_escalate_tool(
+        tenant_id="t1",
+        conversation_id="c1",
+        conv_service=spy,  # type: ignore[arg-type]
+    )
+    client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-1",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "Customer asked for a human"},
+            }
+        ],
+    )
+    node = make_llm_node(
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+        tools=[tool_obj],
+    )
+    state = _state(messages=[HumanMessage(content="transfer me to a human")])
+
+    result = await node(state)
+
+    assert result["escalated"] is True
+    assert result["escalation_message"] == "Customer asked for a human"
+    # Spy was invoked exactly once with the bound IDs.
+    assert len(spy.assign_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_llm_node_no_tool_call_sets_escalated_false() -> None:
+    """A plain-text LLM response leaves ``escalated`` False and
+    populates ``final_text`` from the LLM content (no merge key
+    for ``escalated`` — state default is False)."""
+    client = _capturing_llm_client(content="hi from llm")
+    node = make_llm_node(
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+    )
+    state = _state(messages=[HumanMessage(content="hi")])
+
+    result = await node(state)
+
+    assert result == {"final_text": "hi from llm"}
+    # The node MUST NOT advertise ``escalated: False`` — that's
+    # the state default and including it would couple the test
+    # to internal LangGraph merge semantics.
+    assert "escalated" not in result
+
+
+@pytest.mark.asyncio
+async def test_llm_node_tool_call_failure_falls_back_to_text() -> None:
+    """If the tool raises, the node logs a WARNING and falls back
+    to the LLM's normal text response. The customer turn MUST
+    NOT crash."""
+    class _BoomTool:
+        name = ESCALATION_TOOL_NAME
+        description = "boom"
+
+        async def ainvoke(self, _args: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("tool exploded")
+
+    client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-2",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "x"},
+            }
+        ],
+        content="fallback text",
+    )
+    node = make_llm_node(
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+        tools=[_BoomTool()],  # type: ignore[list-item]
+    )
+    state = _state(messages=[HumanMessage(content="hi")])
+
+    result = await node(state)
+
+    assert result == {"final_text": "fallback text"}
+    assert "escalated" not in result
+
+
+@pytest.mark.asyncio
+async def test_graph_routes_to_escalation_node_when_escalated() -> None:
+    """End-to-end: ``ainvoke`` returns state with ``escalated=True``
+    and the escalation message in ``final_text``."""
+    spy = _ConvServiceSpy()
+    client = _fake_llm_client_with_tool_call(
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "toolu-3",
+                "name": ESCALATION_TOOL_NAME,
+                "input": {"reason": "Escalation reason"},
+            }
+        ],
+    )
+    graph = build_agent_graph(
+        rag_service=_capturing_rag_service(),
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+        conv_service=spy,  # type: ignore[arg-type]
+    )
+    state = _state(
+        tenant_id="t-route",
+        conversation_id="c-route",
+        messages=[HumanMessage(content="transfer me")],
+    )
+
+    result = await graph.ainvoke(dict(state))
+
+    assert result["escalated"] is True
+    assert result["final_text"] == "Escalation reason"
+    assert result["escalation_message"] == "Escalation reason"
+    assert len(spy.assign_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_graph_routes_to_end_when_not_escalated() -> None:
+    """End-to-end: normal text path goes straight to END with
+    ``escalated`` left at its default (False)."""
+    rag_service = _capturing_rag_service()
+    client = _capturing_llm_client(content="normal answer")
+    graph = build_agent_graph(
+        rag_service=rag_service,
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+    )
+    state = _state(messages=[HumanMessage(content="hi")])
+
+    result = await graph.ainvoke(dict(state))
+
+    assert result["final_text"] == "normal answer"
+    # LangGraph fills missing keys with None on the merged state;
+    # the conditional edge treats None as falsy so the test below
+    # documents the observable behaviour.
+    assert not result.get("escalated")
+
+
+@pytest.mark.asyncio
+async def test_graph_escalation_node_is_trivial_passthrough() -> None:
+    """Sanity: ``escalation_node`` copies ``escalation_message``
+    into ``final_text`` — the graph topology makes that explicit
+    even though it's a one-liner."""
+    from agent.graph.nodes import make_escalation_node
+
+    node = make_escalation_node()
+    state: AgentState = {
+        "tenant_id": "t1",
+        "conversation_id": "c1",
+        "messages": [],
+        "rag_messages": [],
+        "final_text": None,
+        "escalated": True,
+        "escalation_message": "Connecting you with a colleague",
+    }
+
+    result = await node(state)
+
+    assert result == {"final_text": "Connecting you with a colleague"}
