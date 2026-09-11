@@ -28,10 +28,12 @@ KBs:
 Articles:
     GET    /knowledge-bases/{kb_id}/articles
     POST   /knowledge-bases/{kb_id}/articles
+    POST   /knowledge-bases/{kb_id}/articles/upload  (Task 6.10)
     GET    /articles/{article_id}
     PATCH  /articles/{article_id}
     DELETE /articles/{article_id}
     POST   /articles/{article_id}/reindex
+    POST   /articles/{article_id}/upload             (Task 6.10)
 
 The create-article endpoint schedules ``index_article`` via
 ``asyncio.create_task`` AFTER returning the response — the worker
@@ -43,12 +45,22 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 
 from auth.dependencies import get_current_user
 from core.logging import get_logger
 from knowledge.enums import ArticleStatus
 from knowledge.models import Article, ArticleVersion, KnowledgeBase
+from knowledge.parser import MAX_PARSE_BYTES
 from knowledge.schemas import (
     ArticleCreateIn,
     ArticleListOut,
@@ -63,10 +75,21 @@ from knowledge.schemas import (
     ReindexRequestIn,
     ReindexResultOut,
 )
-from knowledge.service import ArticleService, KnowledgeBaseService
+from knowledge.service import (
+    ArticleService,
+    KnowledgeBaseService,
+    OversizeDocumentError,
+    UnsupportedDocumentType,
+)
 from knowledge.worker import index_article
 
 log = get_logger(__name__)
+
+# Upload chunk size for the cap-check read loop. 1 MiB keeps
+# memory bounded while keeping the loop tight (~50 iterations for
+# a 50 MiB payload). FastAPI's ``UploadFile.read(size)`` reads at
+# most ``size`` bytes from the spooled buffer / async file.
+_UPLOAD_READ_CHUNK = 1 * 1024 * 1024
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge"])
 
@@ -341,6 +364,187 @@ async def create_article(
     asyncio.create_task(_run_indexing(article.id))  # noqa: RUF006
 
     return _article_out(article)
+
+
+# ---------------------------------------------------------------------------
+# Upload routes (Task 6.10)
+# ---------------------------------------------------------------------------
+
+
+async def _read_upload_capped(file: UploadFile, *, cap: int) -> bytes:
+    """Read an ``UploadFile`` into memory with a hard byte cap.
+
+    The cap protects against DoS: FastAPI's ``UploadFile`` doesn't
+    impose its own limit, so without this an attacker could stream
+    gigabytes into the request before any 413 fires. We read in
+    1 MiB chunks and abort as soon as ``running_total`` would
+    exceed ``cap``.
+
+    Returns the concatenated bytes when the file is at or below
+    the cap. Raises ``HTTPException(413, ...)`` as soon as the
+    cap is exceeded — the underlying stream is left in whatever
+    state the read loop left it in, but the request is rejected
+    so the connection can be closed.
+
+    PII discipline: this helper is a thin byte-loop. Filenames
+    and parsed content are NEVER logged here; the caller's
+    handler is responsible for the high-level audit log.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_READ_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > cap:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"file exceeds the {cap // (1024 * 1024)} MiB upload limit",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@router.post(
+    "/knowledge-bases/{kb_id}/articles/upload",
+    response_model=ArticleOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_article(
+    kb_id: str,
+    file: Annotated[UploadFile, File(...)],
+    title: Annotated[str | None, Form()] = None,
+    source_uri: Annotated[str | None, Form()] = None,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,
+) -> ArticleOut:
+    """Create a new article by uploading a file (Task 6.10).
+
+    Multipart body:
+
+    * ``file`` — the uploaded file (required). M1 supports the
+      formats wired into :func:`knowledge.parser.parse_document`:
+      txt, md, html, pdf, json. Max size: 50 MiB (matches
+      :data:`knowledge.parser.MAX_PARSE_BYTES`).
+    * ``title`` (optional) — overrides the filename-derived
+      default title.
+    * ``source_uri`` (optional) — caller-supplied provenance URL /
+      path string. Free-form, max 2000 chars (enforced at the
+      service layer).
+
+    Status codes:
+
+    * 201 — article created. Returns ``ArticleOut`` (status starts
+      as ``DRAFT``; the indexer runs fire-and-forget).
+    * 400 — file is missing or empty.
+    * 401 — missing / invalid bearer token.
+    * 404 — KB is not visible to the tenant.
+    * 413 — file exceeds 50 MiB.
+    * 422 — parser rejected the bytes (``UnsupportedDocumentType``)
+      or oversize payload that slipped past the API cap
+      (defense-in-depth).
+    """
+    if claims is None:
+        # ``Annotated[..., Depends(get_current_user)]`` already
+        # raises 401 before this branch can fire, but the static
+        # type checker needs the explicit ``= None`` default.
+        raise HTTPException(401, "missing bearer token")
+
+    file_bytes = await _read_upload_capped(file, cap=MAX_PARSE_BYTES)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+    try:
+        article = await _article_service().upload_to_article(
+            tenant_id=claims["tenant_id"],
+            kb_id=kb_id,
+            file_bytes=file_bytes,
+            file_name=file.filename or "upload",
+            mime_type=file.content_type,
+            title=title,
+            source_uri=source_uri,
+        )
+    except OversizeDocumentError as exc:
+        # Parser saw bytes > MAX_PARSE_BYTES. The API-level cap
+        # above should prevent this in normal flow; this branch
+        # is defense-in-depth.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except UnsupportedDocumentType as exc:
+        # Bytes look like binary / can't be detected as a supported
+        # format. The user gets a 422 with the parser's own message
+        # (already PII-safe: format list + file_name only).
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        # The service's only ValueError path is KB-missing (the
+        # parser errors are caught ABOVE before reaching this
+        # branch — ValueError is the base class for the parser's
+        # custom exceptions, so we must catch them first).
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # Fire-and-forget indexer. Same pattern as create_article —
+    # ``_run_indexing`` captures its own exceptions so a failure
+    # here can never surface to the caller.
+    asyncio.create_task(_run_indexing(article.id))  # noqa: RUF006
+
+    return _article_out(article)
+
+
+@router.post(
+    "/articles/{article_id}/upload",
+    response_model=ReindexResultOut,
+)
+async def reupload_article(
+    article_id: str,
+    file: Annotated[UploadFile, File(...)],
+    title: Annotated[str | None, Form()] = None,
+    source_uri: Annotated[str | None, Form()] = None,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,
+) -> ReindexResultOut:
+    """Replace an article's contents by uploading a new file.
+
+    The bytes are parsed; if the resulting text's sha256 matches
+    the latest ``ArticleVersion.content_hash``, the call returns
+    ``skipped=True`` without minting a new version. Otherwise a
+    new ``ArticleVersion`` (next ``version_number``) is inserted,
+    ``article.current_version_id`` is updated, and the indexer
+    runs synchronously (same contract as ``/reindex``) so the
+    response carries the final status + chunk count.
+
+    Status codes mirror :func:`upload_article` plus the
+    ``ReindexResult`` body. 404 covers missing / cross-tenant
+    articles.
+    """
+    if claims is None:  # pragma: no cover - Depends always wins
+        raise HTTPException(401, "missing bearer token")
+
+    file_bytes = await _read_upload_capped(file, cap=MAX_PARSE_BYTES)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+
+    try:
+        result = await _article_service().reupload_article(
+            tenant_id=claims["tenant_id"],
+            article_id=article_id,
+            file_bytes=file_bytes,
+            file_name=file.filename or "upload",
+            mime_type=file.content_type,
+            title=title,
+            source_uri=source_uri,
+        )
+    except OversizeDocumentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except UnsupportedDocumentType as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    if result is None:
+        raise HTTPException(status_code=404, detail="article not found")
+    return ReindexResultOut(
+        article_id=result.article_id,
+        skipped=result.skipped,
+        version_number=result.version_number,
+        status=result.status,
+        chunks_indexed=result.chunks_indexed,
+    )
 
 
 @router.get("/articles/{article_id}", response_model=ArticleWithVersionOut)

@@ -384,6 +384,99 @@ class ArticleRepository:
             )
             return list((await session.execute(stmt)).scalars().all())
 
+    async def max_version_number(
+        self, *, article_id: str
+    ) -> int:
+        """Return the highest ``version_number`` for ``article_id``, or 0.
+
+        Used by the re-upload path (Task 6.10) to compute the next
+        ``version_number`` when minting a new ``ArticleVersion``.
+        Returns 0 when the article has no versions yet (e.g. a future
+        "draft without version" lifecycle) — callers add 1 to that
+        for the new version number.
+
+        No tenant scoping here: ``article_id`` is opaque (ULID) and
+        the caller has already verified tenant ownership via
+        :meth:`get_by_id`.
+        """
+        async with get_session() as session:
+            stmt = (
+                select(ArticleVersion.version_number)
+                .where(ArticleVersion.article_id == article_id)
+                .order_by(ArticleVersion.version_number.desc())
+                .limit(1)
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            return int(row) if row is not None else 0
+
+    async def latest_version(
+        self, *, article_id: str
+    ) -> ArticleVersion | None:
+        """Return the highest-``version_number`` row for ``article_id``.
+
+        Companion to :meth:`max_version_number` — callers that need
+        the full row (e.g. to read ``content_hash`` for the re-upload
+        dedup short-circuit) use this. Returns ``None`` when the
+        article has no versions.
+        """
+        async with get_session() as session:
+            stmt = (
+                select(ArticleVersion)
+                .where(ArticleVersion.article_id == article_id)
+                .order_by(ArticleVersion.version_number.desc())
+                .limit(1)
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
+    async def append_version(
+        self,
+        *,
+        article_id: str,
+        raw_text: str,
+        content_hash: str,
+        version_number: int,
+    ) -> ArticleVersion:
+        """Insert a new ``ArticleVersion`` row and wire it as the article's current.
+
+        Mirrors the article+version mint in :meth:`create` but for
+        the re-upload path: an EXISTING article gets a NEW
+        ``ArticleVersion`` row + ``current_version_id`` UPDATE.
+
+        Ordering matters: the version row is flushed BEFORE the
+        article UPDATE so the FK on ``articles.current_version_id``
+        resolves on the UPDATE. Same transaction so a crash in
+        between doesn't leave the article pointing at a non-existent
+        version.
+
+        Returns the freshly-inserted version row.
+        """
+        version_id = new_id()
+        version = ArticleVersion(
+            id=version_id,
+            article_id=article_id,
+            version_number=version_number,
+            raw_text=raw_text,
+            content_hash=content_hash,
+        )
+        async with get_session() as session:
+            session.add(version)
+            await session.flush()  # ensure version.id is populated
+            # Wire the article at the new version. status=INDEXING
+            # mirrors ``reindex_article``'s recovery semantics: a
+            # crash here leaves the article recoverable rather than
+            # stuck in DRAFT.
+            article = await session.get(Article, article_id)
+            if article is None:
+                raise ValueError("article disappeared mid-append")
+            article.current_version_id = version_id
+            article.status = ArticleStatus.INDEXING
+            article.error_message = None
+            await session.flush()
+            await session.refresh(article)
+            await session.refresh(version)
+            await session.commit()
+            return version
+
 
 # ---------------------------------------------------------------------------
 # Small helpers re-exported for service convenience.
