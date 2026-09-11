@@ -727,6 +727,35 @@ async def test_get_article_cross_tenant_404(
 
 
 @pytest.mark.integration
+async def test_create_article_cross_tenant_returns_404(
+    tenant_factory: Tenant,
+    second_tenant_factory: Tenant,
+) -> None:
+    """A tenant B attempting to POST an article into tenant A's KB must get 404.
+
+    Mirrors :func:`test_get_kb_cross_tenant_returns_404`: the KB
+    lookup at the service layer is tenant-scoped, so a
+    cross-tenant POST never resolves a parent and the API maps
+    that to 404 (not 403, not a leaky 400).
+    """
+    kb = await _kb_factory(tenant_id=tenant_factory.id, slug="xtenant-create")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=_build_app()), base_url="http://test"
+    ) as client:
+        cross = await client.post(
+            f"/api/v1/knowledge/knowledge-bases/{kb.id}/articles",
+            headers=_auth_headers(tenant_id=second_tenant_factory.id),
+            json={
+                "title": "Sneaky cross-tenant article",
+                "source_type": "manual",
+                "raw_text": "should not be created",
+            },
+        )
+        assert cross.status_code == 404, cross.text
+
+
+@pytest.mark.integration
 async def test_update_article_title(
     tenant_factory: Tenant,
 ) -> None:

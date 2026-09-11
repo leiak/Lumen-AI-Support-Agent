@@ -360,16 +360,28 @@ class ArticleRepository:
             await session.delete(existing)
             await session.commit()
 
-    async def list_ids_by_kb(self, *, kb_id: str) -> list[str]:
-        """Return all article IDs belonging to ``kb_id``.
+    async def list_ids_by_kb(
+        self, *, tenant_id: str, kb_id: str
+    ) -> list[str]:
+        """Return all article IDs belonging to ``kb_id`` within ``tenant_id``.
 
-        Used by the KB-delete cleanup branch (service.delete_kb) so
-        it can sweep Qdrant vectors for each article BEFORE the FK
-        cascade wipes the ``ArticleVersion`` rows that
-        ``delete_article_vectors`` would otherwise need to discover.
+        Defence-in-depth: ``tenant_id`` is in the WHERE clause so
+        the repo can't accidentally cross tenants even if a future
+        caller forgets the pre-check. The current caller
+        (``KnowledgeBaseService.delete_kb``) already verifies
+        ownership via ``get_kb`` first, so this is a belt to the
+        existing braces.
+
+        Used by the KB-delete cleanup branch so it can sweep Qdrant
+        vectors for each article BEFORE the FK cascade wipes the
+        ``ArticleVersion`` rows that ``delete_article_vectors``
+        would otherwise need to discover.
         """
         async with get_session() as session:
-            stmt = select(Article.id).where(Article.knowledge_base_id == kb_id)
+            stmt = select(Article.id).where(
+                Article.tenant_id == tenant_id,
+                Article.knowledge_base_id == kb_id,
+            )
             return list((await session.execute(stmt)).scalars().all())
 
 

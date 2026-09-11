@@ -40,7 +40,7 @@ import re
 from sqlalchemy.exc import IntegrityError
 
 from core.logging import get_logger
-from knowledge.enums import ArticleStatus
+from knowledge.enums import ArticleSourceType, ArticleStatus
 from knowledge.models import (
     Article,
     KnowledgeBase,
@@ -235,7 +235,9 @@ class KnowledgeBaseService:
         article_service = self._article_service or ArticleService()
         self._article_service = article_service
 
-        article_ids = await article_service._repo.list_ids_by_kb(kb_id=kb_id)
+        article_ids = await article_service.list_article_ids(
+            tenant_id=tenant_id, kb_id=kb_id
+        )
         for aid in article_ids:
             # Best-effort. A failure here doesn't block the DB
             # delete — orphans in Qdrant self-heal on the next
@@ -312,6 +314,21 @@ class ArticleService:
             )
         return article
 
+    async def list_article_ids(
+        self, *, tenant_id: str, kb_id: str
+    ) -> list[str]:
+        """Return all article IDs for a tenant-owned KB.
+
+        Thin pass-through over :meth:`ArticleRepository.list_ids_by_kb`
+        kept on the service so the KB-delete cleanup branch
+        (``KnowledgeBaseService.delete_kb``) doesn't have to reach
+        into ``self._article_service._repo`` directly — service
+        callers shouldn't know that an ArticleRepository exists.
+        """
+        return await self._repo.list_ids_by_kb(
+            tenant_id=tenant_id, kb_id=kb_id
+        )
+
     # ---- Mutations ----
 
     async def create_article(
@@ -320,7 +337,7 @@ class ArticleService:
         tenant_id: str,
         kb_id: str,
         title: str,
-        source_type: ArticleStatus | str,  # type: ignore[valid-type]
+        source_type: ArticleSourceType,
         raw_text: str,
         source_uri: str | None = None,
     ) -> Article:
