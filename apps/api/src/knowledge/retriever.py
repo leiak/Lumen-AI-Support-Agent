@@ -49,12 +49,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from knowledge.models import Chunk
+from knowledge.models import Chunk, KnowledgeBase
 from knowledge.qdrant_client import DEFAULT_COLLECTION, search_chunks
 from knowledge.repository import ChunkRepository, KnowledgeBaseRepository
 from llm_client.embeddings import EmbeddingError, embed_texts
 
-from core.database import get_session
 from core.logging import get_logger
 
 log = get_logger(__name__)
@@ -109,14 +108,24 @@ class RetrievedChunk:
         return self.chunk.qdrant_point_id
 
 
-async def _assert_kb_exists(*, tenant_id: str, knowledge_base_id: str) -> None:
-    """Raise :class:`KnowledgeBaseNotFoundError` if the KB is missing for this tenant.
+async def _assert_kb_exists(
+    *, tenant_id: str, knowledge_base_id: str
+) -> KnowledgeBase:
+    """Look up the KB and return its row, raising on missing/cross-tenant.
 
     Uses ``KnowledgeBaseRepository.get_by_id`` which already does the
     tenant-scoped lookup. A cross-tenant request — KB exists for
     tenant A, caller asks as tenant B — returns ``None`` and we raise
     the same exception; that's intentional, a cross-tenant lookup
     should look identical to a missing KB to the caller.
+
+    Returns the loaded ``KnowledgeBase`` ORM row (not just a bool) so
+    the caller can reuse it — historically :func:`retrieve_chunks`
+    loaded the row here AND re-loaded it via ``session.get`` a few
+    lines later to read ``embedding_model``, costing two identical
+    roundtrips per retrieval. Returning the row collapses both reads
+    into one. See the note in :func:`retrieve_chunks` for the full
+    rationale.
 
     We check KB existence BEFORE the embedding call so a misrouted
     call (wrong KB id, stale reference) doesn't waste an OpenAI
@@ -128,6 +137,7 @@ async def _assert_kb_exists(*, tenant_id: str, knowledge_base_id: str) -> None:
         raise KnowledgeBaseNotFoundError(
             f"knowledge_base {knowledge_base_id!r} not found for tenant {tenant_id!r}"
         )
+    return kb
 
 
 async def retrieve_chunks(
@@ -203,31 +213,24 @@ async def retrieve_chunks(
     if top_k <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")
 
-    # ---- KB existence check -------------------------------------------
+    # ---- KB existence check + pinned-model lookup --------------------
     # Done before embedding so a misrouted call doesn't burn a request
     # against OpenAI. Cheap DB roundtrip, semantically the first thing
     # a tenant-scoped API should do.
-    await _assert_kb_exists(
+    #
+    # Optimization: ``_assert_kb_exists`` returns the loaded KB row, so
+    # we can read ``embedding_model`` off it directly without a second
+    # ``session.get(KnowledgeBase, ...)`` roundtrip. The pinned model
+    # is per-KB so the same query embedded against KB-A and KB-B
+    # doesn't yield comparable vectors — the retriever MUST honor the
+    # KB's pinned model (Stage 7+ re-rankers can compare across
+    # models). The row is detached but ``expire_on_commit=False`` on
+    # the sessionmaker (see ``core.database.get_sessionmaker``) keeps
+    # the column values readable after the assertion call returns.
+    kb = await _assert_kb_exists(
         tenant_id=tenant_id, knowledge_base_id=knowledge_base_id
     )
-
-    # ---- look up the KB's pinned embedding model ----------------------
-    # The model is pinned on the KnowledgeBase row (per spec) so the
-    # same query embedded against KB-A's model and KB-B's model don't
-    # yield comparable vectors. The retriever MUST honor the KB's
-    # pinned model — Stage 7+ re-rankers can compare across models.
-    async with get_session() as session:
-        from knowledge.models import KnowledgeBase  # local import: keeps top-level cheap
-
-        kb = await session.get(KnowledgeBase, knowledge_base_id)
-        if kb is None:
-            # Race: KB was deleted between _assert_kb_exists and now.
-            # Surface the same error so the caller can't tell the
-            # difference between "was missing" and "disappeared".
-            raise KnowledgeBaseNotFoundError(
-                f"knowledge_base {knowledge_base_id!r} not found for tenant {tenant_id!r}"
-            )
-        embedding_model = kb.embedding_model
+    embedding_model = kb.embedding_model
 
     # ---- embed the query --------------------------------------------
     try:
