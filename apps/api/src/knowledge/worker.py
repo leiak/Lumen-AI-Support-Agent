@@ -580,9 +580,11 @@ async def reindex_article(
        ``version_number = current.version_number + 1`` and the same
        ``raw_text`` re-stored verbatim (preserves the audit trail).
     2. Updates ``Article.current_version_id`` to the new version and
-       resets ``Article.status`` to ``DRAFT``.
+       transitions ``Article.status`` to ``INDEXING`` (NOT
+       ``DRAFT`` — see "Recovery semantics" below).
     3. Calls :func:`index_article`, which runs the full parse →
-       chunk → embed → upsert pipeline.
+       chunk → embed → upsert pipeline and then transitions to
+       ``INDEXED`` or ``FAILED``.
 
     Tenant isolation
     ----------------
@@ -617,6 +619,27 @@ async def reindex_article(
       (e.g. a stray ``ValueError`` from a future refactor) without
       crashing the caller. Logged at ERROR so the silent-swallow
       case is observable.
+
+    Recovery semantics
+    ------------------
+
+    After minting the new ``ArticleVersion`` and updating
+    ``Article.current_version_id``, the article is transitioned to
+    ``INDEXING`` (NOT ``DRAFT``). If the process crashes between
+    that commit and the ``index_article`` call, the article is in
+    ``INDEXING`` — recoverable. A future operator (or a missing
+    Stage 7+ worker retry loop) can simply re-call
+    ``index_article`` on the same ``article_id`` to finish the
+    pipeline run; ``index_article`` will pick up the new
+    ``current_version_id`` and run normally.
+
+    The previous behavior (transitioning to ``DRAFT`` after the
+    version mint) was unsafe: a crash in the window between the
+    DRAFT commit and the ``index_article`` call left the article
+    invisible to the retriever (DRAFT is not retrievable) AND
+    invisible to any retry cron (which would be looking for
+    ``INDEXING`` / ``FAILED``). Moving straight to ``INDEXING``
+    closes that recovery gap.
     """
     # Step 1. Load article + current version + parent KB.
     async with get_session() as session:
@@ -703,11 +726,11 @@ async def reindex_article(
         # violation because the new article_version row hasn't
         # been written yet.
         await session.flush()
-        # Point the article at the new version AND drop it back to
-        # DRAFT. The pipeline (index_article) will move it through
-        # INDEXING → INDEXED / FAILED. The DRAFT transition is
-        # intentional: until the new version's pipeline run
-        # completes, the article is NOT safe to retrieve from.
+        # Point the article at the new version AND mark it INDEXING.
+        # index_article will then transition it to INDEXED (success)
+        # or FAILED (error). See the "Recovery semantics" section in
+        # the docstring for why we go straight to INDEXING instead
+        # of DRAFT.
         article = await session.get(Article, article_id)
         if article is None:
             # Disappeared between the two reads. Treat as a
@@ -715,7 +738,15 @@ async def reindex_article(
             # that no longer exists.
             raise ValueError("article not found")
         article.current_version_id = new_version_id
-        article.status = ArticleStatus.DRAFT
+        # Transition straight to INDEXING (not DRAFT) so the article
+        # is recoverable if a crash happens between this commit and
+        # the index_article call below. INDEXING makes the article
+        # visible to a future retry loop / operator that can simply
+        # re-call index_article; DRAFT would silently hide it from
+        # both the retriever and any recovery sweep. See the
+        # docstring's "Recovery semantics" section for the full
+        # rationale.
+        article.status = ArticleStatus.INDEXING
         article.error_message = None
         await session.commit()
 
