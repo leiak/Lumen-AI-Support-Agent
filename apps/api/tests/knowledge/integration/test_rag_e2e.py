@@ -911,9 +911,10 @@ async def test_e2e_rag_failure_does_not_block_ai_reply(
         )
         chat_call = llm.calls[-1]
         system_contents = [m.content for m in chat_call if m.role == "system"]
-        # No RAG block — the empty context produced by the failure means
-        # ``_build_rag_message`` returned ``None`` and the history was
-        # built without the synthetic RAG system message.
+        # No RAG block — the graph's ``retrieve_node`` caught the
+        # embedding failure and downgraded to an empty rag_messages
+        # list, so the LLM request never received a RAG system
+        # message.
         assert not any("Retrieved knowledge:" in c for c in system_contents), (
             f"RAG block leaked despite embedding failure: "
             f"{[c[:80] for c in system_contents]!r}"

@@ -46,11 +46,12 @@ async def get_me(
     email = str(claims.get("email", ""))
     tenant = await TenantRepository().get_by_id(tenant_id)
     tenant_name = tenant.name if tenant is not None else tenant_id
+    # PII-safe log per Stage 8.1 spec: only user_id + tenant_id.
+    # `role` is on the response body but intentionally NOT logged.
     log.info(
         "agent identity fetched",
         user_id=user_id,
         tenant_id=tenant_id,
-        role=role,
     )
     return AgentMeOut(
         user_id=user_id,
