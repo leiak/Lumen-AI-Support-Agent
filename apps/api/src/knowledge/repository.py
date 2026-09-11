@@ -139,6 +139,36 @@ class KnowledgeBaseRepository:
             )
             return list((await session.execute(stmt)).scalars().all())
 
+    async def get_default_for_tenant(
+        self, *, tenant_id: str
+    ) -> KnowledgeBase | None:
+        """Return the tenant's "default" KB, or ``None``.
+
+        **M1 rule**: a tenant has at most one KB. If exactly one
+        exists, return it. If multiple exist (misconfiguration),
+        return the most recently created one (newest-first by
+        ``created_at``). If zero exist, return ``None``.
+
+        The caller (:class:`knowledge.rag_service.RAGService`)
+        interprets ``None`` as "no KB configured for this tenant"
+        and skips retrieval. The M1 spec treats the singleton-KB
+        assumption as a deliberate simplification — per-channel KB
+        selection is a Stage 6+ concern.
+
+        Tenant isolation: the WHERE clause carries ``tenant_id``
+        explicitly. A future cross-tenant helper that picked "the
+        most recent KB across tenants" would have to bypass this
+        filter; this method deliberately refuses to do that.
+        """
+        async with get_session() as session:
+            stmt = (
+                select(KnowledgeBase)
+                .where(KnowledgeBase.tenant_id == tenant_id)
+                .order_by(KnowledgeBase.created_at.desc())
+                .limit(1)
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
     async def update(
         self,
         *,

@@ -13,7 +13,33 @@ from agent.simple_responder import (
     SimpleResponder,
 )
 from conversation.enums import ConversationStatus, MessageRole
+from knowledge.rag_service import RagContext
 from llm_client.types import ChatResponse
+
+
+def _empty_rag_context() -> RagContext:
+    """A no-op RAG context for unit tests that don't exercise RAG."""
+    return RagContext(
+        system_message="",
+        chunk_count=0,
+        knowledge_base_id="",
+        knowledge_base_name="",
+        retrieval_score_max=0.0,
+    )
+
+
+def _empty_rag_service() -> MagicMock:
+    """A MagicMock for ``RAGService`` whose ``build_context_for_query``
+    returns an empty :class:`RagContext`.
+
+    The simple-responder unit tests don't seed a tenant / KB / Qdrant,
+    so any RAG call would otherwise try to query a real (or absent)
+    database. The mock preserves the no-RAG behavior these tests
+    were originally written against.
+    """
+    svc = MagicMock()
+    svc.build_context_for_query = AsyncMock(return_value=_empty_rag_context())
+    return svc
 
 
 def _conv(**overrides: object) -> MagicMock:
@@ -60,6 +86,7 @@ async def test_responder_returns_none_when_conversation_not_found() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: AsyncMock(),
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -76,6 +103,7 @@ async def test_responder_skips_when_not_ai_handling() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: AsyncMock(),
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -100,6 +128,7 @@ async def test_responder_returns_ai_response_on_llm_success() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -129,6 +158,7 @@ async def test_responder_returns_fallback_on_llm_failure() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -157,6 +187,7 @@ async def test_responder_returns_fallback_on_empty_llm_content() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -187,6 +218,7 @@ async def test_responder_keeps_latest_messages_when_overflowed() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -221,6 +253,7 @@ async def test_responder_skips_tool_messages_in_history() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -244,6 +277,7 @@ async def test_responder_caps_history_at_max_history_messages() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -273,6 +307,7 @@ async def test_responder_maps_agent_and_ai_to_assistant_role() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -301,6 +336,7 @@ async def test_responder_handles_list_messages_returning_none() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
 
     result = await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -348,6 +384,7 @@ async def test_responder_summarizes_overflow_messages() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -382,6 +419,7 @@ async def test_responder_does_not_summarize_below_threshold() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -416,6 +454,7 @@ async def test_responder_summary_failure_uses_truncated_transcript() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 
@@ -465,6 +504,7 @@ async def test_responder_summary_keeps_latest_unchanged() -> None:
     responder = SimpleResponder(
         conv_service=conv_service,
         llm_client_factory=lambda t: fake_client,
+        rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
 

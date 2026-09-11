@@ -7,7 +7,11 @@ response is returned as an ``AgentResponse`` for the caller to persist.
 Design constraints:
 - Synchronous-ish (no background queue in Stage 5).
 - Single LLM call per customer message.
-- No tools, no RAG (those are Stage 6 / 7).
+- RAG-augmented (Task 6.12): retrieved context is injected as a
+  synthetic system message at the start of the history when the
+  tenant has a knowledge base. RAG failures degrade silently — the
+  AI still responds without context.
+- No tools (those are Stage 7 / LangGraph).
 - The interface is small enough that Stage 7's LangGraph implementer
   can ship a drop-in replacement.
 """
@@ -21,6 +25,7 @@ from agent.llm_factory import _default_llm_client_factory
 from conversation.enums import MessageRole
 from conversation.models import Message
 from conversation.service import ConversationService
+from knowledge.rag_service import RAGService, RagContext
 from llm_client.client import LLMClient
 from llm_client.types import ChatMessage as LLMChatMessage
 from llm_client.types import ChatRequest
@@ -73,19 +78,24 @@ class AgentResponse:
 
 
 class SimpleResponder:
-    """Minimal M1 agent: single-turn LLM call, no tools, no RAG."""
+    """Minimal M1 agent: single-turn LLM call with RAG context injection."""
 
     def __init__(
         self,
         *,
         conv_service: ConversationService | None = None,
         llm_client_factory: LLMClientFactory | None = None,
+        rag_service: RAGService | None = None,
         model: str = DEFAULT_MODEL,
     ) -> None:
         self._conv_service = conv_service or ConversationService()
         self._llm_client_factory: LLMClientFactory = (
             llm_client_factory or _default_llm_client_factory
         )
+        # Lazy RAG service so the SimpleResponder can be instantiated
+        # in tests that don't need retrieval — the RAG service is only
+        # touched when ``_build_history`` runs.
+        self._rag_service = rag_service or RAGService()
         self._model = model
 
     async def respond(
@@ -171,6 +181,14 @@ class SimpleResponder:
         payloads are skipped because the simple responder does not
         consume them.
 
+        **RAG (Task 6.12).** When the conversation has at least one
+        customer message, run :meth:`RAGService.build_context_for_query`
+        against the most recent customer message and prepend the
+        formatted chunk block as a synthetic ``system`` message at
+        the start of the history. If retrieval yields no chunks
+        (no KB, no hits, or retrieval error), the history is
+        unchanged — backward-compatible with the no-RAG behaviour.
+
         When the conversation has more than ``MAX_HISTORY_BEFORE_SUMMARY``
         messages, the oldest overflowing messages are summarized via a
         separate LLM call and the summary is prepended as a ``system``
@@ -189,6 +207,20 @@ class SimpleResponder:
             limit=fetch_limit,
         )
         msgs = msgs or []
+
+        # ---- RAG context injection (Task 6.12) ----------------------
+        # Run RAG against the most recent CUSTOMER message (the same
+        # message the customer just sent that triggered this turn).
+        # The RAG service is best-effort — any failure (no KB,
+        # embedding error, KB not found) returns an empty RagContext
+        # and we leave the history unchanged. This is the critical
+        # backward-compat invariant: a tenant with no KB behaves
+        # identically to a no-RAG build.
+        rag_message = await self._build_rag_message(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            messages=msgs,
+        )
 
         if len(msgs) > MAX_HISTORY_BEFORE_SUMMARY:
             # Conversation exceeds the no-summarize threshold.
@@ -221,13 +253,20 @@ class SimpleResponder:
                     content=f"Earlier conversation (truncated):\n{transcript}",
                 )
             mapped = [self._map_message(m) for m in to_keep]
-            return [summary_message, *[m for m in mapped if m is not None]]
+            return [
+                *([rag_message] if rag_message is not None else []),
+                summary_message,
+                *[m for m in mapped if m is not None],
+            ]
 
         # Short conversation: keep the LATEST MAX_HISTORY_MESSAGES verbatim.
         # (Defensive slice in case the repository ignored `limit`.)
         kept = msgs[-MAX_HISTORY_MESSAGES:]
         mapped = [self._map_message(m) for m in kept]
-        return [m for m in mapped if m is not None]
+        tail = [m for m in mapped if m is not None]
+        if rag_message is not None:
+            return [rag_message, *tail]
+        return tail
 
     def _map_message(self, m: Message) -> LLMChatMessage | None:
         """Map our ``Message`` ORM to an LLM ``ChatMessage``.
@@ -284,3 +323,69 @@ class SimpleResponder:
         if not summary:
             return transcript[:FALLBACK_SUMMARY_CHARS]
         return summary
+
+    async def _build_rag_message(
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        messages: list[Message],
+    ) -> LLMChatMessage | None:
+        """Build a synthetic RAG system message, or return ``None``.
+
+        Looks for the most recent customer message in ``messages``;
+        if none exists (empty history, only AI / agent messages),
+        returns ``None`` and the LLM gets a no-RAG history — this
+        matches the pre-6.12 behavior for the "agent-continued
+        without a customer turn" path.
+
+        Returns ``None`` if the RAG service yields no chunks (no
+        KB for the tenant, no hits, or any retrieval error). The
+        RAG service is fully exception-safe — we additionally
+        catch any unexpected error here so a future regression in
+        the RAG layer never takes down the AI auto-reply.
+
+        The returned message, when present, is a synthetic ``system``
+        turn. It is NOT persisted to the messages table — it lives
+        only inside the LLM request payload.
+        """
+        # Walk from the END — the most recent customer message is
+        # usually the last one. ``reversed`` so we short-circuit on
+        # the freshest customer message rather than the oldest.
+        latest_customer: Message | None = next(
+            (m for m in reversed(messages) if m.role == MessageRole.CUSTOMER),
+            None,
+        )
+        if latest_customer is None or not latest_customer.content_text:
+            return None
+
+        try:
+            rag_context: RagContext = (
+                await self._rag_service.build_context_for_query(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    query=latest_customer.content_text,
+                )
+            )
+        except Exception:
+            # Defence-in-depth: the RAG service itself catches
+            # everything, but we don't want a future regression to
+            # take down the AI auto-reply. Log + fall through to
+            # no-RAG behavior.
+            logger.warning(
+                "agent: RAG service raised unexpectedly, continuing without RAG",
+                extra={
+                    "tenant_id": tenant_id,
+                    "conversation_id": conversation_id,
+                },
+                exc_info=True,
+            )
+            return None
+
+        if rag_context.chunk_count == 0 or not rag_context.system_message:
+            return None
+
+        return LLMChatMessage(
+            role=LLMMessageRole.SYSTEM,
+            content=rag_context.system_message,
+        )

@@ -1,4 +1,5 @@
 """Public re-exports for the knowledge base (RAG) package."""
+from knowledge.rag_service import RAGService, RagContext
 from knowledge.repository import (
     ArticleRepository,
     ChunkRepository,
@@ -26,6 +27,8 @@ __all__ = [
     "KnowledgeBaseNotFoundError",
     "KnowledgeBaseRepository",
     "KnowledgeBaseService",
+    "RAGService",
+    "RagContext",
     "ReindexResult",
     "RetrievedChunk",
     "delete_article_vectors",
