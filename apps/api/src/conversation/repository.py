@@ -2,12 +2,27 @@
 
 Each method opens its own short-lived session via get_session(). This matches
 the per-method pattern used in ChannelRepository and TenantRepository.
+
+``SELECT ... FOR UPDATE``
+-------------------------
+
+Two methods accept an externally-owned ``AsyncSession`` so the caller can
+wrap the row lock + read + write in a single transaction:
+
+* :meth:`ConversationRepository.get_by_id_for_update` — locks a
+  single Conversation row (used by :meth:`ConversationService.claim`
+  so two concurrent claim attempts serialize at the DB level).
+* :meth:`MessageRepository.<reserved for future>` — not yet added.
+
+Mirrors the ``session``-parameter pattern in
+``knowledge/repository.py::ArticleRepository.get_by_id_for_update``.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
 from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from conversation.enums import ConversationStatus
 from conversation.models import Conversation, Message
@@ -132,6 +147,86 @@ class ConversationRepository:
             )
             await session.execute(stmt)
             await session.commit()
+
+    async def list_pending_for_tenant(
+        self,
+        *,
+        tenant_id: str,
+        status: ConversationStatus = ConversationStatus.PENDING,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Conversation]:
+        """List Conversations for a tenant, filtered by status, newest-activity first.
+
+        Two modes, selected by the ``status`` argument:
+
+        * ``status == PENDING`` (default — the agent workspace's
+          "queue" view): returns PENDING conversations with
+          ``assigned_agent_id IS NULL`` — i.e. the unassigned work
+          waiting for someone to claim.
+        * Any other status: returns all conversations with that
+          status regardless of whether they're assigned. Used by
+          admin reporting views.
+
+        Sorted by ``last_activity_at DESC`` so the freshest activity
+        surfaces first; pagination via ``limit`` / ``offset``.
+
+        Anti-enumeration note: this method always carries
+        ``tenant_id`` in the WHERE clause. A cross-tenant caller
+        simply gets their own queue, not someone else's.
+        """
+        async with get_session() as session:
+            stmt = select(Conversation).where(
+                Conversation.tenant_id == tenant_id,
+                Conversation.status == status,
+            )
+            if status == ConversationStatus.PENDING:
+                # The agent workspace's "unassigned queue" filter:
+                # only PENDING + unassigned. Admins picking a non-
+                # PENDING status get all rows for that status
+                # regardless of assignment.
+                stmt = stmt.where(Conversation.assigned_agent_id.is_(None))
+            stmt = (
+                stmt.order_by(Conversation.last_activity_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_by_id_for_update(
+        self,
+        *,
+        session: AsyncSession,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> Conversation | None:
+        """Look up a Conversation scoped to ``tenant_id`` with ``SELECT ... FOR UPDATE``.
+
+        Used by :meth:`ConversationService.claim` so two concurrent
+        claim attempts on the same row serialize at the DB level:
+        the second caller blocks on the row lock until the first
+        commits, then reads the freshly-updated
+        ``assigned_agent_id`` and short-circuits to a 409.
+
+        The caller owns ``session`` and is responsible for
+        ``commit()`` / ``rollback()`` — this method only acquires
+        the row lock within the caller's transaction.
+
+        Returns ``None`` if the row doesn't exist OR belongs to a
+        different tenant — anti-enumeration parity with
+        :meth:`get_by_id` (same WHERE clause shape, just under a
+        row lock).
+        """
+        stmt = (
+            select(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
 
 
 class MessageRepository:

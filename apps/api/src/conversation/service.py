@@ -26,8 +26,10 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 
 from conversation.enums import ConversationStatus, MessageRole
+from conversation.exceptions import ConversationNotClaimableError
 from conversation.models import Conversation, Message
 from conversation.repository import ConversationRepository, MessageRepository
+from core.database import get_sessionmaker
 from core.id_gen import new_id
 
 logger = logging.getLogger(__name__)
@@ -225,6 +227,106 @@ class ConversationService:
                 },
             )
         return updated
+
+    async def claim(
+        self, *, tenant_id: str, conversation_id: str, agent_id: str
+    ) -> Conversation:
+        """Atomically claim a PENDING conversation for ``agent_id``.
+
+        This is the agent workspace's "take ownership" action
+        (Stage 8.2). Wraps ``SELECT ... FOR UPDATE`` + status check
+        + write in a single transaction so two concurrent claim
+        attempts on the same row cannot both succeed:
+
+        1. Acquire a row lock on the conversation via
+           :meth:`ConversationRepository.get_by_id_for_update`.
+        2. Re-read the row state under the lock. If the row doesn't
+           exist (or belongs to another tenant) → raise
+           ``ValueError`` (mapped to 404 by the API).
+        3. If the row's ``status != PENDING`` or
+           ``assigned_agent_id IS NOT NULL`` → raise
+           :class:`ConversationNotClaimableError` (mapped to 409 by
+           the API). The lock is released by the rollback before
+           the exception propagates.
+        4. Otherwise set ``assigned_agent_id = agent_id``, keep
+           ``status = PENDING``, keep ``ai_handling = False``,
+           advance ``last_activity_at`` via the injected clock, and
+           commit.
+
+        ``status`` is NOT changed by claim — the conversation stays
+        PENDING while the agent owns it. The agent (or an admin)
+        flips the conversation back to AI handling via the existing
+        ``return_to_ai`` action; closing stays on the
+        ``close`` action.
+
+        Anti-enumeration: the not-found branch raises ``ValueError``
+        with the same wording as :meth:`record_message` so the API
+        layer can map both to 404. The "already claimed / wrong
+        status" branch raises a single
+        :class:`ConversationNotClaimableError` so a probing caller
+        cannot distinguish between the two failure modes via the
+        response body — both surface as 409 with the same
+        ``"conversation cannot be claimed"`` message.
+
+        Raises
+        ------
+        ValueError
+            Cross-tenant or unknown ``conversation_id``. Mapped to
+            404 by the API layer.
+        ConversationNotClaimableError
+            Already claimed by another agent, OR the conversation
+            is in a non-PENDING state. Mapped to 409 by the API
+            layer.
+        """
+        sm = get_sessionmaker()
+        async with sm() as session:
+            conv = await self._repo.get_by_id_for_update(
+                session=session,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+            )
+            if conv is None:
+                # Cross-tenant or unknown — same 404 the rest of
+                # the API uses to prevent enumeration via response
+                # differentiation. Roll back so we don't pin an
+                # empty transaction on the connection pool.
+                await session.rollback()
+                raise ValueError(
+                    f"conversation {conversation_id} not found for tenant {tenant_id}"
+                )
+            if (
+                conv.status != ConversationStatus.PENDING
+                or conv.assigned_agent_id is not None
+            ):
+                # Anti-enumeration: one error class covers both
+                # "already claimed" and "wrong status". The agent
+                # had to know the conversation_id to attempt the
+                # claim, so a 409 here doesn't reveal anything they
+                # couldn't have inferred from the URL.
+                await session.rollback()
+                raise ConversationNotClaimableError()
+
+            now = self._clock()
+            conv.assigned_agent_id = agent_id
+            # status stays PENDING — claim does NOT advance to a
+            # new state. ai_handling stays False (it's already
+            # False for any PENDING conversation; this is a no-op
+            # but documents intent).
+            conv.ai_handling = False
+            conv.last_activity_at = now
+            await session.flush()
+            await session.refresh(conv)
+            await session.commit()
+
+        logger.info(
+            "conversation claimed by agent",
+            extra={
+                "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+            },
+        )
+        return conv
 
     async def escalate_to_human_queue(
         self, *, tenant_id: str, conversation_id: str

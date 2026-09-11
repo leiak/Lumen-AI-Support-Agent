@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conversation import exceptions as conv_exceptions
+from conversation import service as service_module
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
 from conversation.service import ConversationService
@@ -586,3 +588,157 @@ async def test_list_messages_returns_none_when_conversation_missing() -> None:
     result = await svc.list_messages(tenant_id="t1", conversation_id="missing")
     assert result is None
     msg_repo.list_by_conversation.assert_not_called()
+
+
+# ---- claim (Stage 8.2) ----
+
+
+def _stub_sessionmaker_with(monkeypatch: pytest.MonkeyPatch, session: Any) -> None:
+    """Patch ``conversation.service.get_sessionmaker`` so it yields ``session``.
+
+    The ``claim`` method opens its own session via
+    :func:`core.database.get_sessionmaker` rather than
+    :func:`core.database.get_session` — mirroring the
+    ``knowledge.service.reupload_article`` pattern. Unit tests have
+    to monkeypatch that call.
+    """
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=session)
+    cm.__aexit__ = AsyncMock(return_value=None)
+    sm = MagicMock()
+    sm.return_value = cm
+    monkeypatch.setattr(service_module, "get_sessionmaker", lambda: sm)
+
+
+@pytest.mark.asyncio
+async def test_claim_sets_assigned_agent_id_and_keeps_status_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claim a PENDING unassigned conv -> assigned_agent_id set, status unchanged."""
+    conv = _conv(
+        tenant_id="t1",
+        status=ConversationStatus.PENDING,
+        assigned_agent_id=None,
+        ai_handling=False,
+    )
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_sessionmaker_with(monkeypatch, session)
+
+    conv_repo = MagicMock()
+    conv_repo.get_by_id_for_update = AsyncMock(return_value=conv)
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    result = await svc.claim(
+        tenant_id="t1", conversation_id=conv.id, agent_id="u_agent"
+    )
+
+    assert result is not None
+    assert result.assigned_agent_id == "u_agent"
+    assert result.status == ConversationStatus.PENDING
+    assert result.ai_handling is False
+    assert result.last_activity_at == FROZEN_NOW
+
+    conv_repo.get_by_id_for_update.assert_awaited_once()
+    assert conv_repo.get_by_id_for_update.await_args.kwargs["tenant_id"] == "t1"
+    assert conv_repo.get_by_id_for_update.await_args.kwargs["conversation_id"] == conv.id
+    # We used the caller-provided session, so commit() runs on it.
+    session.commit.assert_awaited_once()
+    session.rollback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_raises_value_error_for_missing_or_cross_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """get_by_id_for_update returns None -> ValueError; rolled back."""
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_sessionmaker_with(monkeypatch, session)
+
+    conv_repo = MagicMock()
+    conv_repo.get_by_id_for_update = AsyncMock(return_value=None)
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    with pytest.raises(ValueError, match="tenant"):
+        await svc.claim(
+            tenant_id="t1", conversation_id="01HX_MISSING", agent_id="u_agent"
+        )
+
+    session.rollback.assert_awaited_once()
+    session.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claim_raises_not_claimable_for_wrong_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OPEN conv -> ConversationNotClaimableError (mapped to 409 by the API)."""
+    conv = _conv(
+        tenant_id="t1",
+        status=ConversationStatus.OPEN,  # wrong status
+        assigned_agent_id=None,
+        ai_handling=True,
+    )
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_sessionmaker_with(monkeypatch, session)
+
+    conv_repo = MagicMock()
+    conv_repo.get_by_id_for_update = AsyncMock(return_value=conv)
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    with pytest.raises(conv_exceptions.ConversationNotClaimableError):
+        await svc.claim(
+            tenant_id="t1", conversation_id=conv.id, agent_id="u_agent"
+        )
+
+    # The rollback releases the row lock so the next caller can read.
+    session.rollback.assert_awaited_once()
+    session.commit.assert_not_called()
+    # The conversation was NOT mutated.
+    assert conv.assigned_agent_id is None
+    assert conv.status == ConversationStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_claim_raises_not_claimable_for_already_claimed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Already-claimed conv -> ConversationNotClaimableError; rolled back."""
+    conv = _conv(
+        tenant_id="t1",
+        status=ConversationStatus.PENDING,
+        assigned_agent_id="u_other",  # someone else got here first
+        ai_handling=False,
+    )
+    session = MagicMock()
+    session.flush = AsyncMock()
+    session.refresh = AsyncMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_sessionmaker_with(monkeypatch, session)
+
+    conv_repo = MagicMock()
+    conv_repo.get_by_id_for_update = AsyncMock(return_value=conv)
+    svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
+
+    with pytest.raises(conv_exceptions.ConversationNotClaimableError):
+        await svc.claim(
+            tenant_id="t1", conversation_id=conv.id, agent_id="u_agent"
+        )
+
+    # Anti-enumeration: identical error for both 409 paths.
+    session.rollback.assert_awaited_once()
+    session.commit.assert_not_called()
+    # The prior agent assignment was NOT overwritten.
+    assert conv.assigned_agent_id == "u_other"
