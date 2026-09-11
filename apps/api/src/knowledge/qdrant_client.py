@@ -173,3 +173,139 @@ async def ensure_collection(
 
     log.info("qdrant.collection.created", collection=name)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Upsert + delete helpers used by the worker (Task 6.7)
+# ---------------------------------------------------------------------------
+
+
+async def upsert_chunks(
+    *,
+    collection: str,
+    points: list[qmodels.PointStruct],
+) -> int:
+    """Upsert N points to a Qdrant collection. Returns count upserted.
+
+    Surfaces Qdrant errors via WARNING + return 0 so the caller can decide
+    whether to fail the article (it should). Never raises.
+
+    PII-safety: payload contents are forwarded as-is by Qdrant — we do
+    NOT log point IDs, vectors, or payload text on the error path. The
+    log payload carries only the collection name, point count, and the
+    error class name.
+    """
+    if not points:
+        log.info("qdrant.upsert.empty", collection=collection, point_count=0)
+        return 0
+
+    try:
+        client = get_qdrant_client()
+    except Exception as exc:  # pragma: no cover - defensive; singleton rarely raises
+        log.warning(
+            "qdrant.upsert.client_unavailable",
+            collection=collection,
+            point_count=len(points),
+            error_type=type(exc).__name__,
+        )
+        return 0
+
+    try:
+        await client.upsert(
+            collection_name=collection,
+            points=points,
+            # ``wait=True`` ensures the upsert is durable before we
+            # commit the Chunk rows that reference it. The worker
+            # pipeline relies on this ordering.
+            wait=True,
+        )
+    except UnexpectedResponse as exc:
+        log.warning(
+            "qdrant.upsert.failed",
+            collection=collection,
+            point_count=len(points),
+            status_code=getattr(exc, "status_code", None),
+            error_type=type(exc).__name__,
+        )
+        return 0
+    except Exception as exc:
+        # ConnectionError, timeout, validation that bubbled up as a
+        # non-UnexpectedResponse, etc.
+        log.warning(
+            "qdrant.upsert.error",
+            collection=collection,
+            point_count=len(points),
+            error_type=type(exc).__name__,
+        )
+        return 0
+
+    log.info(
+        "qdrant.upsert.success",
+        collection=collection,
+        point_count=len(points),
+    )
+    return len(points)
+
+
+async def delete_points_by_article_version(
+    *,
+    collection: str,
+    article_version_id: str,
+) -> int:
+    """Delete all Qdrant points matching the article_version_id payload.
+
+    Used by the indexer (Task 6.7) to clean stale vectors before
+    upserting a freshly-chunked version. Returns the best-effort count
+    deleted (Qdrant's delete API does not echo a number on success;
+    we return ``1`` to indicate "operation succeeded, count unknown"
+    on a successful call and ``0`` on any error). Never raises.
+
+    PII-safety: logs carry only the collection name + the opaque
+    article_version_id + error_type. No point IDs or payload contents.
+    """
+    try:
+        client = get_qdrant_client()
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning(
+            "qdrant.delete.client_unavailable",
+            collection=collection,
+            error_type=type(exc).__name__,
+        )
+        return 0
+
+    delete_filter = qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="article_version_id",
+                match=qmodels.MatchValue(value=article_version_id),
+            )
+        ]
+    )
+
+    try:
+        await client.delete(
+            collection_name=collection,
+            points_selector=delete_filter,
+            wait=True,
+        )
+    except UnexpectedResponse as exc:
+        log.warning(
+            "qdrant.delete.failed",
+            collection=collection,
+            status_code=getattr(exc, "status_code", None),
+            error_type=type(exc).__name__,
+        )
+        return 0
+    except Exception as exc:
+        log.warning(
+            "qdrant.delete.error",
+            collection=collection,
+            error_type=type(exc).__name__,
+        )
+        return 0
+
+    log.info(
+        "qdrant.delete.success",
+        collection=collection,
+    )
+    return 1
