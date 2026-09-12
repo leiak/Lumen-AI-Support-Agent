@@ -1,15 +1,31 @@
-function App(): JSX.Element {
+import { Navigate, Route, Routes } from 'react-router-dom';
+
+import { AppShell } from '@/components/layout/app-shell';
+import { AuthGuard } from '@/components/auth/auth-guard';
+import { LoginPage } from '@/pages/login';
+import { InboxPage } from '@/pages/inbox';
+import { InboxDetailPage } from '@/pages/inbox-detail';
+import { KbPage } from '@/pages/kb';
+import { SettingsPage } from '@/pages/settings';
+
+export function App(): JSX.Element {
   return (
-    <div className="app-shell">
-      <main className="app-card">
-        <h1 className="app-title">Lumen AI Support Agent</h1>
-        <p className="app-subtitle">Workspace scaffold ready (Stage 9.1)</p>
-        <p className="app-hint">
-          后续任务将逐步引入路由、状态管理与 UI 组件库。
-        </p>
-      </main>
-    </div>
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route
+        element={
+          <AuthGuard>
+            <AppShell />
+          </AuthGuard>
+        }
+      >
+        <Route path="/inbox" element={<InboxPage />} />
+        <Route path="/inbox/:id" element={<InboxDetailPage />} />
+        <Route path="/kb" element={<KbPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
+      </Route>
+      <Route path="/" element={<Navigate to="/inbox" replace />} />
+      <Route path="*" element={<Navigate to="/inbox" replace />} />
+    </Routes>
   );
 }
-
-export default App;
