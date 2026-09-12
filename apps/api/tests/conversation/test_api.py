@@ -38,6 +38,12 @@ AGENT_CLAIMS: dict[str, Any] = {
     "role": "agent",
 }
 
+OTHER_TENANT_CLAIMS: dict[str, Any] = {
+    "sub": "u_agent_2",
+    "tenant_id": "tenant_Y",
+    "role": "agent",
+}
+
 
 async def _fake_require_admin() -> dict[str, Any]:
     """Bypass JWT verification — directly inject admin claims."""
@@ -98,6 +104,27 @@ def _stub_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         api_module, "require_agent_or_admin", _fake_require_agent_or_admin
     )
+
+
+def _stub_agent_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    claims: dict[str, Any] | None = None,
+) -> None:
+    """Stub auth deps so the route sees the given JWT claims.
+
+    Used by the cross-tenant tests — they need a different ``tenant_id``
+    than the default ``AGENT_CLAIMS`` exposes. Without this helper each
+    cross-tenant test would have to re-implement the closure that returns
+    the chosen claims dict.
+    """
+    payload = claims if claims is not None else AGENT_CLAIMS
+
+    async def _stub() -> dict[str, Any]:
+        return payload
+
+    monkeypatch.setattr(api_module, "require_agent_or_admin", _stub)
+    monkeypatch.setattr(api_module, "require_admin", _stub)
 
 
 # ===========================================================================
@@ -373,7 +400,7 @@ async def test_get_conversation_404_for_unknown(
 async def test_list_messages_returns_chronological_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
     conv = _conv()
     msgs = [
         _msg(conversation_id=conv.id, content_text="first"),
@@ -420,7 +447,7 @@ async def test_list_messages_returns_chronological_list(
 async def test_list_messages_paginates_via_before(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
     conv = _conv()
     cutoff = datetime(2026, 9, 10, 11, 0, 0, tzinfo=UTC)
 
@@ -461,7 +488,7 @@ async def test_list_messages_404_for_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Service returns None (cross-tenant or not-found) -> 404."""
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
 
     async def fake_list_messages(
         self: Any,
@@ -598,7 +625,7 @@ async def test_assign_conversation_validates_agent_id(
 async def test_return_to_ai_resets_to_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
     conv = _conv(
         status=ConversationStatus.PENDING,
         assigned_agent_id="u_agent_1",
@@ -648,7 +675,7 @@ async def test_return_to_ai_resets_to_open(
 async def test_return_to_ai_404_for_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
 
     async def fake_return(
         self: Any,
@@ -679,7 +706,7 @@ async def test_return_to_ai_404_for_unknown(
 async def test_close_conversation_sets_status_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
     conv = _conv()
     updated = _conv(id=conv.id, status=ConversationStatus.CLOSED, ai_handling=False)
 
@@ -717,7 +744,7 @@ async def test_close_conversation_sets_status_closed(
 async def test_close_conversation_404_for_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
 
     async def fake_close(
         self: Any,
@@ -848,3 +875,262 @@ async def test_full_api_flow_assign_to_agent(
         assert body["status"] == "pending"
         assert body["assigned_agent_id"] == "u_agent_1"
         assert body["ai_handling"] is False
+
+
+# ===========================================================================
+# Stage 9.5 widen: messages / close / return-to-ai accept non-admin agents
+# ===========================================================================
+#
+# These three routes widened from ``require_admin`` to
+# ``require_agent_or_admin`` so the agent workspace UI can drive the
+# "关闭" / "返回 AI" buttons and ``MessageStream``. Tenant isolation is
+# the load-bearing invariant — every operation must be scoped to
+# ``tenant_id=user.tenant_id`` and cross-tenant access must return 404
+# (anti-enumeration parity with the rest of the API).
+
+
+@pytest.mark.asyncio
+async def test_messages_endpoint_allows_agent_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT + valid conversation_id in same tenant -> 200."""
+    _stub_agent(monkeypatch)
+    conv = _conv()
+    msgs = [
+        _msg(conversation_id=conv.id, content_text="m1"),
+        _msg(conversation_id=conv.id, content_text="m2"),
+    ]
+
+    captured: dict[str, Any] = {}
+
+    async def fake_list_messages(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        before: datetime | None,
+        limit: int,
+    ) -> list[Message] | None:
+        captured["tenant_id"] = tenant_id
+        captured["conversation_id"] = conversation_id
+        return msgs
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "list_messages", fake_list_messages
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(f"/api/v1/conversations/{conv.id}/messages")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["items"]) == 2
+    # Tenant scoping must come from the JWT, not from the request.
+    assert captured["tenant_id"] == AGENT_CLAIMS["tenant_id"]
+    assert captured["conversation_id"] == conv.id
+
+
+@pytest.mark.asyncio
+async def test_messages_endpoint_returns_404_on_cross_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT for tenant_Y requesting a tenant_X conversation -> 404."""
+    _stub_agent_auth(monkeypatch, claims=OTHER_TENANT_CLAIMS)
+    other_tenant_conv_id = new_id()
+
+    async def fake_list_messages(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        before: datetime | None,
+        limit: int,
+    ) -> list[Message] | None:
+        # Service contract: cross-tenant / unknown -> None (-> 404).
+        return None
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "list_messages", fake_list_messages
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(
+            f"/api/v1/conversations/{other_tenant_conv_id}/messages"
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "conversation not found"
+
+
+@pytest.mark.asyncio
+async def test_close_endpoint_allows_owning_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT + conversation where assigned_agent_id == claims['sub'] -> 200."""
+    _stub_agent(monkeypatch)
+    # Conv is owned by the calling agent (claims['sub'] == 'u_agent_1').
+    conv = _conv(
+        status=ConversationStatus.PENDING,
+        assigned_agent_id=AGENT_CLAIMS["sub"],
+        ai_handling=False,
+    )
+    updated = _conv(
+        id=conv.id,
+        status=ConversationStatus.CLOSED,
+        assigned_agent_id=AGENT_CLAIMS["sub"],
+        ai_handling=False,
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_close(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> Conversation | None:
+        captured["tenant_id"] = tenant_id
+        captured["conversation_id"] = conversation_id
+        return updated
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "close", fake_close
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(f"/api/v1/conversations/{conv.id}/close")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "closed"
+    assert body["ai_handling"] is False
+    # Tenant scoping must come from the JWT.
+    assert captured["tenant_id"] == AGENT_CLAIMS["tenant_id"]
+    assert captured["conversation_id"] == conv.id
+
+
+@pytest.mark.asyncio
+async def test_close_endpoint_returns_404_on_cross_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT for tenant_Y closing a tenant_X conversation -> 404."""
+    _stub_agent_auth(monkeypatch, claims=OTHER_TENANT_CLAIMS)
+    other_tenant_conv_id = new_id()
+
+    async def fake_close(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> Conversation | None:
+        # Service contract: cross-tenant / unknown -> None (-> 404).
+        return None
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "close", fake_close
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/conversations/{other_tenant_conv_id}/close"
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "conversation not found"
+
+
+@pytest.mark.asyncio
+async def test_return_to_ai_endpoint_allows_owning_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT + claimed conversation -> 200, status flips to OPEN."""
+    _stub_agent(monkeypatch)
+    conv = _conv(
+        status=ConversationStatus.PENDING,
+        assigned_agent_id=AGENT_CLAIMS["sub"],
+        ai_handling=False,
+    )
+    updated = _conv(
+        id=conv.id,
+        status=ConversationStatus.OPEN,
+        assigned_agent_id=None,
+        ai_handling=True,
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_return(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> Conversation | None:
+        captured["tenant_id"] = tenant_id
+        captured["conversation_id"] = conversation_id
+        return updated
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "return_to_ai", fake_return
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/conversations/{conv.id}/return-to-ai"
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "open"
+    assert body["assigned_agent_id"] is None
+    assert body["ai_handling"] is True
+    # Tenant scoping must come from the JWT.
+    assert captured["tenant_id"] == AGENT_CLAIMS["tenant_id"]
+    assert captured["conversation_id"] == conv.id
+
+
+@pytest.mark.asyncio
+async def test_return_to_ai_endpoint_returns_404_on_cross_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent JWT for tenant_Y returning tenant_X conversation -> 404."""
+    _stub_agent_auth(monkeypatch, claims=OTHER_TENANT_CLAIMS)
+    other_tenant_conv_id = new_id()
+
+    async def fake_return(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+    ) -> Conversation | None:
+        # Service contract: cross-tenant / unknown -> None (-> 404).
+        return None
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "return_to_ai", fake_return
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/conversations/{other_tenant_conv_id}/return-to-ai"
+        )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "conversation not found"

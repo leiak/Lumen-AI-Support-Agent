@@ -197,7 +197,7 @@ async def get_conversation(
 @router.get("/{conversation_id}/messages", response_model=MessageListOut)
 async def list_messages(
     conversation_id: str,
-    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
     before: Annotated[datetime | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> MessageListOut:
@@ -205,6 +205,12 @@ async def list_messages(
 
     Pagination: if `before` is supplied, returns messages strictly older
     than that timestamp. Otherwise returns the latest `limit` messages.
+
+    Auth: ``require_agent_or_admin`` — assigned agents need to read
+    messages from the conversation detail page (Stage 9.5). Tenant
+    isolation is enforced via the JWT-derived ``tenant_id`` passed to
+    :meth:`ConversationService.list_messages` — cross-tenant or unknown
+    ``conversation_id`` returns ``None`` and surfaces as 404.
     """
     msgs = await _service().list_messages(
         tenant_id=claims["tenant_id"],
@@ -303,9 +309,16 @@ async def assign_conversation(
 @router.post("/{conversation_id}/return-to-ai", response_model=ConversationOut)
 async def return_to_ai(
     conversation_id: str,
-    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
 ) -> ConversationOut:
-    """Return control of a conversation to the AI agent."""
+    """Return control of a conversation to the AI agent.
+
+    Auth: ``require_agent_or_admin`` — assigned agents use this from
+    the workspace (Stage 9.5 "返回 AI" button). Tenant scoping is via
+    the JWT-derived ``tenant_id`` passed to
+    :meth:`ConversationService.return_to_ai`; cross-tenant / unknown
+    returns ``None`` and surfaces as 404.
+    """
     conv = await _service().return_to_ai(
         tenant_id=claims["tenant_id"],
         conversation_id=conversation_id,
@@ -318,9 +331,16 @@ async def return_to_ai(
 @router.post("/{conversation_id}/close", response_model=ConversationOut)
 async def close_conversation(
     conversation_id: str,
-    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
 ) -> ConversationOut:
-    """Close a conversation. Status -> CLOSED."""
+    """Close a conversation. Status -> CLOSED.
+
+    Auth: ``require_agent_or_admin`` — assigned agents close their own
+    conversations from the workspace (Stage 9.5 "关闭" button). Tenant
+    scoping is via the JWT-derived ``tenant_id`` passed to
+    :meth:`ConversationService.close`; cross-tenant / unknown returns
+    ``None`` and surfaces as 404.
+    """
     conv = await _service().close(
         tenant_id=claims["tenant_id"],
         conversation_id=conversation_id,
