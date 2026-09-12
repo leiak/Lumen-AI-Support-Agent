@@ -52,6 +52,7 @@ async def health() -> JSONResponse:
 
 
 from agent.api import router as agents_router  # noqa: E402
+from agent.ws import router as agents_ws_router  # noqa: E402
 from auth.api import router as auth_router  # noqa: E402
 from channel.api import router as channels_router  # noqa: E402
 from channel.feishu.webhook import router as feishu_webhook_router  # noqa: E402
@@ -61,6 +62,7 @@ from widget.api import router as widget_router  # noqa: E402
 from widget.ws.router import router as widget_ws_router  # noqa: E402
 
 app.include_router(agents_router)
+app.include_router(agents_ws_router)
 app.include_router(auth_router)
 app.include_router(channels_router)
 app.include_router(conversations_router)
