@@ -99,6 +99,22 @@ class UserRepository:
             )
             return result.scalar_one_or_none()
 
+    async def get_first_by_email(self, email: str) -> User | None:
+        """Look up a User by email across ALL tenants.
+
+        Returns the first match ordered by ``id`` ascending for
+        determinism — same input always maps to the same row, so the
+        tenant-hint endpoint behaves predictably when a single email
+        happens to exist in more than one tenant.
+
+        Returns ``None`` if no user with that email exists in any tenant.
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                select(User).where(User.email == email).order_by(User.id.asc()).limit(1)
+            )
+            return result.scalar_one_or_none()
+
     async def list_for_tenant(self, tenant_id: str) -> list[User]:
         """Return all users for a tenant (no pagination in M1)."""
         async with get_session() as session:

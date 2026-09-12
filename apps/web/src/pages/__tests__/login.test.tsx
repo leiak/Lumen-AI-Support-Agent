@@ -14,8 +14,10 @@ import { LoginPage } from '@/pages/login';
 import type * as ApiClient from '@/lib/api-client';
 
 // Mock the api-client module so the form never touches a real network.
-// We let the real `login()` (from @/lib/auth) run so its X-Tenant-Id header
-// logic is exercised end-to-end through the mocked apiClient.
+// We let the real ``login()`` and ``lookupTenant()`` (from @/lib/auth)
+// run so the per-call X-Tenant-Id header override is exercised
+// end-to-end through the mocked apiClient. Tests stage the desired
+// responses on ``apiClient.post`` / ``apiClient.get``.
 vi.mock('@/lib/api-client', async () => {
   const actual = await vi.importActual<typeof ApiClient>('@/lib/api-client');
   return {
@@ -38,9 +40,33 @@ function renderLogin(initialEntry = '/login'): void {
   );
 }
 
+const TENANT_OK = {
+  data: { tenant_id: 'demo', tenant_name: 'Acme' },
+};
+
+const LOGIN_OK = {
+  data: {
+    access_token: 'jwt-default',
+    token_type: 'bearer',
+    expires_in: 3600,
+    user: {
+      id: 'u1',
+      tenant_id: 'demo',
+      email: 'agent@example.com',
+      full_name: 'Agent',
+      role: 'agent',
+    },
+  },
+};
+
 beforeEach(() => {
   window.localStorage.clear();
   vi.mocked(apiClient.post).mockReset();
+  vi.mocked(apiClient.get).mockReset();
+  // Default: tenant lookup succeeds, login succeeds. Individual tests
+  // override these to drive failure / 429 / etc.
+  vi.mocked(apiClient.get).mockResolvedValue(TENANT_OK);
+  vi.mocked(apiClient.post).mockResolvedValue(LOGIN_OK);
 });
 
 afterEach(() => {
@@ -94,8 +120,41 @@ describe('LoginPage', () => {
     expect(apiClient.post).not.toHaveBeenCalled();
   });
 
-  it('test_login_submit_calls_api_with_credentials', async () => {
+  it('test_login_looks_up_tenant_after_email_input', async () => {
     const user = userEvent.setup();
+    renderLogin();
+
+    await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+
+    // The page debounces by ~300 ms; allow a generous wait.
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/auth/lookup-tenant',
+        expect.objectContaining({ params: { email: 'agent@example.com' } }),
+      ),
+    );
+  });
+
+  it('test_login_does_not_call_login_api_before_tenant_resolved', async () => {
+    const user = userEvent.setup();
+    // Lookup hangs forever → onSubmit's guard refuses to call POST.
+    vi.mocked(apiClient.get).mockReturnValue(new Promise(() => {}));
+    renderLogin();
+
+    await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+    await user.type(screen.getByLabelText('密码'), 'password123');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    // Give any pending microtasks a chance to flush.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(apiClient.post).not.toHaveBeenCalled();
+  });
+
+  it('test_login_submit_calls_api_with_credentials_and_resolved_tenant', async () => {
+    const user = userEvent.setup();
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { tenant_id: 'tenant-abc', tenant_name: 'Acme' },
+    });
     vi.mocked(apiClient.post).mockResolvedValue({
       data: {
         access_token: 'jwt-abc',
@@ -103,7 +162,7 @@ describe('LoginPage', () => {
         expires_in: 3600,
         user: {
           id: 'u1',
-          tenant_id: 'demo',
+          tenant_id: 'tenant-abc',
           email: 'agent@example.com',
           full_name: 'Agent',
           role: 'agent',
@@ -113,6 +172,13 @@ describe('LoginPage', () => {
     renderLogin();
 
     await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+    // Wait for the lookup to resolve before clicking submit.
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/auth/lookup-tenant',
+        expect.anything(),
+      ),
+    );
     await user.type(screen.getByLabelText('密码'), 'password123');
     await user.click(screen.getByRole('button', { name: '登录' }));
 
@@ -123,7 +189,54 @@ describe('LoginPage', () => {
       email: 'agent@example.com',
       password: 'password123',
     });
-    expect(config?.headers).toMatchObject({ 'X-Tenant-Id': expect.any(String) });
+    expect(config?.headers).toMatchObject({ 'X-Tenant-Id': 'tenant-abc' });
+  });
+
+  it('test_login_submits_with_resolved_tenant_id_in_header', async () => {
+    const user = userEvent.setup();
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { tenant_id: 'resolved-tenant-xyz', tenant_name: 'Beta Co' },
+    });
+    vi.mocked(apiClient.post).mockResolvedValue({
+      data: {
+        access_token: 'jwt-xyz',
+        token_type: 'bearer',
+        expires_in: 3600,
+        user: {
+          id: 'u2',
+          tenant_id: 'resolved-tenant-xyz',
+          email: 'agent@example.com',
+          full_name: 'Agent',
+          role: 'agent',
+        },
+      },
+    });
+    renderLogin();
+
+    await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalled());
+    await user.type(screen.getByLabelText('密码'), 'pw');
+    await user.click(screen.getByRole('button', { name: '登录' }));
+
+    await waitFor(() => expect(apiClient.post).toHaveBeenCalled());
+    const [, , config] = vi.mocked(apiClient.post).mock.calls[0]!;
+    expect(config?.headers?.['X-Tenant-Id']).toBe('resolved-tenant-xyz');
+  });
+
+  it('test_login_shows_generic_error_when_tenant_lookup_returns_null', async () => {
+    const user = userEvent.setup();
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { tenant_id: null, tenant_name: null },
+    });
+    renderLogin();
+
+    await user.type(screen.getByLabelText('邮箱'), 'unknown@example.com');
+
+    // Anti-enumeration: the message must NOT confirm the email is
+    // unknown — only that "邮箱或租户信息" can't be recognised.
+    const hint = await screen.findByTestId('tenant-hint-failed');
+    expect(hint).toHaveTextContent('邮箱或租户信息无法识别');
+    expect(hint.textContent).not.toMatch(/不存在|未注册/);
   });
 
   it('test_login_success_stores_jwt_and_redirects', async () => {
@@ -145,6 +258,7 @@ describe('LoginPage', () => {
     renderLogin();
 
     await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalled());
     await user.type(screen.getByLabelText('密码'), 'password123');
     await user.click(screen.getByRole('button', { name: '登录' }));
 
@@ -168,6 +282,7 @@ describe('LoginPage', () => {
     renderLogin();
 
     await user.type(screen.getByLabelText('邮箱'), 'agent@example.com');
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalled());
     await user.type(screen.getByLabelText('密码'), 'wrong-password');
     await user.click(screen.getByRole('button', { name: '登录' }));
 

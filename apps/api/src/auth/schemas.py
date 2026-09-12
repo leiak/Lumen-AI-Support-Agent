@@ -26,3 +26,17 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"  # noqa: S105
     expires_in: int  # seconds
     user: UserInfo
+
+
+class TenantHintResponse(BaseModel):
+    """GET /auth/lookup-tenant response.
+
+    Always returned with HTTP 200, even when no user matches the email —
+    see the endpoint docstring for the anti-enumeration rationale.
+    Both fields are nullable: ``null`` means "no user found" or "user
+    belongs to no active tenant" — the frontend MUST treat the two
+    cases identically.
+    """
+
+    tenant_id: str | None = None
+    tenant_name: str | None = None
