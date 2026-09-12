@@ -3,6 +3,7 @@ import { Inbox, BookOpen, Settings, LogOut } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/api-client';
+import { useCurrentUser } from '@/lib/use-current-user';
 import { cn } from '@/lib/utils';
 
 interface NavItem {
@@ -19,6 +20,7 @@ const navItems: NavItem[] = [
 
 export function AppShell(): JSX.Element {
   const navigate = useNavigate();
+  const { user, isLoading } = useCurrentUser();
 
   const handleLogout = (): void => {
     clearAuthToken();
@@ -35,7 +37,13 @@ export function AppShell(): JSX.Element {
           </span>
         </div>
         <div className="flex items-center gap-4">
-          <span className="text-sm text-muted-foreground">agent@example.com</span>
+          <span
+            className="text-sm text-muted-foreground"
+            data-testid="current-user-email"
+            data-loading={isLoading ? 'true' : 'false'}
+          >
+            {user?.email ?? (isLoading ? '加载中…' : '未登录')}
+          </span>
           <Button variant="outline" size="sm" onClick={handleLogout}>
             <LogOut className="mr-2" />
             退出登录
@@ -65,7 +73,7 @@ export function AppShell(): JSX.Element {
             ))}
           </nav>
           <div className="border-t px-4 py-3 text-xs text-muted-foreground">
-            Stage 9.2 脚手架就绪
+            Stage 9.3 脚手架就绪
           </div>
         </aside>
 
