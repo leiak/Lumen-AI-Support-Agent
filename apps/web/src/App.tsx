@@ -6,6 +6,8 @@ import { LoginPage } from '@/pages/login';
 import { InboxPage } from '@/pages/inbox';
 import { InboxDetailPage } from '@/pages/inbox-detail';
 import { KbPage } from '@/pages/kb';
+import { KbDetailPage } from '@/pages/kb-detail';
+import { ArticleDetailPage } from '@/pages/article-detail';
 import { SettingsPage } from '@/pages/settings';
 
 export function App(): JSX.Element {
@@ -22,6 +24,8 @@ export function App(): JSX.Element {
         <Route path="/inbox" element={<InboxPage />} />
         <Route path="/inbox/:id" element={<InboxDetailPage />} />
         <Route path="/kb" element={<KbPage />} />
+        <Route path="/kb/:kbId" element={<KbDetailPage />} />
+        <Route path="/kb/:kbId/articles/:articleId" element={<ArticleDetailPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Route>
       <Route path="/" element={<Navigate to="/inbox" replace />} />
