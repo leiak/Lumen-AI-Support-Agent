@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from core.config import get_settings
@@ -40,6 +41,27 @@ app = FastAPI(
     title="AI Customer API",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# CORS — required for the browser-side widget (cross-origin POST to
+# /api/v1/widget/token) and the agent workspace SPA. The allowlist is
+# the same env-driven list used by the widget WebSocket origin check
+# (see ``widget.ws.router._is_origin_allowed``). Credentials are enabled
+# because the agent SPA sends a Bearer token via Authorization header
+# and we may add cookie-based session auth in Stage 10+.
+# IMPORTANT: when ``allow_credentials=True`` starlette rejects
+# ``allow_origins=["*"]``; we echo the request Origin back to clients
+# whose Origin is in the allowlist. An empty allowlist disables
+# cross-origin responses entirely (default-deny).
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.widget_allowed_origins_global,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Content-Type", "Authorization", "X-Tenant-Id"],
+    expose_headers=["Content-Type"],
+    max_age=600,
 )
 
 

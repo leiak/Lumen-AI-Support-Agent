@@ -11,6 +11,7 @@ from auth.jwt import TokenError
 from channel.enums import ChannelStatus
 from channel.inbound import process_inbound_envelope
 from channel.repository import ChannelRepository
+from core.config import get_settings
 from widget.adapter import WebWidgetAdapter
 from widget.tokens import decode_widget_token
 from widget.ws.manager import manager
@@ -18,7 +19,62 @@ from widget.ws.manager import manager
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/widget", tags=["widget-ws"])
 
-__all__ = ["manager", "router", "websocket_endpoint"]
+__all__ = ["manager", "router", "websocket_endpoint", "is_origin_allowed"]
+
+
+# ---------------------------------------------------------------------------
+# Origin allowlist helpers
+#
+# The widget WebSocket is cross-origin by design (the embedding site is on a
+# different host from the API). To prevent drive-by abuse from random
+# websites, we reject handshakes whose ``Origin`` header is not on the
+# configured allowlist. M1 uses a single global allowlist
+# (``widget_allowed_origins_global`` from settings); per-tenant allowlists
+# are a Stage 5+ concern.
+#
+# Anti-enumeration: any rejection — missing Origin, mismatched Origin,
+# malformed Origin, or literal "*" — closes with the same opaque close
+# code and the same generic reason. Do NOT leak which rule fired.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_origin(origin: str) -> str:
+    """Lower-case scheme + host, strip default ports. Returns ``origin`` unchanged
+    if it doesn't look like an ``http://`` / ``https://`` URL.
+    """
+    lower = origin.strip().lower()
+    if lower.startswith("http://"):
+        host_part = lower[len("http://") :]
+        if host_part.endswith(":80"):
+            host_part = host_part[: -len(":80")]
+        return "http://" + host_part
+    if lower.startswith("https://"):
+        host_part = lower[len("https://") :]
+        if host_part.endswith(":443"):
+            host_part = host_part[: -len(":443")]
+        return "https://" + host_part
+    return lower
+
+
+def _normalize_allowlist(allowlist: list[str]) -> set[str]:
+    return {_normalize_origin(o) for o in allowlist if o and o.strip()}
+
+
+def is_origin_allowed(origin: str | None, *, allowlist: list[str]) -> bool:
+    """Return True iff ``origin`` is a non-empty, non-wildcard value that
+    matches one entry in ``allowlist`` after normalization.
+
+    Anti-enumeration: this function returns a single boolean — it does
+    NOT reveal why a value was rejected (missing vs malformed vs not
+    on the list).
+    """
+    if not origin:
+        return False
+    norm = _normalize_origin(origin)
+    # Reject literal wildcard and obvious garbage.
+    if norm in {"*", "null"}:
+        return False
+    return norm in _normalize_allowlist(allowlist)
 
 
 @router.websocket("/ws")
@@ -26,6 +82,21 @@ async def websocket_endpoint(
     websocket: WebSocket,
     token: Annotated[str, Query(min_length=1)],
 ) -> None:
+    # 0. Origin allowlist (defensive — must run before any work that
+    # distinguishes "bad origin" from "bad token"). We read the header
+    # off the handshake scope; FastAPI exposes ``websocket.headers``
+    # which behaves like a regular ``Headers`` mapping.
+    settings = get_settings()
+    origin_header = websocket.headers.get("origin") or websocket.headers.get(
+        "Origin"
+    )
+    if not is_origin_allowed(origin_header, allowlist=settings.widget_allowed_origins_global):
+        # Anti-enumeration: don't include the offending origin or the
+        # allowlist in the log — both leak which rule fired.
+        logger.warning("widget ws: rejected handshake (origin not allowed)")
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     # 1. Authenticate
     try:
         payload = decode_widget_token(token)

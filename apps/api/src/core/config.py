@@ -5,6 +5,20 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from core.settings import Environment
 
+
+def _parse_csv(value: str | list[str] | None) -> list[str]:
+    """Parse a comma-separated env var into a clean list of strings.
+
+    Empty strings are dropped. Whitespace is stripped. This lets us accept
+    both ``WIDGET_ALLOWED_ORIGINS_GLOBAL="http://a.com, http://b.com"``
+    and a pre-parsed list (used by tests).
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [v.strip() for v in value if v and v.strip()]
+    return [v.strip() for v in value.split(",") if v.strip()]
+
 # Known dev/test secret patterns. The actual .env example uses the second
 # one. Production must reject any of these to prevent the
 # classic "deployed with .env default" footgun.
@@ -53,6 +67,23 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "INFO"
     service_name: str = "ai-customer-api"
+
+    # CORS / widget origin allowlist (M1: single global allowlist).
+    # Applied to both the HTTP CORS middleware and the WebSocket origin
+    # check in `widget/ws/router.py`. Production must override this via
+    # env var with the customer's actual embedding host(s).
+    #
+    # Declared as ``str`` so pydantic-settings doesn't try to JSON-decode
+    # the comma-separated env value; we split it into a list ourselves.
+    widget_allowed_origins_global_raw: str = Field(
+        default="http://localhost:5173,http://localhost:3000",
+        alias="WIDGET_ALLOWED_ORIGINS_GLOBAL",
+    )
+
+    @property
+    def widget_allowed_origins_global(self) -> list[str]:
+        """Split the raw env value into a clean list of origins."""
+        return _parse_csv(self.widget_allowed_origins_global_raw)
 
     @model_validator(mode="after")
     def _validate_jwt_secret(self) -> Self:

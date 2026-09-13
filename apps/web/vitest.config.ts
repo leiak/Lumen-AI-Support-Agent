@@ -16,6 +16,14 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
+    // The Vite config (and pure-config helpers like
+    // ``src/lib/dev-proxy.ts``) don't need jsdom and trip a
+    // TextEncoder invariant when esbuild's plugin pipeline boots
+    // inside jsdom. Files matching ``src/__tests__/proxy*.test.ts``
+    // run in node and skip the setupFile.
+    environmentMatchGlobs: [
+      ['src/__tests__/proxy*.test.ts', 'node'],
+    ],
     globals: false,
     css: false,
     include: ['src/**/*.{test,spec}.{ts,tsx}'],
