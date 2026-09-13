@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lumen widget host — E2E test page</title>
+  <style>
+    /* Keep the page minimal so the floating button doesn't overlap
+       anything else in the screenshot. The widget itself is rendered
+       into a <div id="lumen-widget-host"> by the SDK. */
+    body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 2rem; }
+    h1 { font-size: 1.25rem; margin: 0 0 0.5rem; }
+    p { color: #666; max-width: 60ch; }
+    code { background: #f3f4f6; padding: 2px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>Lumen AI — Widget E2E host</h1>
+  <p>
+    This is the static test page that embeds the
+    <code>@lumen/web-sdk</code> bundle for Flow B. Configured with the
+    deterministic demo tenant + web channel from
+    <code>tests/e2e/scripts/seed.py</code>.
+  </p>
+
+  <!-- SDK config: must be defined BEFORE the script tag runs. -->
+  <script>
+    window.LumenAICustomerConfig = {
+      apiBaseUrl: 'http://localhost:8000',
+      channelId: '01HZDEMO00000000000000003',
+      tenantId: '01HZDEMO00000000000000000',
+      title: '支持测试',
+      subtitle: '点我提问',
+      accentColor: '#0ea5e9',
+      position: 'bottom-right',
+    };
+  </script>
+
+  <!-- The SDK bundle is built by `pnpm --filter @lumen/web-sdk build`
+       and dropped into apps/web-sdk/dist/lumen-widget.js. The static
+       host (python -m http.server 8080 --directory tests/e2e/static)
+       serves both this HTML and the bundled JS from the same origin
+       so the iframe srcdoc + postMessage handshake stays in-tact. -->
+  <script src="lumen-widget.js"></script>
+</body>
+</html>

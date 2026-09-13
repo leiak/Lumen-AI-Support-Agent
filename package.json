@@ -1,0 +1,21 @@
+{
+  "name": "lumen-ai-support",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumen AI Support Agent - monorepo root (M1). Backend (FastAPI) + agent workspace SPA + embeddable widget SDK.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "e2e": "playwright test --config=tests/e2e/playwright.config.ts",
+    "e2e:install": "playwright install chromium",
+    "e2e:headed": "playwright test --config=tests/e2e/playwright.config.ts --headed",
+    "e2e:report": "playwright show-report --config=tests/e2e/playwright.config.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0",
+    "@types/node": "^20.11.0"
+  }
+}

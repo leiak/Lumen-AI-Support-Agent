@@ -25,3 +25,9 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Playwright E2E (tests/e2e/)
+test-results/
+playwright-report/
+tests/e2e/report/
+tests/e2e/artifacts/
