@@ -19,7 +19,7 @@
 | 6 | 知识库 + RAG (解析 → 切片 → embedding → 检索 → RAG 服务 + eval) | ✅ | 480 passed |
 | 7 | Agent Runtime (LangChain + LangGraph + escalate_to_human tool) | ✅ | 64 passed (52 unit + 12 integration) |
 | 8 | 坐席工作台 API (me / 发送消息 / queue / claim / suggest-reply) | ✅ | 168+ passed |
-| 9 | 前端 + Web Widget UI | ⏳ pending | — |
+| 9 | 前端 + Web Widget UI (agent SPA + 客户 widget SDK + iframe UI + CORS/origin + Playwright E2E + demo script) | ✅ | 116 backend + 98 frontend + 10 e2e |
 | 10 | 集成 + 可观测性 | ⏳ pending | — |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
