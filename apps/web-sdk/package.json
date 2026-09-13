@@ -1,0 +1,25 @@
+{
+  "name": "@lumen/web-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumen AI Support Agent - Embeddable Web Widget SDK (single-file IIFE bundle)",
+  "type": "module",
+  "main": "dist/lumen-widget.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "type-check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.24.0",
+    "jsdom": "^25.0.1",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.4"
+}
