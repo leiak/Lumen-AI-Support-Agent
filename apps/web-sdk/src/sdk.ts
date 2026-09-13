@@ -135,7 +135,15 @@ async function initInternal(
   }
 
   const host = mountHost(documentRef);
-  const frame = createWidgetFrame(documentRef, config, host);
+  const frame = createWidgetFrame(
+    documentRef,
+    {
+      config,
+      widgetToken: token?.token ?? '',
+      externalUserId,
+    },
+    host,
+  );
 
   let ws: WsClient | null = null;
   if (token && !overrides.skipWs) {

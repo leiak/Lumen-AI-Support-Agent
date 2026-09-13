@@ -5,14 +5,31 @@
  * inserted via textContent (never innerHTML) so the SDK is XSS-safe even
  * if a tenant passes an attacker-controlled config value.
  *
- * The chat content itself is a placeholder iframe (Stage 9.9 will fill it).
- * For Stage 9.8 the iframe shows a minimal greeting so the integration is
- * visually verifiable end-to-end.
+ * The chat UI itself lives in a separate IIFE bundle (`dist/iframe.js`)
+ * whose source is inlined into the iframe HTML at build time. The full
+ * HTML is then injected into this module via the `__IFRAME_HTML__`
+ * esbuild `define`. We set the iframe's `srcdoc` to that HTML so the
+ * customer site never has to serve our files — fully cross-origin safe.
+ *
+ * Wire protocol between this parent SDK and the iframe:
+ *   parent -> iframe: { type:'init', config:{...} }   (on iframe.onload)
+ *   iframe -> parent: { type:'ready' }                (signal post-mount)
+ *   iframe -> parent: { type:'close' }                (user clicked X)
  */
 
 import type { ResolvedConfig } from './config.js';
 
+declare const __IFRAME_HTML__: string;
+
 const STORAGE_KEY = 'lumen-widget:open';
+
+export interface WidgetFrameInit {
+  config: ResolvedConfig;
+  /** Pre-minted widget JWT — propagated to the iframe via postMessage. */
+  widgetToken: string;
+  /** Stable visitor id — propagated to the iframe via postMessage. */
+  externalUserId: string;
+}
 
 export interface WidgetFrame {
   /** Open the chat window. Idempotent. */
@@ -23,7 +40,7 @@ export interface WidgetFrame {
   isOpen(): boolean;
   /** Remove all DOM nodes and detach event listeners. */
   destroy(): void;
-  /** The iframe element (for tests + Stage 9.9 to mount content into). */
+  /** The iframe element (for tests). */
   iframe: HTMLIFrameElement;
   /** The floating button element. */
   button: HTMLButtonElement;
@@ -31,13 +48,12 @@ export interface WidgetFrame {
 
 export function createWidgetFrame(
   documentRef: Document,
-  config: ResolvedConfig,
+  init: WidgetFrameInit,
   host: HTMLElement,
 ): WidgetFrame {
+  const { config, widgetToken, externalUserId } = init;
   const accent = sanitizeAccent(config.accentColor);
 
-  // Inject the SDK stylesheet once per host document. Re-injecting is a
-  // no-op because we look up by id before appending.
   injectStyles(documentRef, accent, config.position);
 
   // Floating button.
@@ -49,9 +65,7 @@ export function createWidgetFrame(
   button.textContent = config.title.charAt(0) || '?';
   host.appendChild(button);
 
-  // Chat iframe shell. We use srcdoc for the placeholder so the customer
-  // site doesn't need to serve a separate file. Stage 9.9 will replace
-  // srcdoc with a real chat UI.
+  // Chat iframe shell.
   const wrapper = documentRef.createElement('div');
   wrapper.setAttribute('data-lumen-widget', 'wrapper');
   wrapper.setAttribute('data-state', 'closed');
@@ -74,8 +88,17 @@ export function createWidgetFrame(
   const iframe = documentRef.createElement('iframe');
   iframe.setAttribute('data-lumen-widget', 'iframe');
   iframe.title = config.title;
-  iframe.srcdoc = buildPlaceholderHtml(config.title, config.subtitle);
   iframe.setAttribute('allow', '');
+  // srcdoc is the inlined iframe HTML — set lazily on first open so the
+  // browser doesn't spin up the iframe document for visitors who never
+  // click the floating button. This is a meaningful saving on pages where
+  // the SDK loads but the user never engages.
+  let srcdocSet = false;
+  const ensureSrcdoc = (): void => {
+    if (srcdocSet) return;
+    iframe.srcdoc = __IFRAME_HTML__;
+    srcdocSet = true;
+  };
 
   wrapper.appendChild(header);
   wrapper.appendChild(iframe);
@@ -87,6 +110,9 @@ export function createWidgetFrame(
     open = next;
     wrapper.setAttribute('data-state', next ? 'open' : 'closed');
     button.setAttribute('aria-expanded', next ? 'true' : 'false');
+    if (next) {
+      ensureSrcdoc();
+    }
     try {
       window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0');
     } catch {
@@ -107,8 +133,49 @@ export function createWidgetFrame(
   const onCloseClick = (): void => {
     setOpenState(false);
   };
+  const onIframeLoad = (): void => {
+    // Hand the iframe its config via postMessage. We always send — even
+    // when widgetToken is empty — so the iframe can decide whether to
+    // mount a graceful "connection failed" state. postMessage with a
+    // missing contentWindow is a no-op in modern browsers.
+    try {
+      iframe.contentWindow?.postMessage(
+        {
+          type: 'init',
+          config: {
+            apiBaseUrl: config.apiBaseUrl,
+            channelId: config.channelId,
+            tenantId: config.tenantId,
+            widgetToken,
+            accentColor: config.accentColor,
+            title: config.title,
+            subtitle: config.subtitle,
+            externalUserId,
+            locale: config.locale,
+          },
+        },
+        '*',
+      );
+    } catch {
+      // best effort — if postMessage throws (e.g. detached contentWindow)
+      // the user can still close via the SDK's own close button.
+    }
+  };
+  const onWindowMessage = (event: MessageEvent): void => {
+    const data = event.data;
+    if (!data || typeof data !== 'object') return;
+    const msg = data as Record<string, unknown>;
+    // Only collapse if the message came from OUR iframe. Other iframes on
+    // the page might also be posting `close` events; we ignore them.
+    if (msg.type === 'close' && event.source === iframe.contentWindow) {
+      setOpenState(false);
+    }
+  };
+
   button.addEventListener('click', onButtonClick);
   closeBtn.addEventListener('click', onCloseClick);
+  iframe.addEventListener('load', onIframeLoad);
+  window.addEventListener('message', onWindowMessage);
 
   return {
     open: (): void => setOpenState(true),
@@ -119,6 +186,8 @@ export function createWidgetFrame(
     destroy: (): void => {
       button.removeEventListener('click', onButtonClick);
       closeBtn.removeEventListener('click', onCloseClick);
+      iframe.removeEventListener('load', onIframeLoad);
+      window.removeEventListener('message', onWindowMessage);
       button.remove();
       wrapper.remove();
     },
@@ -156,9 +225,6 @@ function injectStyles(
 
   const style = documentRef.createElement('style');
   style.id = STYLE_ID;
-  // Use a template string for readability — no user input is interpolated
-  // except `accent` (already sanitized to a hex literal) and `position`
-  // (whitelisted to two literal values).
   style.textContent = `
 [data-lumen-widget="button"] {
   position: fixed;
@@ -204,16 +270,19 @@ function injectStyles(
   background: ${accent};
   color: #fff;
   flex-shrink: 0;
+  position: relative;
 }
 [data-lumen-widget="header"] > span:first-child {
   font-size: 15px;
   font-weight: 600;
   line-height: 1.2;
+  padding-right: 28px;
 }
 [data-lumen-widget="header"] > span:nth-child(2) {
   font-size: 12px;
   opacity: 0.85;
   margin-top: 2px;
+  padding-right: 28px;
 }
 [data-lumen-widget="close"] {
   position: absolute;
@@ -243,39 +312,3 @@ function injectStyles(
 `;
   documentRef.head.appendChild(style);
 }
-
-function buildPlaceholderHtml(title: string, subtitle: string): string {
-  // Static placeholder — title/subtitle are injected via textContent in
-  // the host page, NOT via innerHTML here. The iframe is a separate
-  // document context so even this string interpolation is sanitized.
-  const safeTitle = escapeHtml(title);
-  const safeSubtitle = escapeHtml(subtitle);
-  return `<!doctype html>
-<html><head><meta charset="utf-8"><title>${safeTitle}</title>
-<style>
-  html, body { margin: 0; height: 100%; }
-  body {
-    display: flex; align-items: center; justify-content: center;
-    flex-direction: column; gap: 8px;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    color: #444; background: #fafafa; padding: 24px; box-sizing: border-box;
-    text-align: center;
-  }
-  h1 { font-size: 16px; margin: 0; color: #111; }
-  p { font-size: 13px; margin: 0; color: #666; }
-</style></head>
-<body>
-  <h1>${safeTitle}</h1>
-  <p>${safeSubtitle}</p>
-  <p style="margin-top:12px;font-size:11px;color:#999;">Stage 9.9 will mount the chat UI here.</p>
-</body></html>`;
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
