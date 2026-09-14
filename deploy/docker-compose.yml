@@ -32,6 +32,41 @@ services:
     volumes:
       - qdrantdata:/qdrant/storage
 
+  api:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SERVICE_NAME: ai-customer-api
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@postgres:5432/aicustomer
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
+      WIDGET_ALLOWED_ORIGINS_GLOBAL: ${WIDGET_ALLOWED_ORIGINS_GLOBAL:-http://localhost:8080}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../apps/web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
 volumes:
   pgdata:
   qdrantdata:

@@ -3,6 +3,7 @@
 Translates our provider-agnostic ChatRequest/ChatResponse to Anthropic's
 native /v1/messages API format. Maps HTTP errors to our exception hierarchy.
 """
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -133,7 +134,87 @@ class AnthropicProvider(BaseProvider):
             raw=data,
         )
 
-    async def stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        # M1 defer streaming to M2 — implement when needed
-        raise NotImplementedError("Anthropic streaming pending M2")
-        yield ""  # unreachable; needed for AsyncIterator typing
+    async def stream(self, request: ChatRequest) -> AsyncIterator["ChatResponse | str"]:
+        """Stream /v1/messages in SSE mode. Yields text deltas, then a final
+        ``ChatResponse`` with accumulated text + usage + finish reason.
+
+        Tool-use turns are not streamed (M1 routes those through :meth:`chat`).
+        """
+        system, messages = _convert_messages(request.messages)
+        body: dict[str, Any] = {
+            "model": request.model,
+            "messages": messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens or 1024,
+            "stream": True,
+        }
+        if system is not None:
+            body["system"] = system
+        if request.stop:
+            body["stop_sequences"] = request.stop
+        if request.tools:
+            body["tools"] = request.tools
+        if request.tool_choice:
+            body["tool_choice"] = request.tool_choice
+
+        text_parts: list[str] = []
+        model = request.model
+        input_tokens = 0
+        output_tokens = 0
+        finish_reason = ""
+
+        try:
+            stream_ctx = self._client.stream("POST", ANTHROPIC_API_URL, json=body)
+            async with stream_ctx as resp:
+                if resp.status_code == 429:
+                    raise RateLimited("Anthropic rate limited")
+                if 400 <= resp.status_code < 500:
+                    err_text = (await resp.aread()).decode("utf-8", "replace")
+                    raise InvalidRequest(f"Anthropic 4xx: {err_text[:200]}")
+                if resp.status_code >= 500:
+                    raise ProviderUnavailable(f"Anthropic 5xx: {resp.status_code}")
+
+                async for line in resp.aiter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:"):].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event.get("type")
+                    if etype == "message_start":
+                        message = event.get("message", {})
+                        model = message.get("model", model)
+                        input_tokens = message.get("usage", {}).get("input_tokens", 0)
+                    elif etype == "content_block_delta":
+                        delta = event.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                text_parts.append(text)
+                                yield text
+                    elif etype == "message_delta":
+                        delta = event.get("delta", {})
+                        stop_reason = delta.get("stop_reason")
+                        if stop_reason == "end_turn":
+                            stop_reason = "stop"
+                        finish_reason = stop_reason or finish_reason
+                        usage = event.get("usage", {})
+                        output_tokens = usage.get("output_tokens", output_tokens)
+                        input_tokens = usage.get("input_tokens", input_tokens)
+                    elif etype == "message_stop":
+                        break
+        except httpx.HTTPError as e:
+            raise ProviderUnavailable(f"Anthropic network error: {e}") from e
+
+        yield ChatResponse(
+            content="".join(text_parts),
+            model=model,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            finish_reason=finish_reason or "stop",
+            tool_calls=None,
+        )

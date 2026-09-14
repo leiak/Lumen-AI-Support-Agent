@@ -23,12 +23,15 @@ class BaseProvider(ABC):
         """Send a non-streaming chat request. Returns the full response."""
 
     @abstractmethod
-    async def stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        """Send a streaming chat request. Yields content chunks as they arrive.
+    async def stream(self, request: ChatRequest) -> AsyncIterator["ChatResponse | str"]:
+        """Send a streaming chat request.
 
-        Token usage and finish_reason will be reported in a final
-        sentinel chunk (e.g. a ChatResponse object cast to str) — see
-        the LLMClient for the exact protocol.
+        Yields one ``str`` per text-content delta as it arrives, then a final
+        :class:`llm_client.types.ChatResponse` carrying the accumulated text,
+        token usage and finish reason. On failure raises one of the typed
+        exceptions from :mod:`llm_client.exceptions` (no partial-token retry —
+        a stream cannot be resumed). Tool-use turns are not supported here;
+        callers must use :meth:`chat` instead.
         """
         # Use 'yield' to make this an async generator; subclass overrides
         if False:  # pragma: no cover

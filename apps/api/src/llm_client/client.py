@@ -2,6 +2,7 @@
 import asyncio
 import random
 import uuid
+from collections.abc import AsyncIterator
 
 from llm_client.exceptions import (
     InvalidRequest,
@@ -84,3 +85,28 @@ class LLMClient:
         # Exhausted retries — raise the last exception
         assert last_exc is not None
         raise last_exc
+
+
+    async def stream_chat(
+        self, request: ChatRequest
+    ) -> AsyncIterator["ChatResponse | str"]:
+        """Stream a chat turn. Yields text deltas, then a final ChatResponse.
+
+        Mirrors :meth:`chat`'s usage accounting: on the final ``ChatResponse``
+        a usage row is enqueued (flushed via :meth:`flush_usage`). Streaming
+        cannot be resumed after a partial response, so errors surface directly
+        without retry — callers that need reliability for non-streaming turns
+        should keep using :meth:`chat`.
+        """
+        request_id = uuid.uuid4().hex
+        async for item in self.default_provider.stream(request):
+            if isinstance(item, ChatResponse):
+                self.usage.enqueue(
+                    tenant_id=self.tenant_id,
+                    provider=self.default_provider.name,
+                    model=item.model,
+                    prompt_tokens=item.prompt_tokens,
+                    completion_tokens=item.completion_tokens,
+                    request_id=request_id,
+                )
+            yield item

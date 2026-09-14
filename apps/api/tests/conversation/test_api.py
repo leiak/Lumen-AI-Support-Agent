@@ -145,11 +145,13 @@ async def test_list_conversations_uses_tenant_from_jwt(
         *,
         tenant_id: str,
         status: ConversationStatus | None,
+        search: str | None = None,
         limit: int,
         offset: int,
     ) -> list[Conversation]:
         captured["tenant_id"] = tenant_id
         captured["status"] = status
+        captured["search"] = search
         captured["limit"] = limit
         captured["offset"] = offset
         return [_conv(), _conv(id="c2")]
@@ -187,6 +189,7 @@ async def test_list_conversations_filters_by_status(
         *,
         tenant_id: str,
         status: ConversationStatus | None,
+        search: str | None = None,
         limit: int,
         offset: int,
     ) -> list[Conversation]:
@@ -221,6 +224,7 @@ async def test_list_conversations_default_pagination(
         *,
         tenant_id: str,
         status: ConversationStatus | None,
+        search: str | None = None,
         limit: int,
         offset: int,
     ) -> list[Conversation]:
@@ -279,10 +283,12 @@ async def test_inbox_uses_sub_claim_as_agent_id(
         tenant_id: str,
         agent_id: str,
         status: ConversationStatus | None,
+        search: str | None = None,
     ) -> list[Conversation]:
         captured["tenant_id"] = tenant_id
         captured["agent_id"] = agent_id
         captured["status"] = status
+        captured["search"] = search
         return [_conv(assigned_agent_id="u_agent_1")]
 
     monkeypatch.setattr(
@@ -1134,3 +1140,69 @@ async def test_return_to_ai_endpoint_returns_404_on_cross_tenant(
 
     assert resp.status_code == 404
     assert resp.json()["detail"] == "conversation not found"
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_passes_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """?q= must be forwarded to the service so inbox search works."""
+    _stub_admin(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_list_for_tenant(
+        self: Any,
+        *,
+        tenant_id: str,
+        status: ConversationStatus | None,
+        search: str | None = None,
+        limit: int,
+        offset: int,
+    ) -> list[Conversation]:
+        captured["search"] = search
+        return []
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "list_for_tenant", fake_list_for_tenant
+    )
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(
+            "/api/v1/conversations?q=customer-42&limit=10"
+        )
+    assert resp.status_code == 200, resp.text
+    assert captured["search"] == "customer-42"
+
+
+@pytest.mark.asyncio
+async def test_inbox_passes_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inbox ?q= must reach the service, not just the admin list."""
+    _stub_agent(monkeypatch)
+    captured: dict[str, Any] = {}
+
+    async def fake_list_for_agent(
+        self: Any,
+        *,
+        tenant_id: str,
+        agent_id: str,
+        status: ConversationStatus | None,
+        search: str | None = None,
+    ) -> list[Conversation]:
+        captured["search"] = search
+        return []
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "list_for_agent", fake_list_for_agent
+    )
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get("/api/v1/conversations/inbox?q=01ARZ3")
+    assert resp.status_code == 200, resp.text
+    assert captured["search"] == "01ARZ3"
+

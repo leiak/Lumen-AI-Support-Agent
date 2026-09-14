@@ -177,3 +177,80 @@ describe('bootIframe', () => {
     handle.destroy();
   });
 });
+
+function makeBooted(): { handle: ReturnType<typeof bootIframe>; inbound: (obj: Record<string, unknown>) => void } {
+  const handle = bootIframe({
+    documentRef: document,
+    windowRef: window,
+    webSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+  });
+  dispatchInit(window, {
+    apiBaseUrl: 'https://api.example.com',
+    channelId: 'chan_1',
+    tenantId: 'tenant_a',
+    widgetToken: 'jwt.token.here',
+    title: 'Need help?',
+    subtitle: 'Subtitle',
+    externalUserId: 'visitor-1',
+  });
+  const ws = FakeWebSocket.instances[0]!;
+  ws.fakeOpen();
+  const inbound = (obj: Record<string, unknown>): void => {
+    ws.onmessage?.({ data: JSON.stringify(obj) } as MessageEvent);
+  };
+  return { handle, inbound };
+}
+
+describe('bootIframe streaming', () => {
+  it('renders streamed AI deltas into one bubble and finalises on complete', () => {
+    const { handle, inbound } = makeBooted();
+
+    inbound({ type: 'message.delta', conversation_id: 'c1', text: 'Let me ' });
+    inbound({ type: 'message.delta', conversation_id: 'c1', text: 'check' });
+
+    let bubbles = document.querySelectorAll(
+      '[data-lumen-iframe="message"][data-role="ai"]',
+    );
+    expect(bubbles).toHaveLength(1);
+    expect(bubbles[0]!.textContent).toBe('Let me check');
+
+    inbound({
+      type: 'message.complete',
+      conversation_id: 'c1',
+      message_id: 'm_real',
+      role: 'ai',
+      content: 'Let me check',
+    });
+
+    bubbles = document.querySelectorAll(
+      '[data-lumen-iframe="message"][data-role="ai"]',
+    );
+    expect(bubbles).toHaveLength(1);
+    expect(bubbles[0]!.getAttribute('data-id')).toBe('m_real');
+    expect(bubbles[0]!.getAttribute('data-status')).toBe('sent');
+    expect(bubbles[0]!.textContent).toBe('Let me check');
+
+    handle.destroy();
+  });
+
+  it('renders message.complete normally when no delta preceded it', () => {
+    const { handle, inbound } = makeBooted();
+
+    inbound({
+      type: 'message.complete',
+      conversation_id: 'c1',
+      message_id: 'm2',
+      role: 'ai',
+      content: 'Hi there',
+    });
+
+    const bubble = document.querySelector(
+      '[data-lumen-iframe="message"][data-role="ai"]',
+    );
+    expect(bubble).toBeTruthy();
+    expect(bubble!.getAttribute('data-id')).toBe('m2');
+    expect(bubble!.textContent).toBe('Hi there');
+
+    handle.destroy();
+  });
+});

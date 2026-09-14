@@ -58,6 +58,11 @@ export function bootIframe(options: BootIframeOptions): IframeHandle {
   let ws: WsClient | null = null;
   let header: ReturnType<typeof createHeader> | null = null;
   let chat: ReturnType<typeof createChat> | null = null;
+  // In-flight AI streamed bubbles keyed by conversation_id. The bubble stays
+  // provisional (no real row id yet) and is finalised by `message.complete`,
+  // which replaces the temp id with the persisted message_id for dedupe
+  // against a later REST fetch.
+  const streamingBubbles = new Map<string, { tempId: string; text: string }>();
 
   function handleSend(text: string): void {
     if (!chat) return;
@@ -131,13 +136,63 @@ export function bootIframe(options: BootIframeOptions): IframeHandle {
     if (pending) pending.setAttribute('data-status', 'sent');
   }
 
+  function handleStreamDelta(frame: Record<string, unknown>): void {
+    if (!chat) return;
+    const conv = typeof frame.conversation_id === 'string' ? frame.conversation_id : '';
+    const text = typeof frame.text === 'string' ? frame.text : '';
+    if (!conv || !text) return;
+    const existing = streamingBubbles.get(conv);
+    if (existing) {
+      existing.text += text;
+      chat.updateMessage(existing.tempId, { text: existing.text });
+      return;
+    }
+    const tempId = `stream-${conv}`;
+    streamingBubbles.set(conv, { tempId, text });
+    chat.appendMessage({
+      id: tempId,
+      role: 'ai',
+      text,
+      createdAt: Date.now(),
+      status: 'pending',
+    });
+  }
+
+  /**
+   * Finalise a streamed bubble when message.complete arrives. Returns true if
+   * an in-flight bubble was upgraded (temp id -> real row id, status sent);
+   * false if there was nothing to finalise (the caller then renders the
+   * complete frame normally).
+   */
+  function finalizeStream(frame: Record<string, unknown>): boolean {
+    if (!chat) return false;
+    const conv = typeof frame.conversation_id === 'string' ? frame.conversation_id : '';
+    const entry = streamingBubbles.get(conv);
+    if (!entry) return false;
+    const completeText = typeof frame.content === 'string' ? frame.content : entry.text;
+    const messageId = typeof frame.message_id === 'string' ? frame.message_id : entry.tempId;
+    chat.updateMessage(entry.tempId, {
+      id: messageId,
+      text: completeText,
+      status: 'sent',
+    });
+    streamingBubbles.delete(conv);
+    return true;
+  }
+
   function handleFrame(payload: unknown): void {
     if (!payload || typeof payload !== 'object') return;
     const frame = payload as Record<string, unknown>;
     const type = frame.type;
     if (type === 'ack') {
       confirmLastPending();
-    } else if (type === 'message.complete' || type === 'message.created') {
+    } else if (type === 'message.delta') {
+      handleStreamDelta(frame);
+    } else if (type === 'message.complete') {
+      if (!finalizeStream(frame)) {
+        renderServerMessage(frame);
+      }
+    } else if (type === 'message.created') {
       renderServerMessage(frame);
     }
     // `pong` and `error` are swallowed — the WS client tracks reconnect

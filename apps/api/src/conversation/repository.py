@@ -20,13 +20,23 @@ Mirrors the ``session``-parameter pattern in
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from conversation.enums import ConversationStatus
 from conversation.models import Conversation, Message
 from core.database import get_session
+
+
+def _search_filter(value: str) -> Any:
+    """Build a case-insensitive ILIKE filter over id / customer_external_id."""
+    needle = value.lower()
+    return or_(
+        func.lower(Conversation.id).contains(needle),
+        func.lower(Conversation.customer_external_id).contains(needle),
+    )
 
 
 class ConversationRepository:
@@ -73,14 +83,17 @@ class ConversationRepository:
         *,
         tenant_id: str,
         status: ConversationStatus | None = None,
+        search: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[Conversation]:
-        """List Conversations for a tenant, optionally filtered by status."""
+        """List Conversations for a tenant, optionally filtered by status / search."""
         async with get_session() as session:
             stmt = select(Conversation).where(Conversation.tenant_id == tenant_id)
             if status is not None:
                 stmt = stmt.where(Conversation.status == status)
+            if search:
+                stmt = stmt.where(_search_filter(search))
             stmt = (
                 stmt.order_by(Conversation.last_activity_at.desc())
                 .limit(limit)
@@ -94,16 +107,19 @@ class ConversationRepository:
         *,
         assigned_agent_id: str,
         status: ConversationStatus | None = None,
+        search: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[Conversation]:
-        """List Conversations assigned to a specific agent, optionally filtered by status."""
+        """List Conversations assigned to a specific agent, optionally filtered."""
         async with get_session() as session:
             stmt = select(Conversation).where(
                 Conversation.assigned_agent_id == assigned_agent_id
             )
             if status is not None:
                 stmt = stmt.where(Conversation.status == status)
+            if search:
+                stmt = stmt.where(_search_filter(search))
             stmt = (
                 stmt.order_by(Conversation.last_activity_at.desc())
                 .limit(limit)

@@ -65,9 +65,9 @@ export interface ConversationListResponse {
 
 /**
  * GET /api/v1/conversations/inbox — list conversations assigned to the
- * calling agent (scoped by JWT). The endpoint accepts a `status` query
- * parameter; `search` is applied client-side against `id` and
- * `customer_external_id`.
+ * calling agent (scoped by JWT). The endpoint accepts `status` and `q`
+ * (case-insensitive match against id / customer_external_id) query params,
+ * so the search box is now server-side.
  *
  * We treat the auth surface as agent-only and let 401s/403s fall through
  * to the React Query error path so the page can render its error state.
@@ -78,6 +78,9 @@ export async function fetchConversations(
   const params: Record<string, string> = {};
   if (filters.status) {
     params.status = filters.status;
+  }
+  if (filters.search.trim()) {
+    params.q = filters.search.trim();
   }
   const { data } = await apiClient.get('/api/v1/conversations/inbox', { params });
   const parsed = ConversationListSchema.parse(data);

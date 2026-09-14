@@ -1,13 +1,17 @@
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import Response
 
 from core.config import get_settings
 from core.health import aggregate_health
 from core.logging import configure_logging, get_logger
+from core.metrics import prometheus_metrics_middleware, render_metrics
 from core.qdrant import close_qdrant_client
 from core.redis import close_redis, get_redis
 from knowledge.startup import ensure_qdrant_collection
@@ -65,12 +69,25 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def metrics_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    return await prometheus_metrics_middleware(request, call_next)
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     body, all_ok = await aggregate_health()
     # 200 when all components are healthy; 503 when degraded so that load
     # balancers / k8s probes / alerting can detect the failure.
     return JSONResponse(status_code=200 if all_ok else 503, content=body)
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    return render_metrics()
 
 
 from agent.api import router as agents_router  # noqa: E402

@@ -21,7 +21,7 @@ bridges the existing DB layer to the LangGraph state schema.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,7 +43,7 @@ from agent.graph.tools import (
     bind_escalation_context,
     reset_escalation_context,
 )
-from agent.llm_factory import _default_llm_client_factory
+from agent.llm_factory import _default_llm_client_factory, _resolve_default_model
 from conversation.enums import MessageRole
 from conversation.models import Message
 from conversation.service import ConversationService
@@ -117,7 +117,7 @@ class SimpleResponder:
         conv_service: ConversationService | None = None,
         llm_client_factory: LLMClientFactory | None = None,
         rag_service: RAGService | None = None,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
     ) -> None:
         self._conv_service = conv_service or ConversationService()
         self._llm_client_factory: LLMClientFactory = (
@@ -129,7 +129,7 @@ class SimpleResponder:
         # default to a real ``RAGService()`` instance here so production
         # code never has to pass one explicitly.
         self._rag_service = rag_service or RAGService()
-        self._model = model
+        self._model = model or _resolve_default_model()
         # Compiled LangGraph agent graph. Built lazily on first
         # ``respond()`` and reused thereafter. ``Any`` because
         # ``langgraph`` is not fully typed; the public surface we
@@ -152,12 +152,20 @@ class SimpleResponder:
         *,
         tenant_id: str,
         conversation_id: str,
+        on_delta: Callable[[str], Awaitable[object]] | None = None,
     ) -> AgentResponse | None:
         """Generate an AI reply for the given conversation.
 
         Returns ``None`` if the conversation is not in AI-handling state
         (e.g., it was transferred to a human agent, or closed). Caller
         should NOT persist anything in that case.
+
+        ``on_delta`` — optional async callback invoked with each streamed
+        text chunk as the LLM runs, so the caller can relay ``message.delta``
+        frames over WebSocket. It is threaded through the graph state and
+        consulted by the LLM node per turn (the memoized graph is reused).
+        On a streaming callback failure the chunk is dropped and the turn
+        continues; a broken WebSocket never takes down the AI reply.
 
         On LLM failure, the graph's ``llm_node`` swallows the exception
         and writes ``FALLBACK_MESSAGE`` into ``state["final_text"]``, so
@@ -219,6 +227,7 @@ class SimpleResponder:
                         "final_text": None,
                         "escalated": False,
                         "escalation_message": None,
+                        "on_delta": on_delta,
                     }
                 )
             except Exception as exc:

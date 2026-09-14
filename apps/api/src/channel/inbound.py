@@ -11,14 +11,14 @@ provider. The channel provider's payload is the source of truth; retrying
 on our DB error would cause duplicate customer messages on eventual
 recovery.
 
-M1 limitation — no token streaming
-----------------------------------
-We emit a single ``message.complete`` frame *after* the AI message is
-persisted; there are no ``message.delta`` frames. The M1 LLM client does not
-implement streaming (``AnthropicProvider.stream`` raises NotImplementedError),
-so there is nothing incremental to forward. The event envelope is shaped so
-Stage 7 can add ``message.delta`` frames ahead of the existing
-``message.complete`` without changing the completion contract.
+Streaming (``message.delta`` frames)
+-------------------------------------
+During an AI auto-response the pipeline relays each streamed text chunk as a
+``message.delta`` frame ahead of the (unchanged) ``message.complete``. The
+final ``message.complete`` still carries the persisted row id so the frontend
+can finalise / dedupe the in-flight bubble against a later REST fetch. Deltas
+carry only ``conversation_id`` + ``text``; the bubble is keyed by
+``conversation_id`` because the row id does not exist yet while streaming.
 """
 from __future__ import annotations
 
@@ -35,6 +35,40 @@ from conversation.service import ConversationService
 from widget.ws.manager import manager as _wsm
 
 logger = logging.getLogger(__name__)
+
+
+async def _broadcast_ai_delta(
+    *,
+    channel_id: str,
+    conversation_id: str,
+    text: str,
+) -> None:
+    """Best-effort WS broadcast of a ``message.delta`` text chunk.
+
+    Deliberately lightweight: the bubble is keyed by ``conversation_id`` (the
+    AI row does not exist yet mid-stream), and the final
+    ``message.complete`` — which *does* carry the real ``message_id`` — is
+    what the frontend uses to finalise and dedupe. Wrapped in try/except so a
+    dead socket never breaks the inbound path.
+    """
+    try:
+        await _wsm.broadcast_to_channel(
+            channel_id=channel_id,
+            payload={
+                "type": "message.delta",
+                "conversation_id": conversation_id,
+                "text": text,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "channel inbound: WS delta broadcast failed",
+            extra={
+                "channel_id": channel_id,
+                "conversation_id": conversation_id,
+            },
+            exc_info=True,
+        )
 
 
 async def _broadcast_ai_complete(
@@ -118,9 +152,21 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
         # volume; Stage 7+ should move this to a background worker.
         if conversation.ai_handling and conversation.status == ConversationStatus.OPEN:
             responder = SimpleResponder()
+            channel_id = envelope.channel_id
+
+            async def _stream_delta(text: str) -> None:
+                # Relay each streamed chunk as a message.delta frame. The
+                # callback signature matches the graph's ``on_delta`` contract.
+                await _broadcast_ai_delta(
+                    channel_id=channel_id,
+                    conversation_id=conversation.id,
+                    text=text,
+                )
+
             ai_response = await responder.respond(
                 tenant_id=envelope.tenant_id,
                 conversation_id=conversation.id,
+                on_delta=_stream_delta,
             )
             if ai_response is not None:
                 ai_message = await conv_service.record_message(

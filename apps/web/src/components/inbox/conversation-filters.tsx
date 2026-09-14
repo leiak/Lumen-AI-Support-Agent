@@ -22,11 +22,11 @@ const STATUS_OPTIONS: StatusOption[] = [
 /**
  * Left-pane filter sidebar for the inbox page.
  *
- * For M1 the only server-side filter is `status`; the search box is a
- * client-side substring match against `id` and `customer_external_id`
- * applied in the page component. The channel dropdown is intentionally
- * deferred — the inbox endpoint does not currently expose channel
- * metadata, and a placeholder list would mislead users.
+ * Filters are server-side: `status` and `q` (case-insensitive match
+ * against id / customer_external_id) are forwarded to the inbox endpoint.
+ * The channel dropdown is intentionally deferred — the inbox endpoint does
+ * not currently expose channel metadata, and a placeholder list would
+ * mislead users.
  */
 export function ConversationFilters({
   filters,
@@ -86,7 +86,7 @@ export function ConversationFilters({
           aria-label="按会话 ID 或客户 ID 搜索"
           data-testid="conversation-search"
         />
-        <p className="text-xs text-muted-foreground">客户端过滤,仅匹配当前页结果。</p>
+        <p className="text-xs text-muted-foreground">服务端搜索,匹配会话 ID / 客户 ID。</p>
       </section>
     </aside>
   );

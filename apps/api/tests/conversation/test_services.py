@@ -227,12 +227,17 @@ async def test_list_for_tenant_passes_through() -> None:
     svc, _, _ = _service_with_repos(conversation_repo=conv_repo)
 
     result = await svc.list_for_tenant(
-        tenant_id="t1", status=ConversationStatus.PENDING, limit=10, offset=5
+        tenant_id="t1",
+        status=ConversationStatus.PENDING,
+        search="customer-42",
+        limit=10,
+        offset=5,
     )
     assert result == expected
     conv_repo.list_by_tenant.assert_awaited_once_with(
         tenant_id="t1",
         status=ConversationStatus.PENDING,
+        search="customer-42",
         limit=10,
         offset=5,
     )
@@ -262,6 +267,7 @@ async def test_list_for_agent_filters_cross_tenant() -> None:
     conv_repo.list_by_assigned_agent.assert_awaited_once_with(
         assigned_agent_id="u_agent",
         status=ConversationStatus.PENDING,
+        search=None,
     )
 
 

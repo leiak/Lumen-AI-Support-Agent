@@ -142,6 +142,7 @@ class ConversationService:
         *,
         tenant_id: str,
         status: ConversationStatus | None = None,
+        search: str | None = None,
         limit: int = DEFAULT_PAGE_SIZE,
         offset: int = 0,
     ) -> list[Conversation]:
@@ -149,6 +150,7 @@ class ConversationService:
         return await self._repo.list_by_tenant(
             tenant_id=tenant_id,
             status=status,
+            search=search,
             limit=limit,
             offset=offset,
         )
@@ -159,6 +161,7 @@ class ConversationService:
         tenant_id: str,
         agent_id: str,
         status: ConversationStatus | None = None,
+        search: str | None = None,
     ) -> list[Conversation]:
         """List conversations assigned to ``agent_id`` within ``tenant_id``.
 
@@ -170,6 +173,7 @@ class ConversationService:
         rows = await self._repo.list_by_assigned_agent(
             assigned_agent_id=agent_id,
             status=status,
+            search=search,
         )
         return [r for r in rows if r.tenant_id == tenant_id]
 

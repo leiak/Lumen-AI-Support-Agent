@@ -837,7 +837,7 @@ class _StructlogCapture:
         self.text: str = ""
         self._redirect_cm: Any = None
 
-    def __enter__(self) -> "_StructlogCapture":
+    def __enter__(self) -> _StructlogCapture:
         self._redirect_cm = contextlib.redirect_stdout(self.buffer)
         self._redirect_cm.__enter__()
         return self
@@ -1060,3 +1060,104 @@ async def test_graph_emits_timing_metrics_with_escalation() -> None:
     ]
     assert len(completed_lines) == 1
     assert "escalated" in completed_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_llm_node_streams_deltas_when_on_delta_provided() -> None:
+    """When state carries an ``on_delta`` callback, the node must use
+    ``stream_chat`` and relay each text chunk; the final response still
+    populates ``final_text`` (and its ``tool_calls`` feed escalation).
+    """
+    from llm_client.types import ChatResponse
+
+    final = ChatResponse(
+        content="Hello there",
+        model="mini",
+        prompt_tokens=4,
+        completion_tokens=5,
+        finish_reason="stop",
+    )
+
+    async def _stream(_request):
+        yield "Hel"
+        yield "lo"
+        yield final
+
+    client = MagicMock()
+    client.stream_chat = _stream
+
+    deltas_received: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        deltas_received.append(text)
+
+    node = make_llm_node(llm_client_factory=_make_factory(client), model=DEFAULT_MODEL)
+    state = _state(messages=[HumanMessage(content="hi")])
+    state["on_delta"] = on_delta  # type: ignore[typeddict-unknown-key]
+
+    result = await node(state)
+
+    assert result == {"final_text": "Hello there"}
+    assert deltas_received == ["Hel", "lo"]
+    # stream_chat was used (chat must NOT be invoked on the streaming path)
+    assert client.chat.called is False
+
+
+@pytest.mark.asyncio
+async def test_llm_node_streams_tool_escalation_from_final_response() -> None:
+    """A streamed turn that ends in a tool call must still escalate — the
+    reassembled ``tool_calls`` on the final ``ChatResponse`` drive dispatch.
+    """
+    from llm_client.types import ChatResponse
+
+    final = ChatResponse(
+        content="",
+        model="mini",
+        prompt_tokens=4,
+        completion_tokens=5,
+        finish_reason="tool_calls",
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "escalate_to_human",
+                "input": {"reason": "streamed"},
+            }
+        ],
+    )
+
+    async def _stream(_request):
+        yield final
+
+    client = MagicMock()
+    client.stream_chat = _stream
+
+    async def on_delta(_text: str) -> None:
+        pass
+
+    from agent.graph.tools import (
+        bind_escalation_context,
+        reset_escalation_context,
+    )
+
+    tool_obj = MagicMock()
+    tool_obj.name = "escalate_to_human"
+    tool_obj.ainvoke = AsyncMock(return_value="streamed escalation")
+
+    node = make_llm_node(
+        llm_client_factory=_make_factory(client),
+        model=DEFAULT_MODEL,
+        tools=[tool_obj],
+    )
+    state = _state(messages=[HumanMessage(content="transfer me")])
+    state["on_delta"] = on_delta  # type: ignore[typeddict-unknown-key]
+
+    token = bind_escalation_context(tenant_id="t1", conversation_id="c1")
+    try:
+        result = await node(state)
+    finally:
+        reset_escalation_context(token)
+
+    assert result["escalated"] is True
+    assert result["escalation_message"] == "streamed escalation"
+    tool_obj.ainvoke.assert_awaited_once()

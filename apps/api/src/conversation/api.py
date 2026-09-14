@@ -16,8 +16,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from auth.dependencies import require_admin, require_agent_or_admin
 from agent.schemas import AgentMessageCreate
+from auth.dependencies import require_admin, require_agent_or_admin
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
 from conversation.service import ConversationService
@@ -146,6 +146,7 @@ def _service() -> ConversationService:
 async def list_conversations(
     claims: Annotated[dict[str, Any], Depends(require_admin)],
     status_filter: Annotated[ConversationStatus | None, Query(alias="status")] = None,
+    q: Annotated[str | None, Query(max_length=100)] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> ConversationListOut:
@@ -153,6 +154,7 @@ async def list_conversations(
     items = await _service().list_for_tenant(
         tenant_id=claims["tenant_id"],
         status=status_filter,
+        search=q,
         limit=limit,
         offset=offset,
     )
@@ -166,6 +168,7 @@ async def list_conversations(
 async def list_inbox(
     claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
     status_filter: Annotated[ConversationStatus | None, Query(alias="status")] = None,
+    q: Annotated[str | None, Query(max_length=100)] = None,
 ) -> ConversationListOut:
     """List conversations assigned to the calling agent.
 
@@ -176,6 +179,7 @@ async def list_inbox(
         tenant_id=claims["tenant_id"],
         agent_id=claims["sub"],
         status=status_filter,
+        search=q,
     )
     return ConversationListOut(items=[_conv_out(c) for c in items])
 

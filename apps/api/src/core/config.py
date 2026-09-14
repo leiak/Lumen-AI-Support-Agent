@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     ollama_base_url: str | None = Field(default=None, alias="OLLAMA_BASE_URL")
     default_llm_model: str = Field(default="claude-3-5-sonnet-20241022", alias="DEFAULT_LLM_MODEL")
 
+    # MiniMax (OpenAI-compatible). When MINIMAX_API_KEY is set the default LLM
+    # factory prefers MiniMax over Anthropic/OpenAI.
+    minimax_api_key: str | None = Field(default=None, alias="MINIMAX_API_KEY")
+    minimax_base_url: str | None = Field(default=None, alias="MINIMAX_BASE_URL")
+    minimax_model: str | None = Field(default=None, alias="MINIMAX_MODEL")
+
     # Observability
     log_level: str = "INFO"
     service_name: str = "ai-customer-api"

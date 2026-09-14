@@ -11,7 +11,6 @@ import { ConversationRow } from '@/components/inbox/conversation-row';
 import { Pagination } from '@/components/inbox/pagination';
 import {
   fetchConversations,
-  type Conversation,
   type ConversationFilters as ConversationFiltersT,
   type ConversationStatus,
 } from '@/lib/conversations';
@@ -98,24 +97,13 @@ export function InboxPage(): JSX.Element {
   // the new filter set is fetching — feels faster for typing in the
   // search box.
   const query = useQuery({
-    queryKey: [...QUERY_KEY, filters.status ?? 'all'],
+    queryKey: [...QUERY_KEY, filters.status ?? 'all', filters.search.trim()],
     queryFn: () => fetchConversations(filters),
     placeholderData: (previous) => previous,
   });
 
-  // Client-side search filter — the inbox endpoint has no `q` parameter.
-  // Match against id and customer_external_id (both fields are opaque
-  // tenant-meaningful ids, never raw PII).
-  const filteredItems = useMemo<Conversation[]>(() => {
-    const items = query.data?.items ?? [];
-    const needle = filters.search.trim().toLowerCase();
-    if (!needle) return items;
-    return items.filter(
-      (item) =>
-        item.id.toLowerCase().includes(needle) ||
-        item.customer_external_id.toLowerCase().includes(needle),
-    );
-  }, [query.data, filters.search]);
+  // Search is server-side now; the endpoint handles `q`, so render what it returns.
+  const filteredItems = query.data?.items ?? [];
 
   const pageCount = Math.max(1, Math.ceil(filteredItems.length / PAGE_SIZE));
   // Clamp the URL page back into range if filters shrank the dataset.

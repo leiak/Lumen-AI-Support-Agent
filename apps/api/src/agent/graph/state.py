@@ -47,7 +47,8 @@ TypedDict is the idiomatic choice and keeps the surface small.
 """
 from __future__ import annotations
 
-from typing import TypedDict
+from collections.abc import Awaitable, Callable
+from typing import NotRequired, TypedDict
 
 from langchain_core.messages import BaseMessage
 
@@ -67,6 +68,7 @@ class AgentState(TypedDict):
     final_text: str | None
     escalated: bool
     escalation_message: str | None
+    on_delta: NotRequired[Callable[[str], Awaitable[object]] | None]
 
 
 __all__ = ["AgentState"]

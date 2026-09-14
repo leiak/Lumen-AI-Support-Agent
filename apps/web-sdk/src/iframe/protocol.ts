@@ -22,8 +22,12 @@
  *   Incoming (server -> iframe):
  *     { type: 'ack', external_message_id }            // server confirms our message
  *     { type: 'pong' }                                // heartbeat reply
+ *     { type: 'message.delta', conversation_id, text }
+ *                                                    // streamed AI text chunk; bubbles
+ *                                                    // are keyed by conversation_id
  *     { type: 'message.complete', conversation_id, message_id, role, content }
- *                                                    // AI auto-response
+ *                                                    // AI auto-response — finalises the
+ *                                                    // streamed bubble for conversation_id
  *     { type: 'message.created', conversation_id, message_id, role: 'agent', sender_id }
  *                                                    // human agent replied via REST
  *                                                    // (no `content` field — server

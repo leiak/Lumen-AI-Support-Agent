@@ -1,4 +1,6 @@
 """Tests for the Anthropic provider adapter. HTTP calls mocked via pytest-httpx."""
+import json
+
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
@@ -168,11 +170,67 @@ def test_anthropic_empty_api_key_rejected() -> None:
         AnthropicProvider(api_key="", model="claude-3-5-sonnet-20241022")
 
 
-async def test_anthropic_stream_not_implemented(provider: AnthropicProvider) -> None:
+def _sse(payloads):
+    """Join event dicts into an SSE body: 'data: <json>\n' per event."""
+    nl = chr(10)
+    parts = [pl if isinstance(pl, str) else json.dumps(pl) for pl in payloads]
+    return nl.join("data: " + part for part in parts) + nl
+
+
+async def test_anthropic_stream_success(httpx_mock: HTTPXMock) -> None:
+    provider = AnthropicProvider(
+        api_key="test-key", model="claude-3-5-sonnet-20241022"
+    )
+    httpx_mock.add_response(
+        url="https://api.anthropic.com/v1/messages",
+        text=_sse(
+            [
+                {
+                    "type": "message_start",
+                    "message": {
+                        "model": "claude-3-5-sonnet-20241022",
+                        "usage": {"input_tokens": 12},
+                    },
+                },
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hel"}},
+                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "lo"}},
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 8},
+                },
+                {"type": "message_stop"},
+            ]
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
     req = ChatRequest(
         model="claude-3-5-sonnet-20241022",
         messages=[ChatMessage(role=MessageRole.USER, content="Hi")],
     )
-    with pytest.raises(NotImplementedError):
-        async for _ in provider.stream(req):
+    items = [item async for item in provider.stream(req)]
+    deltas = [i for i in items if isinstance(i, str)]
+    assert deltas == ["Hel", "lo"]
+    final = items[-1]
+    assert final.content == "Hello"
+    assert final.prompt_tokens == 12
+    assert final.completion_tokens == 8
+    assert final.finish_reason == "stop"
+
+
+async def test_anthropic_stream_rate_limited(httpx_mock: HTTPXMock) -> None:
+    provider = AnthropicProvider(
+        api_key="test-key", model="claude-3-5-sonnet-20241022"
+    )
+    httpx_mock.add_response(
+        url="https://api.anthropic.com/v1/messages",
+        status_code=429,
+        json={"error": {"type": "rate_limit_error", "message": "slow"}},
+    )
+    req = ChatRequest(
+        model="claude-3-5-sonnet-20241022",
+        messages=[ChatMessage(role=MessageRole.USER, content="Hi")],
+    )
+    with pytest.raises(RateLimited):
+        async for _item in provider.stream(req):
             pass

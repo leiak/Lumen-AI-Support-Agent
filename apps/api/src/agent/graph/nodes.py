@@ -77,11 +77,12 @@ from llm_client.types import (
 )
 from llm_client.types import (
     ChatRequest,
+    ChatResponse,
+    EmbeddingError,
 )
 from llm_client.types import (
     MessageRole as LLMMessageRole,
 )
-from llm_client.types import EmbeddingError
 
 log = get_logger(__name__)
 
@@ -344,7 +345,30 @@ def make_llm_node(
                 max_tokens=CHAT_MAX_TOKENS,
                 tools=tool_schemas or None,
             )
-            response = await client.chat(request)
+            on_delta = state.get("on_delta")
+            if on_delta is not None:
+                streamed: ChatResponse | None = None
+                async for item in client.stream_chat(request):
+                    if isinstance(item, ChatResponse):
+                        streamed = item
+                        continue
+                    # item is a plain text delta; relay it to the WS layer.
+                    # A WS hiccup must NEVER take down the customer turn, so
+                    # failures here are logged and the stream continues.
+                    try:
+                        await on_delta(str(item))
+                    except Exception:
+                        log.warning(
+                            "agent.graph.stream_delta_failed",
+                            tenant_id=tenant_id,
+                            conversation_id=state["conversation_id"],
+                            error_type=type(item).__name__,
+                        )
+                if streamed is None:
+                    raise ProviderUnavailable("stream ended without a final response")
+                response = streamed
+            else:
+                response = await client.chat(request)
         except (
             RateLimited,
             ProviderUnavailable,

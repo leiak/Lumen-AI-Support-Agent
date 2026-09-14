@@ -12,6 +12,7 @@ from agent.simple_responder import (
     MAX_HISTORY_MESSAGES,
     AgentResponse,
     SimpleResponder,
+    _resolve_default_model,
 )
 from conversation.enums import ConversationStatus, MessageRole
 from knowledge.rag_service import RagContext
@@ -141,7 +142,7 @@ async def test_responder_returns_ai_response_on_llm_success() -> None:
 
     # Verify chat request was constructed correctly
     call_args = fake_client.chat.await_args.args[0]
-    assert call_args.model == DEFAULT_MODEL
+    assert call_args.model == _resolve_default_model()
     assert len(call_args.messages) == 2  # system + 1 customer
     assert call_args.messages[0].role == "system"
 
@@ -884,3 +885,52 @@ async def test_simple_responder_resets_escalation_context_on_success() -> None:
     # After the turn, the ContextVar is reset to its default
     # sentinel (empty strings).
     assert _escalation_ctx.get() == ("", "")
+
+@pytest.mark.asyncio
+async def test_responder_streams_deltas_via_on_delta() -> None:
+    """Passing ``on_delta`` must switch the graph to stream_chat and relay
+    each chunk to the callback while still returning the full AgentResponse.
+    """
+    conv = _conv(ai_handling=True)
+    conv_service = MagicMock()
+    conv_service.get = AsyncMock(return_value=conv)
+    conv_service.list_messages = AsyncMock(
+        return_value=[_msg(MessageRole.CUSTOMER, "How do I reset my password?")]
+    )
+
+    async def _stream(_request):
+        yield "Let me"
+        yield " check"
+        yield ChatResponse(
+            content="Let me check",
+            model=DEFAULT_MODEL,
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+        )
+
+    fake_client = MagicMock()
+    fake_client.stream_chat = _stream
+
+    deltas_received: list[str] = []
+
+    async def on_delta(text: str) -> None:
+        deltas_received.append(text)
+
+    responder = SimpleResponder(
+        conv_service=conv_service,
+        llm_client_factory=lambda _t: fake_client,
+        rag_service=_empty_rag_service(),
+    )
+    result = await responder.respond(
+        tenant_id="t1",
+        conversation_id="c1",
+        on_delta=on_delta,
+    )
+
+    assert result is not None
+    assert result.role == MessageRole.AI
+    assert result.content_text == "Let me check"
+    assert deltas_received == ["Let me", " check"]
+    # The streaming path must never fall back to the non-streaming chat().
+    assert fake_client.chat.called is False

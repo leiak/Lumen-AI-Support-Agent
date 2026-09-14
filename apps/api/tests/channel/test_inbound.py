@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -138,9 +138,12 @@ async def test_process_inbound_triggers_ai_response_when_open_and_ai_handling() 
 
         await process_inbound_envelope(_envelope())
 
-        mock_responder.respond.assert_awaited_once_with(
-            tenant_id="t1", conversation_id="c1"
-        )
+        assert mock_responder.respond.await_count == 1
+        call_kwargs = mock_responder.respond.await_args.kwargs
+        assert call_kwargs["tenant_id"] == "t1"
+        assert call_kwargs["conversation_id"] == "c1"
+        # A streaming relay callback is wired so message.delta frames flow.
+        assert callable(call_kwargs["on_delta"])
         # record_message called twice: customer, then AI.
         assert mock_service.record_message.await_count == 2
         second_call = mock_service.record_message.await_args_list[1]
@@ -285,6 +288,48 @@ async def test_process_inbound_broadcast_uses_persisted_message_id() -> None:
         await process_inbound_envelope(_envelope())
 
         assert mock_bcast.await_args.kwargs["message_id"] == "PERSISTED_ROW_ID"
+
+
+@pytest.mark.asyncio
+async def test_process_inbound_streams_message_delta_via_relay_callback() -> None:
+    """The on_delta callback handed to SimpleResponder must fan each chunk
+    out as a message.delta broadcast (keyed by conversation_id, no row id yet).
+    """
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch("channel.inbound._broadcast_ai_delta", new_callable=AsyncMock) as mock_delta:
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            channel_id="ch1",
+            ai_handling=True,
+            status=ConversationStatus.OPEN,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        ai_msg = MagicMock(id="m_ai_1", role=MessageRole.AI, content_text="Hel lo")
+        mock_service.record_message = AsyncMock(side_effect=[MagicMock(), ai_msg])
+
+        mock_responder = mock_resp_cls.return_value
+        mock_responder.respond = AsyncMock(
+            return_value=AgentResponse(content_text="Hel lo", role=MessageRole.AI)
+        )
+
+        await process_inbound_envelope(_envelope(channel_id="ch1"))
+
+        # Response was invoked with a relay callback that fans deltas out.
+        on_delta = mock_responder.respond.await_args.kwargs["on_delta"]
+        await on_delta("Hel")
+        await on_delta(" lo")
+
+        # Each chunk is fanned out as its own message.delta broadcast.
+        mock_delta.assert_has_awaits(
+            [
+                call(channel_id="ch1", conversation_id="c1", text="Hel"),
+                call(channel_id="ch1", conversation_id="c1", text=" lo"),
+            ]
+        )
+        assert mock_delta.await_count == 2
 
 
 @pytest.mark.asyncio

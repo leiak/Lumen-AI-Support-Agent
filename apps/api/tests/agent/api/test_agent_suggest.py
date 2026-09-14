@@ -1473,7 +1473,7 @@ def test_suggestion_service_constructor_defaults() -> None:
     assert isinstance(svc._conv_service, service_module.ConversationService)
     assert isinstance(svc._rag_service, suggest_module.RAGService)
     assert svc._llm_client_factory is suggest_module._default_llm_client_factory
-    assert svc._model == suggest_module.DEFAULT_MODEL
+    assert svc._model == suggest_module._resolve_default_model()
 
 
 def test_suggestion_service_constructor_overrides() -> None:

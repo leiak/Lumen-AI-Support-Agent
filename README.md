@@ -20,7 +20,7 @@
 | 7 | Agent Runtime (LangChain + LangGraph + escalate_to_human tool) | ✅ | 64 passed (52 unit + 12 integration) |
 | 8 | 坐席工作台 API (me / 发送消息 / queue / claim / suggest-reply) | ✅ | 168+ passed |
 | 9 | 前端 + Web Widget UI (agent SPA + 客户 widget SDK + iframe UI + CORS/origin + Playwright E2E + demo script) | ✅ | 116 backend + 98 frontend + 10 e2e |
-| 10 | 集成 + 可观测性 | ⏳ pending | — |
+| 10 | 集成 + 可观测性 | 🔧 进行中 (/metrics + 容器化 + CI 已落地) | — |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -150,6 +150,28 @@ export DEFAULT_LLM_MODEL=claude-haiku-4-5
 export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 ```
 
+### 容器化 + CI (Stage 10)
+
+```bash
+# 一键拉起 基础设施 + API + 前端 (Web Widget 同源代理 + WS)
+cd deploy
+docker compose up --build
+
+# 仅基础设施 (本地开发用)
+docker compose up -d postgres redis qdrant
+
+# API 容器: http://localhost:8000  Web 容器: http://localhost:8080
+```
+
+- **后端镜像** `apps/api/Dockerfile` — 多阶段构建 (wheel + 精简 runtime),含 `/health` HEALTHCHECK,`CMD uvicorn main:app`
+- **前端镜像** `apps/web/Dockerfile` + `nginx.conf` — 静态 SPA + `/api/v1/` 同源代理 (含 WebSocket upgrade),`VITE_API_BASE_URL` 通过构建参数注入
+- **CI** `.github/workflows/ci.yml` — 五个 job:`backend` (ruff + mypy + 单测)、`backend-integration` (真实 Postgres/Redis/Qdrant service)、`frontend` (lint + type-check + test + build)、`web-sdk` (type-check + test + build)
+
+### 可观测性 (Stage 10)
+
+- `GET /metrics` — Prometheus text 格式,暴露 `http_requests_total` (method/path/status) + `http_request_duration_seconds` 直方图;动态路径段 (ULID/数字 id) 自动折叠为 `/:id`,避免 label 基数爆炸
+- 中间件 re-raise 异常,5xx 由 FastAPI 统一响应并计数,不影响错误处理链
+
 ## 关键设计
 
 ### 多租户隔离 (三层防御)
@@ -170,6 +192,12 @@ export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 - **失败非致命**: RAG 失败 → empty context;LLM 失败 → `FALLBACK_MESSAGE`;tool 失败 → LLM 原文 fallback
 - **Metrics**:`_wrap_with_metrics` 发 `agent.graph.invoke.{started,completed,failed}`,带 `duration_ms` + `turn_kind ∈ {rag_hit, no_rag, escalated}`
 
+### LLM 流式输出 (LLM 层, Stage 10)
+- `BaseProvider.stream` / `LLMClient.stream_chat` — SSE 流式：Anthropic `message_delta` 与 OpenAI `delta.content` chunk 分别解析，`yield` 文本增量，末尾 `yield` 一个携带累计文本 + token 用量 + finish reason 的 `ChatResponse`
+- 流式中断不可续传，不重试；错误映射为既有 typed 异常（`RateLimited` / `InvalidRequest` / `ProviderUnavailable`）
+- 流式不覆盖 tool-use 回合（走 `chat()`）；`stream_chat` 在末尾记录用量（复用 `UsageRecorder`）
+- ⏳ 尚未接到客户会话 WS（`message.delta` 帧）—— 见「已知技术债」
+
 ### 知识库 + RAG (Stage 6)
 - 文档解析 → 多模态增强 (code/image/table blocks) → 长度切片 + overlap
 - OpenAI `text-embedding-3-small` (1536 维),semaphore cap 4 并发
@@ -179,6 +207,10 @@ export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 - 并发 reupload `SELECT FOR UPDATE` 防 UNIQUE 撞车
 
 ## API 端点 (M1)
+
+### 系统
+- `GET /health` — 依赖健康检查 (200 / 503)
+- `GET /metrics` — Prometheus 指标 (text 格式)
 
 ### Auth
 - `POST /api/v1/auth/login` — 颁发 JWT
@@ -230,6 +262,7 @@ export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 4. **多模态 RAG** — `_log_ocr_todo_once` 留待 Stage 7+ 接 vision model
 5. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
 6. **第二 tool / 工具循环** — 当前 `tool_calls[:1]` first-wins,第二个 tool 时改 loop-until-no-tool-calls
+7. **LLM 流式已到引擎层未接 WS** — provider/client 流式已实现 (`test_client_stream.py` 等),客户会话 `message.delta` 帧待接入
 
 ## 仓库信息
 

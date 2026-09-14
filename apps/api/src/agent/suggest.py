@@ -56,13 +56,13 @@ from agent.graph.prompts import (
     FALLBACK_MESSAGE,
     M1_SYSTEM_PROMPT,
 )
-from agent.llm_factory import _default_llm_client_factory
-from agent.simple_responder import DEFAULT_MODEL, MAX_HISTORY_MESSAGES
+from agent.llm_factory import _default_llm_client_factory, _resolve_default_model
 from agent.schemas import CITATION_TEXT_MAX_CHARS, CitationOut
+from agent.simple_responder import MAX_HISTORY_MESSAGES
 from conversation.enums import MessageRole
 from conversation.service import ConversationService
 from core.logging import get_logger
-from knowledge.rag_service import RAGService, RagContext
+from knowledge.rag_service import RAGService
 from knowledge.retriever import RetrievedChunk, retrieve_chunks
 from llm_client.client import LLMClient
 from llm_client.exceptions import (
@@ -182,14 +182,14 @@ class SuggestionService:
         conv_service: ConversationService | None = None,
         llm_client_factory: LLMClientFactory | None = None,
         rag_service: RAGService | None = None,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
     ) -> None:
         self._conv_service = conv_service or ConversationService()
         self._llm_client_factory: LLMClientFactory = (
             llm_client_factory or _default_llm_client_factory
         )
         self._rag_service = rag_service or RAGService()
-        self._model = model
+        self._model = model or _resolve_default_model()
 
     async def suggest_reply(
         self,

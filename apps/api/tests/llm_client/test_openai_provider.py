@@ -1,4 +1,6 @@
 """Tests for the OpenAI provider adapter and OllamaProvider subclass."""
+import json
+
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
@@ -153,3 +155,137 @@ def test_openai_empty_api_key_for_other_base_url_allowed() -> None:
     """Non-OpenAI base URL (e.g. local proxy) with empty api_key is allowed."""
     p = OpenAIProvider(api_key="", model="x", base_url="http://localhost:1234/v1")
     assert p.api_key == ""
+
+def _sse(payloads):
+    """Join event dicts into an SSE body: 'data: <json>\n' per event."""
+    nl = chr(10)
+    parts = [pl if isinstance(pl, str) else json.dumps(pl) for pl in payloads]
+    return nl.join("data: " + part for part in parts) + nl
+
+
+async def test_openai_stream_success(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url="https://api.openai.com/v1/chat/completions",
+        text=_sse(
+            [
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "Hi"},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [
+                        {"index": 0, "delta": {"content": " there"}, "finish_reason": None}
+                    ],
+                },
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                },
+                "[DONE]",
+            ]
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    p = OpenAIProvider(api_key="k", model="gpt-4o", base_url="https://api.openai.com/v1")
+    req = ChatRequest(
+        model="gpt-4o",
+        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
+    )
+    items = [item async for item in p.stream(req)]
+    deltas = [i for i in items if isinstance(i, str)]
+    assert deltas == ["Hi", " there"]
+    final = items[-1]
+    assert final.content == "Hi there"
+    assert final.prompt_tokens == 5
+    assert final.completion_tokens == 3
+    assert final.finish_reason == "stop"
+
+
+async def test_openai_stream_accumulates_tool_calls(httpx_mock: HTTPXMock) -> None:
+    """Streamed tool-call fragments must be reassembled on the final response.
+
+    This is what lets the agent graph detect a streamed ``escalate_to_human``
+    tool invocation so escalation still works while text deltas stream to the
+    widget.
+    """
+    httpx_mock.add_response(
+        url="https://api.openai.com/v1/chat/completions",
+        text=_sse(
+            [
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_abc",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "escalate_to_human",
+                                            "arguments": '{"re',
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": 'ason": "help"}'},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+                {
+                    "id": "c1",
+                    "model": "gpt-4o",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                },
+                "[DONE]",
+            ]
+        ),
+        headers={"Content-Type": "text/event-stream"},
+    )
+    p = OpenAIProvider(api_key="k", model="gpt-4o", base_url="https://api.openai.com/v1")
+    req = ChatRequest(
+        model="gpt-4o",
+        messages=[ChatMessage(role=MessageRole.USER, content="help")],
+    )
+    items = [item async for item in p.stream(req)]
+    final = items[-1]
+    assert final.content == ""
+    assert final.tool_calls is not None
+    assert len(final.tool_calls) == 1
+    tc = final.tool_calls[0]
+    assert tc["id"] == "call_abc"
+    assert tc["name"] == "escalate_to_human"
+    assert tc["input"] == {"reason": "help"}

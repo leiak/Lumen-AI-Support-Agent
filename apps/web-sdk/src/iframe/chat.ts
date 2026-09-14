@@ -124,6 +124,7 @@ export function createChat(
       `[data-lumen-iframe="message"][data-id="${cssEscape(id)}"]`,
     );
     if (!bubble) return;
+    if (patch.id !== undefined) bubble.setAttribute('data-id', patch.id);
     if (patch.text !== undefined) bubble.textContent = patch.text;
     if (patch.status !== undefined) bubble.setAttribute('data-status', patch.status);
     if (patch.role !== undefined) bubble.setAttribute('data-role', patch.role);

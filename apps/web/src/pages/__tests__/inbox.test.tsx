@@ -176,4 +176,20 @@ describe('InboxPage', () => {
     // Page param must be dropped from the URL when reset.
     expect(screen.getByTestId('inbox-pagination')).toHaveTextContent('第 1 / 1 页');
   });
+
+  it('sends the typed query as the q param', async () => {
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { items: [sampleConversation] },
+    });
+    renderInbox('/inbox');
+
+    const user = userEvent.setup();
+    await user.type(screen.getByTestId('conversation-search'), 'customer-9');
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenLastCalledWith(
+        '/api/v1/conversations/inbox',
+        expect.objectContaining({ params: { q: 'customer-9' } }),
+      ),
+    );
+  });
 });
