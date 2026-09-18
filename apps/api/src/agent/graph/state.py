@@ -68,6 +68,7 @@ class AgentState(TypedDict):
     final_text: str | None
     escalated: bool
     escalation_message: str | None
+    tool_iterations: int
     on_delta: NotRequired[Callable[[str], Awaitable[object]] | None]
 
 

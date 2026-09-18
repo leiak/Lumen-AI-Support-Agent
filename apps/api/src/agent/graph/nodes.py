@@ -91,6 +91,16 @@ log = get_logger(__name__)
 # circular import with ``agent.simple_responder``.
 LLMClientFactory = Callable[[str], LLMClient]
 
+# Stage 12 / Task 2 — maximum number of tool-call dispatches the
+# LLM node will perform in a single turn before bailing out with
+# :data:`FALLBACK_MESSAGE`. M1 used a first-wins shortcut
+# (``tool_calls[:1]``) which made multi-step tool flows
+# impossible; the new loop dispatches every tool call the LLM
+# emits. A misbehaving LLM (or a runaway tool) must NOT be able
+# to keep the customer's turn alive forever, so the loop bails
+# after this many iterations and falls back to the safe message.
+_MAX_TOOL_ITERATIONS = 5
+
 
 def _latest_customer_text(messages: list[BaseMessage]) -> str | None:
     """Return the text of the most recent customer ``HumanMessage`` in
@@ -329,22 +339,33 @@ def make_llm_node(
 
         try:
             client = llm_client_factory(tenant_id)
-            request = ChatRequest(
-                model=model,
-                messages=[
-                    LLMChatMessage(role=LLMMessageRole.SYSTEM, content=M1_SYSTEM_PROMPT),
-                    *[
-                        _to_llm_chat_message(m)
-                        for m in (
-                            *state["rag_messages"],
-                            *state["messages"],
-                        )
-                    ],
+            # Mutable message list — Stage 12 / Task 2 tool loop
+            # appends a ``ToolMessage`` (ChatMessage(role=TOOL, ...))
+            # for each dispatch and rebuilds the ``ChatRequest`` from
+            # the running list. Keeping the list hoisted (rather
+            # than rebuilding from ``state`` on every iteration)
+            # matches the documented LangGraph tool-loop pattern.
+            llm_messages: list[LLMChatMessage] = [
+                LLMChatMessage(role=LLMMessageRole.SYSTEM, content=M1_SYSTEM_PROMPT),
+                *[
+                    _to_llm_chat_message(m)
+                    for m in (
+                        *state["rag_messages"],
+                        *state["messages"],
+                    )
                 ],
-                temperature=CHAT_TEMPERATURE,
-                max_tokens=CHAT_MAX_TOKENS,
-                tools=tool_schemas or None,
-            )
+            ]
+
+            def _build_request() -> ChatRequest:
+                return ChatRequest(
+                    model=model,
+                    messages=llm_messages,
+                    temperature=CHAT_TEMPERATURE,
+                    max_tokens=CHAT_MAX_TOKENS,
+                    tools=tool_schemas or None,
+                )
+
+            request = _build_request()
             on_delta = state.get("on_delta")
             if on_delta is not None:
                 streamed: ChatResponse | None = None
@@ -401,111 +422,221 @@ def make_llm_node(
             )
             return {"final_text": FALLBACK_MESSAGE}
 
-        # ---- Tool call dispatch (Stage 7.2) -------------------------
-        # The LLM may have decided to escalate. We only dispatch
-        # tools we recognise — anything else is logged and
-        # ignored so the customer's turn is never blocked by a
-        # hallucinated tool name. ``getattr`` with a default keeps
-        # 7.1's plain-text fakes (``_StubChatResponse`` without
-        # ``tool_calls``) working without modification.
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            # No tool calls — fall through to the normal text path.
-            pass
-        else:
-            # Single-tool-call dispatch (Stage 7.4 hardening).
-            # M1's tool surface has exactly one entry point
-            # (``escalate_to_human``); dispatching more than one
-            # would invite inconsistent state transitions. We
-            # honour the FIRST tool call and log a WARNING for
-            # any extras so an operator can detect a misbehaving
-            # provider without taking the customer's turn down.
-            first = tool_calls[0]
-            for extra in tool_calls[1:]:
-                extra_name = (
-                    extra.get("name") if isinstance(extra, dict) else "<unparsed>"
-                )
-                log.warning(
-                    "agent.graph.extra_tool_calls_ignored",
-                    tenant_id=tenant_id,
-                    conversation_id=state["conversation_id"],
-                    tool_name=str(extra_name or "<missing>"),
-                )
+        # ---- Tool call loop (Stage 12 / Task 2) -------------------
+        # The LLM may decide to invoke zero or more tools before
+        # producing its final answer. Stage 7.2 / 7.4 used a
+        # first-wins shortcut (``tool_calls[:1]``) that could only
+        # dispatch the first tool call and silently dropped the
+        # rest. The loop below dispatches EVERY tool call the LLM
+        # emits, feeds the results back into the message list as
+        # ``ToolMessage``-equivalent ``ChatMessage(role=TOOL, ...)``
+        # rows, and re-invokes the LLM. The loop bails out after
+        # :data:`_MAX_TOOL_ITERATIONS` successful dispatches so a
+        # misbehaving provider cannot keep the customer's turn
+        # alive forever.
+        #
+        # Escalation semantics (M1 contract preserved)
+        # ---------------------------------------------
+        # The ``escalate_to_human`` tool is a *terminal* tool: once
+        # it succeeds the conversation is already flipped at the DB
+        # level via its side effect (``escalate_to_human_queue``),
+        # so calling the LLM again would only risk the model
+        # overriding the escalation with new tool calls. We
+        # therefore short-circuit on a successful
+        # ``escalate_to_human`` dispatch — surface
+        # ``escalated=True`` + ``escalation_message`` so the
+        # graph's conditional edge routes to the escalation
+        # terminal, and log a WARNING for any sibling tool calls
+        # the LLM bundled in the same response (these are
+        # "extras" in the M1 sense). For all OTHER tools the loop
+        # continues normally — the M2 contract lets the LLM see
+        # the tool result and produce a final answer.
+        #
+        # Errors that surface inside the dispatch path are caught
+        # locally so a flaky tool never aborts the whole turn — we
+        # write the error string into the ToolMessage and continue.
+        # PII-safe logging throughout: opaque IDs, error_type
+        # names, no message content, no tool args, no tool results.
+        iterations = 0
 
-            if not isinstance(first, dict):
+        while True:
+            tool_calls = getattr(response, "tool_calls", None) or []
+            if not tool_calls:
+                break
+
+            iterations += 1
+            if iterations > _MAX_TOOL_ITERATIONS:
+                # M1 contract — this node must never raise and
+                # must always return some answer to the customer.
+                # A runaway tool loop falls back to the safe
+                # fallback message; the conversation log records
+                # ``iterations`` so an operator can spot the
+                # misbehaving provider.
                 log.warning(
-                    "agent.graph.tool_call_unparseable",
+                    "agent.graph.tool_loop_max_iterations_exceeded",
                     tenant_id=tenant_id,
                     conversation_id=state["conversation_id"],
-                    error_type=type(first).__name__,
+                    iterations=iterations,
                 )
-            else:
-                name = first.get("name")
-                if name != ESCALATION_TOOL_NAME:
-                    log.info(
-                        "agent.graph.unknown_tool_call",
+                return {"final_text": FALLBACK_MESSAGE}
+
+            # Dispatch every tool call in the response. For each
+            # dispatch we may either (a) append a ToolMessage and
+            # continue the loop, (b) short-circuit with an
+            # escalation result, or (c) bail out via max_iterations
+            # (handled above).
+            for idx, tc in enumerate(tool_calls):
+                if not isinstance(tc, dict):
+                    log.warning(
+                        "agent.graph.tool_call_unparseable",
                         tenant_id=tenant_id,
                         conversation_id=state["conversation_id"],
-                        tool_name=name or "<missing>",
+                        error_type=type(tc).__name__,
                     )
+                    tool_call_id: str | None = None
+                    tool_name: str | None = None
+                    tool_result_str = (
+                        f"Error: unparseable tool call "
+                        f"({type(tc).__name__})"
+                    )
+                    tool_succeeded = False
                 else:
-                    tool_obj = tool_by_name.get(name)
+                    tool_call_id = tc.get("id")
+                    tool_name = tc.get("name")
+                    tool_obj = (
+                        tool_by_name.get(tool_name) if tool_name else None
+                    )
                     if tool_obj is None:
-                        # Should not happen — factory built
-                        # tools only for names it knows.
-                        # Defensive log + fallback.
+                        # The LLM hallucinated a tool name we
+                        # didn't advertise (or the tool factory
+                        # was wired with a different surface).
+                        # Either way, the customer MUST still
+                        # get an answer — we feed the LLM an
+                        # error string as the tool result and
+                        # continue the loop so it can recover.
                         log.warning(
-                            "agent.graph.tool_not_registered",
+                            "agent.graph.unknown_tool_call",
                             tenant_id=tenant_id,
                             conversation_id=state["conversation_id"],
-                            tool_name=name,
+                            tool_name=str(tool_name or "<missing>"),
                         )
-                        return _fallback_to_text(response, tenant_id, state)
+                        tool_result_str = (
+                            f"Error: unknown tool '{tool_name}'"
+                        )
+                        tool_succeeded = False
+                    else:
+                        # Anthropic nests tool args under
+                        # ``input``; OpenAI nests them under
+                        # ``args`` / ``function.arguments``. The
+                        # helper handles both shapes so the
+                        # dispatcher stays provider-agnostic.
+                        args = _extract_tool_args(tc)
+                        try:
+                            tool_result = await tool_obj.ainvoke(args)
+                        except Exception as exc:
+                            # Tool failure MUST NOT abort the
+                            # turn. Write the error into the
+                            # ToolMessage and continue so the LLM
+                            # can either retry or formulate a
+                            # text response.
+                            log.warning(
+                                "agent.graph.tool_call_failed",
+                                tenant_id=tenant_id,
+                                conversation_id=state["conversation_id"],
+                                tool_name=str(tool_name or "<missing>"),
+                                error_type=type(exc).__name__,
+                            )
+                            tool_result_str = (
+                                f"Error: tool '{tool_name}' failed "
+                                f"({type(exc).__name__})"
+                            )
+                            tool_succeeded = False
+                        else:
+                            tool_succeeded = True
+                            tool_result_str = _tool_result_to_string(
+                                tool_result
+                            )
 
-                    # The Anthropic provider returns raw
-                    # ``tool_use`` blocks with the args under
-                    # ``input``. OpenAI-style payloads nest them
-                    # under ``args`` / ``function.arguments``.
-                    # We accept either to keep the dispatcher
-                    # provider-agnostic.
-                    args = _extract_tool_args(first)
-                    try:
-                        tool_result = await tool_obj.ainvoke(args)
-                    except Exception as exc:
-                        # Tool failure MUST NOT take down the
-                        # turn. Fall back to whatever the LLM
-                        # originally returned.
+                # ---- Escalation short-circuit (M1 contract) ----
+                # When ``escalate_to_human`` succeeds, the
+                # conversation state has already been flipped at
+                # the DB level by the tool's side effect — calling
+                # the LLM again would only risk the model
+                # overriding the escalation. We log any sibling
+                # tool calls (the "extras ignored" M1 pattern) and
+                # return the escalation result so the graph routes
+                # to the escalation terminal.
+                if (
+                    tool_succeeded
+                    and tool_name == ESCALATION_TOOL_NAME
+                ):
+                    for extra in tool_calls[idx + 1 :]:
+                        extra_name = (
+                            extra.get("name")
+                            if isinstance(extra, dict)
+                            else "<unparsed>"
+                        )
                         log.warning(
-                            "agent.graph.tool_call_failed",
+                            "agent.graph.extra_tool_calls_ignored",
                             tenant_id=tenant_id,
                             conversation_id=state["conversation_id"],
-                            tool_name=name,
-                            error_type=type(exc).__name__,
+                            tool_name=str(extra_name or "<missing>"),
                         )
-                        return _fallback_to_text(response, tenant_id, state)
-
-                    # The tool returned
-                    # ``{"escalated": True, "reason": "..."}``.
-                    # The customer-facing message is the
-                    # ``reason`` text (the same text the LLM
-                    # would have surfaced anyway).
-                    message = _tool_result_to_message(tool_result)
-                    if message is None:
-                        log.warning(
-                            "agent.graph.tool_result_unparseable",
-                            tenant_id=tenant_id,
-                            conversation_id=state["conversation_id"],
-                            tool_name=name,
-                        )
-                        return _fallback_to_text(response, tenant_id, state)
-
                     return {
                         "escalated": True,
-                        "escalation_message": message,
+                        "escalation_message": _tool_result_to_message(
+                            tool_result
+                        )
+                        if tool_succeeded
+                        else tool_result_str,
                     }
 
-        # ---- Normal text path ---------------------------------------
-        text = response.content.strip()
+                # Otherwise: append the ToolMessage-equivalent to
+                # the running message list so the next LLM call
+                # sees the tool result alongside the assistant's
+                # prior turn.
+                llm_messages.append(
+                    LLMChatMessage(
+                        role=LLMMessageRole.TOOL,
+                        content=tool_result_str,
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    )
+                )
+
+            # Re-invoke the LLM with the updated message list.
+            # Loop iterations always use ``client.chat`` (not the
+            # streaming surface) — the customer's first-text UX
+            # is driven by the *initial* stream; subsequent
+            # dispatches are batched to keep the loop simple and
+            # deterministic.
+            try:
+                request = _build_request()
+                response = await client.chat(request)
+            except (
+                RateLimited,
+                ProviderUnavailable,
+                OutputInvalid,
+                InvalidRequest,
+            ) as exc:
+                log.warning(
+                    "agent.graph.llm_failed",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    error_type=type(exc).__name__,
+                )
+                return {"final_text": FALLBACK_MESSAGE}
+            except Exception as exc:
+                log.warning(
+                    "agent.graph.llm_failed_unexpected",
+                    tenant_id=tenant_id,
+                    conversation_id=state["conversation_id"],
+                    error_type=type(exc).__name__,
+                )
+                return {"final_text": FALLBACK_MESSAGE}
+
+        # ---- Loop exit (no more tool_calls) -----------------------
+        text = response.content.strip() if isinstance(response.content, str) else ""
         if not text:
             log.warning(
                 "agent.graph.llm_empty",
@@ -639,6 +770,39 @@ def _tool_result_to_message(result: Any) -> str | None:
     if isinstance(content_attr, str) and content_attr.strip():
         return content_attr
     return None
+
+
+def _tool_result_to_string(result: Any) -> str:
+    """Convert a LangChain tool's ainvoke result into the string
+    that flows into the follow-up ``ToolMessage`` content.
+
+    Stage 12 / Task 2 — the tool loop feeds tool results back to
+    the LLM via ``ChatMessage(role=TOOL, content=...)``. Strings
+    pass through; dicts collapse to ``reason`` (the customer-facing
+    text) or ``content`` (for ``ToolMessage`` wrappers); anything
+    else falls back to ``str(result)`` so the LLM sees *some*
+    signal rather than a TypeError.
+
+    Errors are already pre-formatted as ``"Error: ..."`` strings
+    by the caller (the dispatch loop), so this helper only sees
+    successful tool results.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        # Mirrors ``_tool_result_to_message`` — prefer the
+        # customer-facing ``reason`` first, then any ``content``
+        # field. Falls back to the dict repr as a last resort.
+        reason = result.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason
+        content = result.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+    content_attr = getattr(result, "content", None)
+    if isinstance(content_attr, str) and content_attr.strip():
+        return content_attr
+    return str(result)
 
 
 def _tool_to_anthropic_schema(tool: BaseTool) -> dict[str, Any]:

@@ -676,10 +676,17 @@ async def test_llm_node_no_tool_call_sets_escalated_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_node_tool_call_failure_falls_back_to_text() -> None:
-    """If the tool raises, the node logs a WARNING and falls back
-    to the LLM's normal text response. The customer turn MUST
-    NOT crash."""
+async def test_llm_node_tool_call_failure_writes_error_to_tool_message_and_continues_loop() -> None:
+    """Stage 12 / Task 2 — if the tool raises, the node writes the
+    error into the ToolMessage content and continues the loop. The
+    LLM gets a second chance to produce a final answer. The
+    customer turn MUST NOT crash.
+
+    Pre-Task-2 the M1 contract was "fall back to the LLM's
+    original text" — that path is gone now. The new behaviour
+    matches the standard LangGraph tool-loop pattern: error in,
+    LLM recovers, final text out.
+    """
     class _BoomTool:
         name = ESCALATION_TOOL_NAME
         description = "boom"
@@ -687,17 +694,36 @@ async def test_llm_node_tool_call_failure_falls_back_to_text() -> None:
         async def ainvoke(self, _args: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("tool exploded")
 
-    client = _fake_llm_client_with_tool_call(
-        tool_calls=[
-            {
-                "type": "tool_use",
-                "id": "toolu-2",
-                "name": ESCALATION_TOOL_NAME,
-                "input": {"reason": "x"},
-            }
-        ],
-        content="fallback text",
-    )
+    # Mock returns the tool_call on the first call, then a final
+    # text response after the loop surfaces the error.
+    tool_call_response = MagicMock()
+    tool_call_response.content = "fallback text"
+    tool_call_response.tool_calls = [
+        {
+            "type": "tool_use",
+            "id": "toolu-2",
+            "name": ESCALATION_TOOL_NAME,
+            "input": {"reason": "x"},
+        }
+    ]
+    tool_call_response.model = DEFAULT_MODEL
+    tool_call_response.prompt_tokens = 10
+    tool_call_response.completion_tokens = 5
+    tool_call_response.finish_reason = "tool_use"
+    tool_call_response.raw = {}
+
+    final_response = MagicMock()
+    final_response.content = "recovered after error"
+    final_response.tool_calls = []
+    final_response.model = DEFAULT_MODEL
+    final_response.prompt_tokens = 15
+    final_response.completion_tokens = 10
+    final_response.finish_reason = "stop"
+    final_response.raw = {}
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=[tool_call_response, final_response])
+
     node = make_llm_node(
         llm_client_factory=_make_factory(client),
         model=DEFAULT_MODEL,
@@ -707,7 +733,14 @@ async def test_llm_node_tool_call_failure_falls_back_to_text() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": "fallback text"}
+    # The LLM is called twice — once for the tool_call, once after
+    # the loop surfaces the error in a ToolMessage and the model
+    # recovers.
+    assert client.chat.await_count == 2
+    # The LLM's *second* response is what the customer sees; the
+    # original ``fallback text`` content of the first response is
+    # no longer the final answer.
+    assert result == {"final_text": "recovered after error"}
     assert "escalated" not in result
 
 
