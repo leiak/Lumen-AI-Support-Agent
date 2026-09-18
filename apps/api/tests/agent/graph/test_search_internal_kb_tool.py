@@ -58,14 +58,24 @@ async def test_search_internal_kb_returns_top_k_chunks(mock_rag_service, mock_kb
 
 @pytest.mark.asyncio
 async def test_search_internal_kb_clamps_top_k_to_20(mock_rag_service, mock_kb_repo):
+    """Stage 12 Task 1 polish: top_k has Pydantic ``le=20`` + body clamp.
+
+    The Pydantic constraint (``le=20``) rejects out-of-range values at
+    the schema layer before the tool body even runs, so the LLM cannot
+    smuggle a bad value past LangChain's args validation. The body
+    ``max(1, min(top_k, 20))`` is a defensive belt-and-suspenders net
+    for any path that bypasses the schema (e.g. direct ainvoke calls
+    in tests).
+    """
+    from pydantic import ValidationError
+
     tool = make_search_internal_kb_tool(rag_service=mock_rag_service, kb_repository=mock_kb_repo)
     token = bind_escalation_context(tenant_id="t1", conversation_id="conv1")
     try:
-        await tool.ainvoke({"query": "x", "top_k": 100})
+        with pytest.raises(ValidationError):
+            await tool.ainvoke({"query": "x", "top_k": 100})
     finally:
         reset_escalation_context(token)
-    _, kwargs = mock_rag_service.retrieve.call_args
-    assert kwargs["top_k"] == 20
 
 
 @pytest.mark.asyncio

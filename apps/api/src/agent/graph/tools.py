@@ -57,13 +57,17 @@ the LLM never sees again.
 from __future__ import annotations
 
 import contextvars
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
 
 from conversation.service import ConversationService
 from core.logging import get_logger
+
+if TYPE_CHECKING:
+    from knowledge.rag_service import RAGService
+    from knowledge.repository import KnowledgeBaseRepository
 
 log = get_logger(__name__)
 
@@ -256,6 +260,7 @@ class SearchInternalKbArgs(BaseModel):
     """Pydantic schema for ``search_internal_kb`` tool arguments."""
 
     query: str = Field(
+        ...,
         description=(
             "Natural-language search query. Will be matched against "
             "the tenant's knowledge base articles via semantic search."
@@ -270,13 +275,19 @@ class SearchInternalKbArgs(BaseModel):
     )
     top_k: int = Field(
         default=5,
+        ge=1,
+        le=20,
         description=(
-            "Number of chunks to return. Clamped to 20 server-side."
+            "Number of chunks to return. Clamped to [1, 20] server-side."
         ),
     )
 
 
-def make_search_internal_kb_tool(*, rag_service, kb_repository):
+def make_search_internal_kb_tool(
+    *,
+    rag_service: "RAGService",
+    kb_repository: "KnowledgeBaseRepository",
+) -> BaseTool:
     """Build a configured ``search_internal_kb`` tool.
 
     Closure-injects ``rag_service`` and ``kb_repository`` so the graph
@@ -316,6 +327,12 @@ def make_search_internal_kb_tool(*, rag_service, kb_repository):
             )
             return "Error: no active conversation context."
 
+        if not query.strip():
+            # Guard against an empty / whitespace-only query —
+            # saves an embedding round-trip and gives the LLM
+            # explicit feedback rather than an empty result set.
+            return "Error: empty query."
+
         kb = None
         if kb_slug and hasattr(_kb_repo, "find_by_slug"):
             try:
@@ -323,10 +340,11 @@ def make_search_internal_kb_tool(*, rag_service, kb_repository):
             except Exception as exc:
                 # KB lookup failure must not break the tool — return no KB
                 # filter and let RAG search across all tenant KBs.
+                # PII-safe payload: kb_slug is intentionally omitted
+                # (slugs can carry tenant-meaningful identifiers).
                 log.warning(
                     "agent.graph.search_internal_kb_kb_lookup_failed",
                     tenant_id=tenant_id,
-                    kb_slug=kb_slug,
                     error_type=type(exc).__name__,
                 )
                 kb = None
@@ -337,7 +355,7 @@ def make_search_internal_kb_tool(*, rag_service, kb_repository):
                 conversation_id=conversation_id,
                 query=query.strip()[:500],
                 knowledge_base_id=kb.id if kb else None,
-                top_k=min(top_k, 20),
+                top_k=max(1, min(top_k, 20)),
             )
         except Exception as exc:
             log.warning(
