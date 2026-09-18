@@ -2,8 +2,8 @@
 
 > 智能化多租户 B2B SaaS 客服系统 — SaaS / 软件企业的 AI 深度介入客服平台,服务外部客户(Web Widget、邮件、企业 IM)的同时为内部坐席提供统一工作台。
 
-[![status](https://img.shields.io/badge/M1-Stages_1--7_complete-brightgreen)]()
-[![tests](https://img.shields.io/badge/agent_tests-64_passed-brightgreen)]()
+[![status](https://img.shields.io/badge/M1-Stages_1--11_complete-brightgreen)]()
+[![tests](https://img.shields.io/badge/agent_tests-440%2B_passed-brightgreen)]()
 [![python](https://img.shields.io/badge/python-3.11+-blue)]()
 [![framework](https://img.shields.io/badge/FastAPI-0.110+-009688)]()
 
@@ -20,7 +20,8 @@
 | 7 | Agent Runtime (LangChain + LangGraph + escalate_to_human tool) | ✅ | 64 passed (52 unit + 12 integration) |
 | 8 | 坐席工作台 API (me / 发送消息 / queue / claim / suggest-reply) | ✅ | 168+ passed |
 | 9 | 前端 + Web Widget UI (agent SPA + 客户 widget SDK + iframe UI + CORS/origin + Playwright E2E + demo script) | ✅ | 116 backend + 98 frontend + 10 e2e |
-| 10 | 集成 + 可观测性 | 🔧 进行中 (/metrics + 容器化 + CI 已落地) | — |
+| 10 | 集成 + 可观测性 (LLM streaming → WS `message.delta` + 可配置 embedding + Doubao 路由 + 真实 RAG eval 阈值校准) | ✅ | 75 streaming + RAG eval |
+| 11 | M1 收尾 (request_id 贯穿 + 业务指标 + /health 拆分 + demo 录屏 + CI 镜像构建) | ✅ | +20 core + 5 health |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -132,8 +133,13 @@ python -m pytest tests/agent -q
 # RAG 离线 eval (mock deterministic embeddings)
 make eval-rag
 
-# 真实 OpenAI 校准 (需要 OPENAI_API_KEY)
+# 真实 embedding 校准 (需要 OPENAI_API_KEY 或 DOUBAO_API_KEY)
+# Stage 10.3 用 20 篇合成文章 + 50 查询算出 DEFAULT_SCORE_THRESHOLD=0.45
 make eval-rag-real
+
+# 录制 demo 截图(需 Postgres+Redis+Qdrant up,seed 已跑)
+bash tests/e2e/scripts/record-demo.sh  # → 11 张 images/demo-act{N}-{step}.png
+# PowerShell: .\tests\e2e\scripts\record-demo.ps1
 ```
 
 ### 环境变量
@@ -167,10 +173,23 @@ docker compose up -d postgres redis qdrant
 - **前端镜像** `apps/web/Dockerfile` + `nginx.conf` — 静态 SPA + `/api/v1/` 同源代理 (含 WebSocket upgrade),`VITE_API_BASE_URL` 通过构建参数注入
 - **CI** `.github/workflows/ci.yml` — 五个 job:`backend` (ruff + mypy + 单测)、`backend-integration` (真实 Postgres/Redis/Qdrant service)、`frontend` (lint + type-check + test + build)、`web-sdk` (type-check + test + build)
 
-### 可观测性 (Stage 10)
+### 可观测性 (Stage 10 + Stage 11)
 
-- `GET /metrics` — Prometheus text 格式,暴露 `http_requests_total` (method/path/status) + `http_request_duration_seconds` 直方图;动态路径段 (ULID/数字 id) 自动折叠为 `/:id`,避免 label 基数爆炸
+- `GET /metrics` — Prometheus text 格式,暴露:
+  - HTTP 层:`http_requests_total` (method/path/status) + `http_request_duration_seconds` 直方图;动态路径段 (ULID/数字 id) 自动折叠为 `/:id`,避免 label 基数爆炸
+  - 业务层(Stage 11.3):`lumen_messages_total{role}` + `lumen_llm_calls_total{provider,model,outcome}` + `lumen_llm_tokens_total{provider,model,direction}`。**故意不加 tenant_id label** — 避免 Prometheus 基数爆炸,租户维度走 `llm_usage` 表
+- `GET /health/live` — 进程存活,**无 IO**(用于 k8s livenessProbe)
+- `GET /health/ready` — 依赖就绪,503 on degraded(用于 k8s readinessProbe / LB)
+- `GET /health` — `/health/ready` 的别名,保留向后兼容
+- 三个 health 端点都返回 `version` + `started_at` + `git_sha`(Stage 11.4,镜像 build 时通过 `--build-arg GIT_SHA=$(git rev-parse --short HEAD)` 注入)
 - 中间件 re-raise 异常,5xx 由 FastAPI 统一响应并计数,不影响错误处理链
+- 每个 HTTP 请求生成 `request_id`(`X-Request-ID` 透传或 ULID),出现在响应头 + 所有 structlog 日志 + 后续业务指标中(Stage 11.2)
+
+### Demo 录制
+
+详细演示流程见 [`docs/demo-script.md`](docs/demo-script.md)。自动化截图见
+[`tests/e2e/scripts/record-demo.sh`](tests/e2e/scripts/record-demo.sh)(或 Windows 的
+`record-demo.ps1`)—— 产 11 张 PNG 到 `images/demo-act{N}-{step}.png`。
 
 ## 关键设计
 
@@ -258,11 +277,15 @@ docker compose up -d postgres redis qdrant
 
 1. **`_reset_db_singletons` autouse fixture** 在多个集成测试文件重复 — Stage 10 集中到 `apps/api/tests/conftest.py`
 2. ~~**`require_admin` / `require_agent_or_admin` 历史 inline 副本**~~ — Stage 8.1 已整合到 `auth/dependencies.py`
-3. **真实 OpenAI M1 阈值校准** — `make eval-rag-real` 路径待 Stage 10 实施
+3. ~~**真实 OpenAI M1 阈值校准** — `make eval-rag-real` 路径待 Stage 10 实施~~ — Stage 10.3 完成 (`eval-rag-real` 现在跑真实 Doubao embedding,校准 `DEFAULT_SCORE_THRESHOLD=0.45`)
 4. **多模态 RAG** — `_log_ocr_todo_once` 留待 Stage 7+ 接 vision model
 5. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
 6. **第二 tool / 工具循环** — 当前 `tool_calls[:1]` first-wins,第二个 tool 时改 loop-until-no-tool-calls
-7. **LLM 流式已到引擎层未接 WS** — provider/client 流式已实现 (`test_client_stream.py` 等),客户会话 `message.delta` 帧待接入
+7. ~~**LLM 流式已到引擎层未接 WS** — provider/client 流式已实现,客户会话 `message.delta` 帧待接入~~ — Stage 10.1 完成 (`src/channel/inbound.py` 已有 `_broadcast_ai_delta` / `_stream_delta`,2 个 E2E 测试覆盖)
+8. **业务指标当前无 tenant_id label** — Stage 11.3 故意不加避免 Prometheus 基数爆炸;按需租户维度走 `llm_usage` 表(账单路径)
+9. **demo mp4 留 presenter** — Stage 11.5 自动化脚本只产 11 张 PNG;mp4 需要 presenter + 音频,自动化做不出
+10. **Plan 10.4 LLM/tracing spans 留 M3** — M1 close-out 只做 request_id 贯穿(Stage 11.2);OpenTelemetry 留到 M3 LLM Gateway
+11. **Plan 10.7 K8s manifests 留 M3/M4** — M1 docker-compose 单区域部署够用
 
 ## 仓库信息
 
