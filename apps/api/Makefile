@@ -2,15 +2,28 @@
 #
 # Minimal scaffolding — add targets as the project grows. The
 # ``eval-rag`` target runs the offline RAG evaluation against
-# the synthetic dataset in tests/knowledge/eval/.
+# the synthetic dataset in tests/knowledge/eval/. ``eval-rag-real``
+# is Stage 10.3 — uses the production embedding backend (Doubao /
+# OpenAI per ``DEFAULT_EMBEDDING_MODEL``) and sweeps a cosine-
+# similarity threshold grid to recommend a value for
+# ``RAGService.DEFAULT_SCORE_THRESHOLD``.
 
 POETRY ?= poetry
 
 .PHONY: eval-rag
-eval-rag: ## Run the offline RAG eval against the synthetic dataset
+eval-rag: ## Run the offline RAG eval against the synthetic dataset (hash-seeded mock embeddings)
 	$(POETRY) run python -m tests.knowledge.eval.run_eval \
 		--dataset tests/knowledge/eval/rag_eval_set.json \
 		--output-dir ./eval_output
+
+.PHONY: eval-rag-real
+eval-rag-real: ## Run RAG eval with REAL embeddings + threshold sweep (Stage 10.3)
+	$(POETRY) run python -m tests.knowledge.eval.run_eval \
+		--dataset tests/knowledge/eval/rag_eval_set.json \
+		--output-dir ./eval_output_real \
+		--real-embeddings \
+		--threshold-sweep \
+		--top-k 10
 
 .PHONY: eval-rag-test
 eval-rag-test: ## Run the eval as a single pytest test (asserts M1 framework contract)

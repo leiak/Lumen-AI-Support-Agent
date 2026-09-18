@@ -18,7 +18,6 @@ from core.logging import get_logger
 from llm_client.providers.openai_embedding_provider import OpenAIEmbeddingProvider
 from llm_client.types import EmbeddingError, EmbeddingResult
 
-_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 _OPENAI_BATCH_LIMIT = 2048
 _MAX_RETRIES = 3
 
@@ -40,12 +39,28 @@ __all__ = ["EmbeddingError", "EmbeddingResult", "aclose_default_client", "embed_
 def _get_default_client() -> openai.AsyncOpenAI:
     """Return the module-level `AsyncOpenAI` singleton, creating it lazily.
 
-    The OpenAI client doesn't need async init, so a synchronous lazy init is
-    sufficient and avoids needing an asyncio lock.
+    Routing priority:
+      1. If ``DOUBAO_API_KEY`` is set → use the Doubao/Ark base URL + Doubao key
+         (serves Doubao embedding models like ``doubao-embedding``).
+      2. Otherwise → use ``OPENAI_API_KEY`` against OpenAI's default endpoint.
+
+    The OpenAI Python SDK is OpenAI-compatible, so it talks to either server
+    without code changes in the provider layer. The singleton is cached so
+    subsequent calls reuse the same HTTPX connection pool.
+
+    Re-init after ``reset_settings()`` requires a manual
+    ``_reset_default_client_for_tests()`` (called by test teardown).
     """
     global _client_singleton
     if _client_singleton is None:
-        _client_singleton = openai.AsyncOpenAI(api_key=get_settings().openai_api_key)
+        settings = get_settings()
+        if settings.doubao_api_key:
+            _client_singleton = openai.AsyncOpenAI(
+                api_key=settings.doubao_api_key,
+                base_url=settings.doubao_base_url,
+            )
+        else:
+            _client_singleton = openai.AsyncOpenAI(api_key=settings.openai_api_key)
     return _client_singleton
 
 
@@ -86,7 +101,7 @@ async def _embed_batch_with_semaphore(
 async def embed_texts(
     *,
     texts: list[str],
-    model: str = _DEFAULT_EMBEDDING_MODEL,
+    model: str | None = None,
     tenant_id: str | None = None,
     client: openai.AsyncOpenAI | None = None,
 ) -> EmbeddingResult:
@@ -112,6 +127,12 @@ async def embed_texts(
         EmbeddingError: On permanent failure (4xx, auth, rate-limit
             exhausted, etc.).
     """
+    # Resolve the embedding model lazily so settings changes (env override
+    # in tests, hot-reload) propagate without a process restart. The
+    # caller may still pass `model` explicitly to override per-KB.
+    if model is None:
+        model = get_settings().default_embedding_model
+
     log = get_logger("llm.embedding")
     log.info(
         "embedding_request",

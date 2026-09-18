@@ -27,9 +27,16 @@ What it does
    * ``mrr`` — Mean Reciprocal Rank (1/rank of the first relevant hit).
    * ``ndcg_at_5`` — Normalized Discounted Cumulative Gain at depth 5
      with binary relevance (1 if the article is expected, else 0).
-5. Writes an ``EvalReport`` JSON to ``output_dir/eval_report.json`` and
+5. *(Optional)* When invoked with ``--threshold-sweep``, additionally
+   computes precision / recall across a grid of cosine-similarity
+   thresholds (0.20 … 0.70 step 0.05) and recommends the lowest
+   threshold that hits ``recall ≥ 0.9`` while keeping
+   ``precision ≥ 0.5``. Stage 10.3 added this so an operator can
+   calibrate ``RAGService.DEFAULT_SCORE_THRESHOLD`` against a real
+   embedding model rather than the eyeballed 0.3 default.
+6. Writes an ``EvalReport`` JSON to ``output_dir/eval_report.json`` and
    prints a human-readable summary to stdout.
-6. Cleans up the tenant (cascade deletes articles, chunks, etc.).
+7. Cleans up the tenant (cascade deletes articles, chunks, etc.).
 
 Design choices
 --------------
@@ -45,24 +52,31 @@ Design choices
   *different* tenant_id than the one the articles belong to. The
   retriever raises ``KnowledgeBaseNotFoundError`` for those — the
   runner treats that as a successful isolation (0 relevant hits).
-* **Mock-deterministic embeddings.** The eval is designed to work with
-  both real OpenAI embeddings and the hash-seeded mock used elsewhere
-  in the test suite. With the mock, retrieval is essentially random —
-  the metrics will be near 0, but the framework still runs end-to-end
-  and the per-query diagnostics surface the failure mode. Thresholds
-  in the pytest wrapper are calibrated for the mock (0.0) so the test
-  validates the *framework*, not the embedding quality. The M1 spec
-  for real-embedding thresholds is hit_rate@1>=0.6, hit_rate@5>=0.9,
-  MRR>=0.7 — those are documented inline in the pytest wrapper.
+* **Two embedding modes.** ``--real-embeddings`` uses the production
+  ``embed_texts`` (which routes to Doubao / OpenAI per
+  ``DEFAULT_EMBEDDING_MODEL``). The default mode is the hash-seeded
+  mock so the suite can run offline. Real embeddings need the
+  matching Qdrant collection dimensions — ``_ensure_collection_ready``
+  reads ``get_settings().default_embedding_model`` and creates the
+  collection at the right size if it doesn't already exist.
 
 CLI
 ---
 
 ::
 
+    # Mock embeddings (offline; framework-only assertion in CI)
     python -m tests.knowledge.eval.run_eval \\
         --dataset tests/knowledge/eval/rag_eval_set.json \\
-        --output-dir /tmp/rag-eval
+        --output-dir ./eval_output
+
+    # Real embeddings (Stage 10.3): calibrate recall + recommend threshold
+    python -m tests.knowledge.eval.run_eval \\
+        --dataset tests/knowledge/eval/rag_eval_set.json \\
+        --output-dir ./eval_output_real \\
+        --real-embeddings \\
+        --threshold-sweep \\
+        --top-k 10
 
 Or programmatically::
 
@@ -139,6 +153,11 @@ class EvalReport:
         them).
     dataset_path:
         Absolute path to the dataset JSON that was scored.
+    embedding_mode:
+        ``"real"`` when ``--real-embeddings`` was passed (production
+        embeddings via OpenAI/Doubao), ``"mock"`` when the hash-seeded
+        stub was used. The report is honest about which backend ran
+        so a downstream reader doesn't confuse the two.
     total_queries:
         Total number of queries evaluated (standard + edge cases).
     hit_rate_at_1:
@@ -160,12 +179,23 @@ class EvalReport:
         ``{topic: {metric: value}}`` aggregates restricted to
         *standard* queries (edge cases are excluded from the topic
         rollups because they don't belong to a topic).
+    threshold_sweep:
+        When ``--threshold-sweep`` is on, a list of
+        ``{threshold, precision, recall, f1, n_kept}`` rows scanned
+        over a grid of cosine-similarity cutoffs, plus a
+        ``recommended_threshold`` field on the recommended operating
+        point. Empty list when the sweep wasn't requested.
+    recommended_threshold:
+        Convenience mirror of the recommended threshold from the
+        sweep (``None`` when the sweep wasn't run or no candidate met
+        the recall/precision target).
     elapsed_seconds:
         Wall-clock time for the whole eval run.
     """
 
     dataset_version: str
     dataset_path: str
+    embedding_mode: str
     total_queries: int
     hit_rate_at_1: float
     hit_rate_at_5: float
@@ -173,6 +203,8 @@ class EvalReport:
     ndcg_at_5: float
     per_query: list[dict] = field(default_factory=list)
     per_topic: dict[str, dict] = field(default_factory=dict)
+    threshold_sweep: list[dict] = field(default_factory=list)
+    recommended_threshold: float | None = None
     elapsed_seconds: float = 0.0
 
 
@@ -181,7 +213,7 @@ class EvalReport:
 # ---------------------------------------------------------------------------
 
 
-def _make_topic_vector(text: str, *, dim: int = DEFAULT_VECTOR_SIZE) -> list[float]:
+def _make_topic_vector(text: str, *, dim: int) -> list[float]:
     """Hash-seeded unit vector — same approach as ``test_retriever.py``.
 
     The retriever's mock vector must be deterministic across calls so
@@ -190,9 +222,16 @@ def _make_topic_vector(text: str, *, dim: int = DEFAULT_VECTOR_SIZE) -> list[flo
     convention the integration tests use, so anyone reading the test
     file finds a familiar function.
 
-    With a real OpenAI client (``OPENAI_API_KEY`` set), this stub is
-    NOT used — the live ``embed_texts`` runs instead. The eval is
-    written to work with both.
+    ``dim`` is REQUIRED (no default) — it must match the
+    ``article_chunks`` collection's configured vector dimension,
+    otherwise Qdrant rejects the upserts with a 400 ``Bad Request``.
+    Callers in this module always read the dim from
+    ``vector_size_for_model(get_settings().default_embedding_model)``
+    so the mock stays in lockstep with whatever model the live
+    pipeline would use.
+
+    With a real OpenAI / Doubao client (``--real-embeddings``), this
+    stub is NOT used — the live ``embed_texts`` runs instead.
     """
     seed = hashlib.sha256(text.encode("utf-8")).digest()
     expanded = (seed * ((dim // len(seed)) + 1))[:dim]
@@ -202,13 +241,41 @@ def _make_topic_vector(text: str, *, dim: int = DEFAULT_VECTOR_SIZE) -> list[flo
     return [x / norm for x in raw]
 
 
-def _patch_embed_topic_coded() -> None:
-    """Patch ``embed_texts`` to return hash-seeded vectors.
+def _configured_vector_size() -> int:
+    """Return the dim for ``article_chunks`` based on the live settings.
+
+    Centralizes the "what dim should the eval use" question so the
+    mock, the Qdrant collection, and the real embedding backend all
+    agree. Reads ``DEFAULT_EMBEDDING_MODEL`` from settings so the
+    mock matches the live collection dim (e.g. 2048 for
+    ``doubao-embedding-vision``); falls back to
+    ``DEFAULT_VECTOR_SIZE = 1536`` only when the model is unknown
+    (which raises ``ValueError`` in production code too).
+    """
+    from core.config import get_settings
+    from knowledge.qdrant_client import vector_size_for_model
+
+    return vector_size_for_model(get_settings().default_embedding_model)
+
+
+def _patch_embed_topic_coded(*, dim: int) -> None:
+    """Patch ``embed_texts`` to return hash-seeded vectors of the given dim.
 
     The worker imports ``embed_texts`` at module-load time; the
     retriever does too. We patch both symbols so the eval is
     independent of network access. Tests can call
     :func:`_patch_embed_topic_coded` once at the top of the runner.
+
+    ``dim`` MUST equal the ``article_chunks`` collection's vector
+    size — otherwise the mock-emitted vectors get rejected at
+    upsert time with a 400 Bad Request. Pass
+    ``_configured_vector_size()`` to stay in lockstep with whatever
+    the live model would produce.
+
+    NOTE: this is a one-way patch by default. Real-embedding mode
+    needs to *restore* the originals first via
+    :func:`_restore_embed_originals` — otherwise the module-load
+    patch leaks into the real run and you get mock-grade metrics.
     """
     from knowledge import retriever as retriever_module
     from knowledge import worker as worker_module
@@ -220,10 +287,41 @@ def _patch_embed_topic_coded() -> None:
             self.usage = type("U", (), {"prompt_tokens": 0, "total_tokens": 0})()
 
     async def _stub(*, texts, model, tenant_id=None, client=None):
-        return _Stub([_make_topic_vector(t) for t in texts])
+        return _Stub([_make_topic_vector(t, dim=dim) for t in texts])
 
     worker_module.embed_texts = _stub  # type: ignore[assignment]
     retriever_module.embed_texts = _stub  # type: ignore[assignment]
+
+
+def _restore_embed_originals() -> bool:
+    """Restore the unpatched ``embed_texts`` on the worker + retriever.
+
+    Called at the top of ``run_eval`` when ``--real-embeddings`` is
+    requested. The module-load :func:`_patch_embed_topic_coded` call
+    runs unconditionally for the offline / CI path; without this
+    restore the real mode would silently inherit the hash-seeded stub
+    and report mock-grade metrics while logging ``embedding_mode=real``.
+
+    We cache the originals once via the worker-module sentinel
+    ``_rag_eval_original_embed_texts`` so a second ``run_eval`` call
+    in the same process doesn't re-bind to the stub (which would
+    replace a real ``embed_texts`` with a copy of itself).
+
+    Returns ``True`` if the originals were restored, ``False`` if
+    there was nothing to restore (e.g. first call in this process).
+    """
+    from knowledge import retriever as retriever_module
+    from knowledge import worker as worker_module
+
+    # Cache the originals the first time we restore.
+    cached = getattr(worker_module, "_rag_eval_original_embed_texts", None)
+    if cached is None:
+        cached = worker_module.embed_texts
+        worker_module._rag_eval_original_embed_texts = cached  # type: ignore[attr-defined]
+
+    worker_module.embed_texts = cached  # type: ignore[assignment]
+    retriever_module.embed_texts = cached  # type: ignore[assignment]
+    return True
 
 
 def _dcg_at_k(relevances: list[int], k: int) -> float:
@@ -269,15 +367,32 @@ def _ndcg_at_k(relevances: list[int], k: int) -> float:
 # ---------------------------------------------------------------------------
 
 
-async def _ensure_collection_ready() -> None:
+async def _ensure_collection_ready(*, vector_size: int | None = None) -> None:
     """Idempotently create the Qdrant collection if missing.
 
     Mirrors the production startup path — the worker assumes the
     collection exists, so the eval must create it before indexing.
+
+    ``vector_size`` is the *target* size for the collection. When the
+    eval runs in ``--real-embeddings`` mode the caller passes the
+    configured model's dimension (via ``vector_size_for_model(get_settings().default_embedding_model)``)
+    so a freshly-created collection matches the vectors the live
+    ``embed_texts`` will produce. The mock mode keeps the historical
+    ``DEFAULT_VECTOR_SIZE = 1536`` fallback so legacy fixtures
+    continue to work.
+
+    The helper is safe to call against a collection that already
+    exists at a *different* size: ``ensure_collection`` returns
+    ``True`` on the probe without touching it, and the subsequent
+    upsert call will fail loudly at Qdrant if the dimension mismatches
+    the live embedding backend. That's the behavior we want — a
+    silent truncation would be much worse.
     """
+    if vector_size is None:
+        vector_size = DEFAULT_VECTOR_SIZE
     ok = await ensure_collection(
         name=DEFAULT_COLLECTION,
-        vector_size=DEFAULT_VECTOR_SIZE,
+        vector_size=vector_size,
     )
     if not ok:
         raise RuntimeError(
@@ -399,6 +514,9 @@ async def run_eval(
     *,
     dataset_path: str,
     output_dir: str,
+    use_real_embeddings: bool = False,
+    do_threshold_sweep: bool = False,
+    top_k: int = 5,
 ) -> EvalReport:
     """Run the full offline RAG eval against the loaded dataset.
 
@@ -410,6 +528,25 @@ async def run_eval(
     output_dir:
         Directory to write ``eval_report.json`` into. Created if
         missing.
+    use_real_embeddings:
+        When ``True`` the production ``embed_texts`` (which routes
+        through Doubao / OpenAI per ``DEFAULT_EMBEDDING_MODEL``) is
+        used instead of the hash-seeded mock. The Qdrant collection
+        is ensured at the live model's dimension so the upserts
+        succeed. Default ``False`` keeps the mock mode for offline /
+        CI runs that don't have API keys.
+    do_threshold_sweep:
+        When ``True`` the report additionally carries a
+        ``threshold_sweep`` table plus a ``recommended_threshold``
+        calibrated for ``recall ≥ 0.9`` and ``precision ≥ 0.5``.
+        Implies ``top_k >= 10`` — the sweep walks the score
+        distribution across more than the standard 5 hits, so
+        callers that pass this flag should also pass
+        ``top_k=10`` (or higher) for meaningful results.
+    top_k:
+        Number of hits ``retrieve_chunks`` should return per query.
+        Default ``5`` matches the production default; ``10`` is the
+        recommended value when running the threshold sweep.
 
     Returns
     -------
@@ -440,18 +577,39 @@ async def run_eval(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    # ---- 2. Ensure Qdrant collection -----------------------------------
+    # ---- 2. Resolve embedding backend ---------------------------------
+    # Both modes use the *configured* model's vector dim so the mock
+    # stays in lockstep with the Qdrant collection. Real-embedding
+    # mode additionally skips the mock patch so ``embed_texts`` hits
+    # the live AsyncOpenAI singleton (Doubao / OpenAI).
+    from core.config import get_settings
+
+    configured_model = get_settings().default_embedding_model
+    eval_vector_size = _configured_vector_size()
+
+    if use_real_embeddings:
+        embedding_mode = "real"
+        log.info(
+            "rag_eval.real_embeddings",
+            embedding_model=configured_model,
+            vector_size=eval_vector_size,
+        )
+        # The module-load patch is unconditional (so the offline /
+        # CI path works without ceremony). Real mode needs to
+        # restore the original ``embed_texts`` BEFORE any indexing
+        # call, otherwise the mock leaks through and you get
+        # mock-grade metrics with ``embedding_mode=real`` in the
+        # log — a particularly confusing failure mode.
+        _restore_embed_originals()
+    else:
+        embedding_mode = "mock"
+        if not _embedding_is_patched():
+            _patch_embed_topic_coded(dim=eval_vector_size)
+
+    # ---- 3. Ensure Qdrant collection -----------------------------------
     # Done before DB writes so a Qdrant outage fails fast — no point
     # in provisioning a tenant we can't index into.
-    await _ensure_collection_ready()
-
-    # ---- 3. Patch embeddings to deterministic mock ---------------------
-    # With a live OPENAI_API_KEY the caller can monkeypatch embed_texts
-    # BEFORE calling run_eval; we honor whatever is on the module at
-    # this point. The default for CLI runs is the hash-seeded mock.
-    # The CLI wrapper (``main()``) patches the modules at startup.
-    if not _embedding_is_patched():
-        _patch_embed_topic_coded()
+    await _ensure_collection_ready(vector_size=eval_vector_size)
 
     # ---- 4. Provision tenant + KB + articles ---------------------------
     tenants_def = dataset.get("tenants", {})
@@ -467,7 +625,16 @@ async def run_eval(
         tenant_id=main_tenant.id,
         name=main_kb_def["name"],
         slug=main_kb_def["slug"],
-        embedding_model=main_kb_def["embedding_model"],
+        # Honor the dataset's documented model for mock-mode runs
+        # so the legacy contract is unchanged, but in real-embedding
+        # mode pin the live configured model so the eval exercises
+        # whatever the deployment actually uses. The dataset's
+        # embedding_model field is treated as documentation in
+        # real-embedding mode.
+        embedding_model=(
+            configured_model if use_real_embeddings
+            else main_kb_def["embedding_model"]
+        ),
         chunk_size=main_kb_def["chunk_size"],
         chunk_overlap=main_kb_def["chunk_overlap"],
     )
@@ -539,7 +706,7 @@ async def run_eval(
                 tenant_id=q_tenant,
                 knowledge_base_id=q_kb_id,
                 query=q_text,
-                top_k=5,
+                top_k=top_k,
             )
         except KnowledgeBaseNotFoundError:
             # Cross-tenant isolation worked. Record the result and
@@ -568,11 +735,23 @@ async def run_eval(
     hit_rate_at_1, hit_rate_at_5, mrr, ndcg_at_5 = _compute_overall_metrics(per_query)
     per_topic = _compute_per_topic_metrics(per_query)
 
+    # Optional threshold sweep — Stage 10.3 calibration. Walk a grid of
+    # cosine-similarity cutoffs and compute precision / recall across
+    # the entire query set. The recommended threshold is the lowest
+    # cutoff that hits ``recall >= 0.9`` while keeping
+    # ``precision >= 0.5``; falling back to the threshold with the
+    # best F1 if none meets both targets.
+    threshold_sweep: list[dict] = []
+    recommended_threshold: float | None = None
+    if do_threshold_sweep:
+        threshold_sweep, recommended_threshold = _compute_threshold_sweep(per_query)
+
     elapsed = time.perf_counter() - started
 
     report = EvalReport(
         dataset_version=dataset["version"],
         dataset_path=str(dataset_file.resolve()),
+        embedding_mode=embedding_mode,
         total_queries=len(per_query),
         hit_rate_at_1=hit_rate_at_1,
         hit_rate_at_5=hit_rate_at_5,
@@ -580,6 +759,8 @@ async def run_eval(
         ndcg_at_5=ndcg_at_5,
         per_query=per_query,
         per_topic=per_topic,
+        threshold_sweep=threshold_sweep,
+        recommended_threshold=recommended_threshold,
         elapsed_seconds=round(elapsed, 3),
     )
 
@@ -603,11 +784,13 @@ async def run_eval(
 
     log.info(
         "rag_eval.done",
+        embedding_mode=report.embedding_mode,
         total_queries=report.total_queries,
         hit_rate_at_1=report.hit_rate_at_1,
         hit_rate_at_5=report.hit_rate_at_5,
         mrr=report.mrr,
         ndcg_at_5=report.ndcg_at_5,
+        recommended_threshold=report.recommended_threshold,
         elapsed_seconds=report.elapsed_seconds,
     )
     return report
@@ -717,6 +900,124 @@ def _compute_per_topic_metrics(per_query: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _compute_threshold_sweep(
+    per_query: list[dict],
+) -> tuple[list[dict], float | None]:
+    """Walk a grid of cosine-similarity thresholds and report precision/recall.
+
+    Stage 10.3 — calibrate ``RAGService.DEFAULT_SCORE_THRESHOLD``
+    against the real embedding model. The eval records the per-query
+    predicted scores (top-``k``); this function sweeps a grid of
+    cutoffs and reports, for each:
+
+    * ``n_kept`` — number of (query, hit) pairs that survive the
+      cutoff. ``0`` means the cutoff dropped every hit.
+    * ``precision`` — across kept pairs, fraction whose article id is
+      in the expected set.
+    * ``recall`` — fraction of (query, expected article) pairs that
+      survived the cutoff.
+    * ``f1`` — harmonic mean of precision and recall, with the usual
+      ``f1=0`` when both are 0.
+
+    The recommended threshold is the LOWEST cutoff that satisfies:
+
+    * ``recall >= 0.9`` AND ``precision >= 0.5``
+
+    If no cutoff meets both targets we fall back to the cutoff with
+    the best F1, so the report always surfaces a single number the
+    operator can paste into ``DEFAULT_SCORE_THRESHOLD``.
+
+    Only ``category == "standard"`` queries participate in the sweep
+    — out-of-domain and cross-tenant queries carry empty expected
+    sets, so a hit "above the threshold" against them counts as a
+    false positive that swamps the precision denominator. Filtering
+    them out mirrors the per-topic rollup behavior.
+
+    Returns:
+        ``(rows, recommended)`` where ``rows`` is the sorted sweep
+        table and ``recommended`` is the recommended cutoff (``None``
+        when no query produced any hits at any threshold).
+    """
+    # Cosine similarity is bounded in [0, 1] for normalized vectors;
+    # we sweep the interesting band 0.20 .. 0.70 in 0.05 steps.
+    thresholds = [round(t * 0.05 + 0.20, 2) for t in range(0, 11)]
+    rows: list[dict] = []
+
+    # Pre-bucket standard records to avoid the category filter in the
+    # inner loop. Empty expected sets are excluded.
+    standard_records = [
+        r
+        for r in per_query
+        if r.get("category") == "standard"
+        and r.get("expected_relevant_article_ids")
+        and r.get("predicted_scores")
+    ]
+
+    if not standard_records:
+        # No real queries → nothing meaningful to sweep. Return the
+        # empty grid + None recommendation so callers still get a
+        # well-formed report.
+        return rows, None
+
+    # Total (query, expected article) pairs — the recall denominator.
+    total_relevant = sum(len(r["expected_relevant_article_ids"]) for r in standard_records)
+
+    best_f1 = -1.0
+    best_f1_threshold: float | None = None
+    recommended: float | None = None
+
+    for t in thresholds:
+        n_kept = 0
+        n_true_positives = 0
+        n_relevant_kept = 0
+        for r in standard_records:
+            expected = set(r["expected_relevant_article_ids"])
+            for aid, score in zip(
+                r["predicted_article_ids"], r["predicted_scores"]
+            ):
+                if score >= t:
+                    n_kept += 1
+                    if aid in expected:
+                        n_true_positives += 1
+                        n_relevant_kept += 1
+        precision = (n_true_positives / n_kept) if n_kept else 0.0
+        recall = (n_relevant_kept / total_relevant) if total_relevant else 0.0
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if (precision + recall) > 0
+            else 0.0
+        )
+        rows.append(
+            {
+                "threshold": t,
+                "n_kept": n_kept,
+                "precision": round(precision, 4),
+                "recall": round(recall, 4),
+                "f1": round(f1, 4),
+            }
+        )
+
+        # Track the F1-best cutoff as a fallback.
+        if f1 > best_f1:
+            best_f1 = f1
+            best_f1_threshold = t
+
+        # Recommend the LOWEST cutoff that meets both targets — we
+        # prefer admitting more hits (lower threshold) as long as
+        # recall stays at the floor.
+        if (
+            recommended is None
+            and recall >= 0.9
+            and precision >= 0.5
+        ):
+            recommended = t
+
+    if recommended is None:
+        recommended = best_f1_threshold
+
+    return rows, recommended
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -788,12 +1089,17 @@ def _print_summary(report: EvalReport) -> None:
     print(line)
     print(f"dataset         : {report.dataset_path}")
     print(f"version         : {report.dataset_version}")
+    print(f"embedding_mode  : {report.embedding_mode}")
     print(f"queries         : {report.total_queries}")
     print(f"hit_rate@1      : {report.hit_rate_at_1:.4f}")
     print(f"hit_rate@5      : {report.hit_rate_at_5:.4f}")
     print(f"MRR             : {report.mrr:.4f}")
     print(f"nDCG@5          : {report.ndcg_at_5:.4f}")
     print(f"elapsed_seconds : {report.elapsed_seconds}")
+    if report.recommended_threshold is not None:
+        print()
+        print(f"recommended_threshold (>=0.9 recall, >=0.5 precision): "
+              f"{report.recommended_threshold:.2f}")
     print()
     print("PER-TOPIC (standard queries only)")
     print("-" * 72)
@@ -807,6 +1113,24 @@ def _print_summary(report: EvalReport) -> None:
             f"{m['mrr']:>8.4f} "
             f"{m['ndcg_at_5']:>8.4f}"
         )
+    if report.threshold_sweep:
+        print()
+        print("THRESHOLD SWEEP (cosine similarity, standard queries only)")
+        print("-" * 72)
+        print(f"{'thr':>5} {'n_kept':>7} {'precision':>10} {'recall':>8} {'f1':>8}")
+        for row in report.threshold_sweep:
+            marker = ""
+            if report.recommended_threshold is not None and abs(
+                row["threshold"] - report.recommended_threshold
+            ) < 1e-6:
+                marker = "  <- recommended"
+            print(
+                f"{row['threshold']:>5.2f} "
+                f"{row['n_kept']:>7d} "
+                f"{row['precision']:>10.4f} "
+                f"{row['recall']:>8.4f} "
+                f"{row['f1']:>8.4f}{marker}"
+            )
     print(line)
 
 
@@ -837,6 +1161,39 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="./eval_output",
         help="Directory to write eval_report.json into (default: %(default)s).",
     )
+    parser.add_argument(
+        "--real-embeddings",
+        action="store_true",
+        help=(
+            "Use the production ``embed_texts`` (routed to "
+            "Doubao/OpenAI via ``DEFAULT_EMBEDDING_MODEL``) instead of "
+            "the hash-seeded mock. Requires a valid embedding API key "
+            "in the environment and a Qdrant collection at the "
+            "matching vector dimension."
+        ),
+    )
+    parser.add_argument(
+        "--threshold-sweep",
+        action="store_true",
+        help=(
+            "After the standard metric pass, walk a grid of cosine "
+            "similarity cutoffs and report precision / recall + a "
+            "recommended ``DEFAULT_SCORE_THRESHOLD`` for the live "
+            "embedding model. Implies ``--top-k 10`` for a meaningful "
+            "score distribution."
+        ),
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help=(
+            "Number of hits ``retrieve_chunks`` should return per "
+            "query (default: %(default)s). Use 10+ when sweeping "
+            "thresholds so the score distribution covers more than "
+            "the obvious top-5."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -848,9 +1205,21 @@ def main(argv: list[str] | None = None) -> int:
     inside ``run_eval`` via ``asyncio.run``.
     """
     args = _parse_args(argv)
+    # Sanity: the threshold sweep is only meaningful with a wider
+    # score distribution than the default top-5 — silently upgrade
+    # top_k if the caller forgot to bump it.
+    top_k = args.top_k
+    if args.threshold_sweep and top_k < 10:
+        top_k = 10
     try:
         asyncio.run(
-            run_eval(dataset_path=args.dataset, output_dir=args.output_dir)
+            run_eval(
+                dataset_path=args.dataset,
+                output_dir=args.output_dir,
+                use_real_embeddings=args.real_embeddings,
+                do_threshold_sweep=args.threshold_sweep,
+                top_k=top_k,
+            )
         )
     except Exception as exc:
         print(f"rag_eval failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -867,8 +1236,16 @@ def _mark_embedding_patched() -> None:
     worker_module._rag_eval_patched = True  # type: ignore[attr-defined]
 
 
-_patch_embed_topic_coded()
-_mark_embedding_patched()
+# NO module-level patch. Earlier versions of this file patched
+# ``embed_texts`` at import time so an empty CLI invocation would
+# "just work" for offline runs, but that made the real-embedding
+# path fragile: any attempt to restore the originals cached the
+# already-patched stub. The patch is now applied inside
+# ``run_eval`` (mock mode only) so the worker + retriever see the
+# real ``embed_texts`` until the eval explicitly asks for the mock.
+#
+# ``_embedding_is_patched`` still drives the "have we patched in
+# this process" check used by re-entrant ``run_eval`` calls.
 
 
 if __name__ == "__main__":

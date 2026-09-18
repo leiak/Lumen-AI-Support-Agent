@@ -31,6 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from core.config import get_settings
 from core.database import get_session
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -43,9 +44,11 @@ from knowledge.models import (
 
 # Default values for a fresh KnowledgeBase. Kept here so the repo
 # owns its own persistence defaults — the service layer never needs
-# to know them. Matches the model defaults (``models.py``) and the
-# M1 spec.
-_DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+# to know them. The embedding-model default is resolved at call time
+# from ``Settings.default_embedding_model`` (see ``create()`` below),
+# not stored as a module-level literal so env overrides take effect without
+# a code change. ``models.py`` keeps a literal default as a defensive
+# safety net for direct INSERTs (tests, migrations).
 _DEFAULT_CHUNK_SIZE = 800
 _DEFAULT_CHUNK_OVERLAP = 100
 
@@ -71,7 +74,7 @@ class KnowledgeBaseRepository:
         name: str,
         slug: str,
         description: str | None = None,
-        embedding_model: str = _DEFAULT_EMBEDDING_MODEL,
+        embedding_model: str | None = None,
         chunk_size: int = _DEFAULT_CHUNK_SIZE,
         chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
     ) -> KnowledgeBase:
@@ -83,6 +86,12 @@ class KnowledgeBaseRepository:
         (service) is responsible for translating that error into a
         409 — this layer only surfaces the raw DB exception.
         """
+        # Resolve the embedding-model default from Settings if the caller
+        # didn't provide it. The KB row is persisted with the resolved
+        # value so it remains correct even if env later changes.
+        if embedding_model is None:
+            embedding_model = get_settings().default_embedding_model
+
         kb = KnowledgeBase(
             id=new_id(),
             tenant_id=tenant_id,

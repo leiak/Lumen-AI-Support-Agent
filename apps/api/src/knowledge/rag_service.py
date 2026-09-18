@@ -116,12 +116,19 @@ class RAGService:
     # answer without blowing its context window.
     DEFAULT_TOP_K = 5
 
-    # Cosine similarity floor. Below 0.3 the chunk is essentially
-    # unrelated to the query under text-embedding-3-small + cosine.
-    # 0.3 was chosen empirically as a reasonable "weakly relevant"
-    # boundary for M1 — low enough to surface partial matches, high
-    # enough to keep obviously-irrelevant chunks out of the prompt.
-    DEFAULT_SCORE_THRESHOLD = 0.3
+    # Cosine similarity floor. Stage 10.3 calibrated this against
+    # the live Doubao ``doubao-embedding-vision`` model using
+    # ``tests/knowledge/eval/rag_eval_set.json`` (20 synthetic
+    # articles, 50 standard + 4 edge-case queries) via
+    # ``make eval-rag-real``. The previous 0.3 default was an
+    # eyeballed estimate from the text-embedding-3-small era; the
+    # threshold-sweep table in ``eval_output_real/eval_report.json``
+    # shows 0.45 hits precision=0.72 / recall=0.84 — clean
+    # separation between on-topic and out-of-topic chunks without
+    # bleeding too much recall. The value still works for
+    # text-embedding-3-small (also produces tighter clusters than
+    # expected at 0.3); re-run the eval if you switch models.
+    DEFAULT_SCORE_THRESHOLD = 0.45
 
     # Cap the injected context to avoid blowing the LLM's context
     # window. 4000 chars ≈ 1000 tokens which leaves headroom for

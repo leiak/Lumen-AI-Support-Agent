@@ -13,8 +13,8 @@ export const SEED = {
   webChannelId: '01HZDEMO00000000000000003',
   conversationId: '01HZDEMO00000000000000004',
 
-  agentEmail: 'agent@demo.test',
-  adminEmail: 'admin@demo.test',
+  agentEmail: 'agent@example.com',
+  adminEmail: 'admin@example.com',
   password: 'Demo123!',
 
   customerExternalId: 'e2e-visitor-001',

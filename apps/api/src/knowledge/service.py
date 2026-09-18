@@ -40,6 +40,7 @@ import re
 
 from sqlalchemy.exc import IntegrityError
 
+from core.config import get_settings
 from core.database import get_sessionmaker
 from core.logging import get_logger
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -173,7 +174,7 @@ class KnowledgeBaseService:
                 slug=slug,
                 description=description,
                 embedding_model=(
-                    embedding_model if embedding_model else "text-embedding-3-small"
+                    embedding_model if embedding_model else get_settings().default_embedding_model
                 ),
                 chunk_size=effective_chunk_size,
                 chunk_overlap=effective_chunk_overlap,

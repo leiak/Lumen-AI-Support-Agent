@@ -81,8 +81,8 @@ Created by `tests/e2e/scripts/seed.py` (idempotent — safe to re-run):
 
 | Role  | Email              | Password   |
 | ----- | ------------------ | ---------- |
-| agent | `agent@demo.test`  | `Demo123!` |
-| admin | `admin@demo.test`  | `Demo123!` |
+| agent | `agent@example.com`  | `Demo123!` |
+| admin | `admin@example.com`  | `Demo123!` |
 
 These exist ONLY in the local dev database. Production MUST NOT ship
 this seed.

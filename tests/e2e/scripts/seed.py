@@ -74,8 +74,8 @@ DEMO_CHANNEL_ID = "01HZDEMO00000000000000003"
 DEMO_CONVERSATION_ID = "01HZDEMO00000000000000004"
 
 # Public demo creds — referenced from the E2E specs and the README.
-DEMO_AGENT_EMAIL = "agent@demo.test"
-DEMO_ADMIN_EMAIL = "admin@demo.test"
+DEMO_AGENT_EMAIL = "agent@example.com"
+DEMO_ADMIN_EMAIL = "admin@example.com"
 DEMO_PASSWORD = "Demo123!"  # meets backend min_length=8.
 
 # A single seeded customer message gives the AI-suggest endpoint a

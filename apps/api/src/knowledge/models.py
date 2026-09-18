@@ -80,6 +80,10 @@ class KnowledgeBase(Base):
     slug: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     embedding_model: Mapped[str] = mapped_column(
+        # SQLAlchemy column-level default. The service layer always
+        # passes an explicit value (resolved from ``Settings.default_embedding_model``
+        # when the caller doesn't), so this default is a defensive
+        # safety net for direct INSERTs (tests, migrations).
         String(100), nullable=False, default="text-embedding-3-small"
     )
     chunk_size: Mapped[int] = mapped_column(

@@ -257,3 +257,10 @@ export function bootIframe(options: BootIframeOptions): IframeHandle {
     },
   };
 }
+
+// Self-boot: this bundle runs inside the iframe (loaded via srcdoc by the
+// parent SDK or as a standalone page in dev). It must register its message
+// listener immediately on load so the parent's `{type:'init', config}`
+// postMessage is caught the moment it arrives. `windowRef.parent` is the
+// parent SDK when embedded, or `window` when loaded standalone.
+bootIframe({ documentRef: document, windowRef: parent });
