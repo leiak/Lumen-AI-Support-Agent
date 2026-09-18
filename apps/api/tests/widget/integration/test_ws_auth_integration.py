@@ -63,6 +63,13 @@ class FakeWebSocket:
         self.close_code: int | None = None
         self.close_reason: str | None = None
         self.accepted: bool = False
+        # The auth router reads ``websocket.headers.get("origin")`` at the
+        # top of the endpoint. The real ``WebSocket`` has a starlette
+        # ``Headers`` mapping; we only need the ``.get`` contract for the
+        # negative tests, so an empty dict suffices. This attribute is the
+        # single source of the 5 collection errors that previously
+        # blocked this module (see Stage 11.1 plan).
+        self.headers: dict[str, str] = {}
 
     async def close(
         self, code: int = 1000, reason: str | None = None

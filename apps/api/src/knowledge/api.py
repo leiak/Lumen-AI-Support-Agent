@@ -245,6 +245,7 @@ async def update_knowledge_base(
 @router.delete(
     "/knowledge-bases/{kb_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
 )
 async def delete_knowledge_base(
     kb_id: str,
@@ -601,6 +602,7 @@ async def update_article(
 @router.delete(
     "/articles/{article_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
 )
 async def delete_article(
     article_id: str,
