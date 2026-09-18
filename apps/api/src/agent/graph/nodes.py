@@ -365,6 +365,7 @@ def make_llm_node(
             )
             return {
                 "final_text": FALLBACK_MESSAGE,
+                "escalated": False,
                 "tool_iterations": iterations,
             }
 
@@ -464,6 +465,7 @@ def make_llm_node(
             )
             return {
                 "final_text": FALLBACK_MESSAGE,
+                "escalated": False,
                 "tool_iterations": iterations,
             }
         except Exception as exc:
@@ -480,6 +482,7 @@ def make_llm_node(
             )
             return {
                 "final_text": FALLBACK_MESSAGE,
+                "escalated": False,
                 "tool_iterations": iterations,
             }
 
@@ -540,6 +543,7 @@ def make_llm_node(
                 )
                 return {
                     "final_text": FALLBACK_MESSAGE,
+                    "escalated": False,
                     "tool_iterations": iterations,
                 }
 
@@ -691,6 +695,7 @@ def make_llm_node(
                 )
                 return {
                     "final_text": FALLBACK_MESSAGE,
+                    "escalated": False,
                     "tool_iterations": iterations,
                 }
             except Exception as exc:
@@ -702,6 +707,7 @@ def make_llm_node(
                 )
                 return {
                     "final_text": FALLBACK_MESSAGE,
+                    "escalated": False,
                     "tool_iterations": iterations,
                 }
 
@@ -715,11 +721,13 @@ def make_llm_node(
             )
             return {
                 "final_text": FALLBACK_MESSAGE,
+                "escalated": False,
                 "tool_iterations": iterations,
             }
 
         return {
             "final_text": response.content,
+            "escalated": False,
             "tool_iterations": iterations,
         }
 

@@ -212,14 +212,11 @@ async def test_search_internal_kb_tool_invoked_through_graph_loop() -> None:
     # ``escalated`` stays False (search_internal_kb is not terminal),
     # ``tool_iterations`` increments once per successful dispatch.
     assert result["final_text"] == "MAGIC_PHRASE_FINAL_ANSWER_DO_X"
-    # ``escalated`` is only written into the return dict on the escalation
-    # short-circuit; the normal text path leaves the key absent (the
-    # graph defaults it to False via the TypedDict). Either way the
-    # contract is "not escalated".
-    assert not result.get("escalated"), (
-        f"expected escalated to be False/absent on normal text path; "
-        f"got {result.get('escalated')!r}"
-    )
+    # ``make_llm_node`` always writes ``escalated`` on every return
+    # path — ``False`` on the normal text / fallback paths, ``True``
+    # on the escalation short-circuit. The contract is a stable
+    # shape so callers can rely on the key being present.
+    assert result["escalated"] is False
     assert result["tool_iterations"] == 1, (
         f"expected exactly one tool dispatch; got "
         f"tool_iterations={result['tool_iterations']}"

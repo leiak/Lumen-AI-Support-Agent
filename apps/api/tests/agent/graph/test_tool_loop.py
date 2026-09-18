@@ -73,6 +73,9 @@ async def test_tool_loop_stops_when_no_tool_calls() -> None:
     result = await node(_state())
 
     assert result["final_text"] == "answer"
+    # Stage 12 / Task 3 — every non-escalation return path now
+    # advertises ``escalated: False`` for a stable caller contract.
+    assert result["escalated"] is False
     # LLM called once (no tool_calls → no second call).
     assert llm.chat.await_count == 1
 
@@ -133,6 +136,9 @@ async def test_tool_loop_handles_one_tool_call_then_done() -> None:
     assert llm.chat.await_count == 2
     # The LLM's second response is what the customer sees.
     assert result["final_text"] == "final answer"
+    # Stage 12 / Task 3 — non-escalation text path advertises
+    # ``escalated: False`` so callers can rely on the key.
+    assert result["escalated"] is False
     # Sanity: the tool was actually called exactly once.
     assert _EchoSpy.call_count == 1
 
@@ -165,6 +171,9 @@ async def test_tool_loop_max_iterations_safety() -> None:
     result = await node(_state())
 
     assert result["final_text"] == FALLBACK_MESSAGE
+    # Stage 12 / Task 3 — every fallback path now advertises
+    # ``escalated: False`` for a stable caller contract.
+    assert result["escalated"] is False
     # Should bail out via max_iterations (5) — exact call count
     # depends on whether the loop counts attempts or successful
     # dispatches; the spec says <= 6 (5 + 1 safety).
@@ -207,3 +216,6 @@ async def test_tool_loop_handles_unknown_tool() -> None:
 
     assert llm.chat.await_count == 2
     assert result["final_text"] == "recovered"
+    # Stage 12 / Task 3 — non-escalation text path advertises
+    # ``escalated: False`` so callers can rely on the key.
+    assert result["escalated"] is False

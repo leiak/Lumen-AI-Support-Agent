@@ -230,6 +230,7 @@ async def test_llm_node_returns_text() -> None:
     result = await node(state)
 
     assert result["final_text"] == "hi"
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -312,6 +313,7 @@ async def test_llm_node_fallback_on_exception() -> None:
     result = await node(state)
 
     assert result["final_text"] == FALLBACK_MESSAGE
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -324,6 +326,7 @@ async def test_llm_node_fallback_on_empty_content() -> None:
     result = await node(state)
 
     assert result["final_text"] == FALLBACK_MESSAGE
+    assert result["escalated"] is False
 
 
 # ----- build_agent_graph --------------------------------------------------
@@ -360,6 +363,7 @@ async def test_end_to_end_graph_flow() -> None:
     result = await graph.ainvoke(dict(state))
 
     assert result["final_text"] == "reset via settings panel"
+    assert result["escalated"] is False
     # The LLM was called exactly once, with the rag context prepended.
     assert client.chat.await_count == 1
     sent = client.chat.await_args.args[0]
@@ -388,6 +392,7 @@ async def test_end_to_end_graph_flow_llm_failure_yields_fallback() -> None:
     result = await graph.ainvoke(dict(state))
 
     assert result["final_text"] == FALLBACK_MESSAGE
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -409,6 +414,7 @@ async def test_end_to_end_graph_flow_rag_failure_yields_no_rag_block() -> None:
     result = await graph.ainvoke(dict(state))
 
     assert result["final_text"] == "ok"
+    assert result["escalated"] is False
     # Only the M1 system prompt + the user turn — no rag block.
     sent = client.chat.await_args.args[0]
     roles = [m.role for m in sent.messages]
@@ -657,8 +663,12 @@ async def test_llm_node_invokes_escalation_tool_on_tool_call() -> None:
 @pytest.mark.asyncio
 async def test_llm_node_no_tool_call_sets_escalated_false() -> None:
     """A plain-text LLM response leaves ``escalated`` False and
-    populates ``final_text`` from the LLM content (no merge key
-    for ``escalated`` — state default is False)."""
+    populates ``final_text`` from the LLM content.
+
+    Stage 12 / Task 3 — the contract tightened: the node now
+    writes ``escalated: False`` into the return dict on every
+    non-escalation path so callers can rely on a stable shape.
+    """
     client = _capturing_llm_client(content="hi from llm")
     node = make_llm_node(
         llm_client_factory=_make_factory(client),
@@ -669,10 +679,7 @@ async def test_llm_node_no_tool_call_sets_escalated_false() -> None:
     result = await node(state)
 
     assert result["final_text"] == "hi from llm"
-    # The node MUST NOT advertise ``escalated: False`` — that's
-    # the state default and including it would couple the test
-    # to internal LangGraph merge semantics.
-    assert "escalated" not in result
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -741,7 +748,10 @@ async def test_llm_node_tool_call_failure_writes_error_to_tool_message_and_conti
     # original ``fallback text`` content of the first response is
     # no longer the final answer.
     assert result["final_text"] == "recovered after error"
-    assert "escalated" not in result
+    # Stage 12 / Task 3 — the normal text path always advertises
+    # ``escalated: False`` (the tool-failure path here lets the LLM
+    # recover, so it never escalates).
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -799,7 +809,12 @@ async def test_graph_routes_to_escalation_node_when_escalated() -> None:
 @pytest.mark.asyncio
 async def test_graph_routes_to_end_when_not_escalated() -> None:
     """End-to-end: normal text path goes straight to END with
-    ``escalated`` left at its default (False)."""
+    ``escalated`` explicitly False.
+
+    Stage 12 / Task 3 — the node now writes ``escalated: False``
+    into every non-escalation return dict so the graph merge
+    sees the key on the conditional-edge lookup.
+    """
     rag_service = _capturing_rag_service()
     client = _capturing_llm_client(content="normal answer")
     graph = build_agent_graph(
@@ -812,10 +827,7 @@ async def test_graph_routes_to_end_when_not_escalated() -> None:
     result = await graph.ainvoke(dict(state))
 
     assert result["final_text"] == "normal answer"
-    # LangGraph fills missing keys with None on the merged state;
-    # the conditional edge treats None as falsy so the test below
-    # documents the observable behaviour.
-    assert not result.get("escalated")
+    assert result["escalated"] is False
 
 
 @pytest.mark.asyncio
@@ -987,6 +999,7 @@ async def test_llm_node_handles_typed_llm_exceptions() -> None:
             result = await node(state)
 
         assert result["final_text"] == FALLBACK_MESSAGE
+        assert result["escalated"] is False
         # The typed-catch path logged a WARNING carrying
         # ``error_type`` matching the exception class name.
         assert capture.has_event("agent.graph.llm_failed")
@@ -1131,6 +1144,9 @@ async def test_llm_node_streams_deltas_when_on_delta_provided() -> None:
     result = await node(state)
 
     assert result["final_text"] == "Hello there"
+    # Stage 12 / Task 3 — non-escalation streaming path advertises
+    # ``escalated: False`` for a stable caller contract.
+    assert result["escalated"] is False
     assert deltas_received == ["Hel", "lo"]
     # stream_chat was used (chat must NOT be invoked on the streaming path)
     assert client.chat.called is False
