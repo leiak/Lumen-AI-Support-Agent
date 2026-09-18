@@ -252,10 +252,123 @@ def make_escalate_tool(
     return escalate_to_human
 
 
+class SearchInternalKbArgs(BaseModel):
+    """Pydantic schema for ``search_internal_kb`` tool arguments."""
+
+    query: str = Field(
+        description=(
+            "Natural-language search query. Will be matched against "
+            "the tenant's knowledge base articles via semantic search."
+        )
+    )
+    kb_slug: str | None = Field(
+        default=None,
+        description=(
+            "Optional KB slug to narrow the search. If omitted, "
+            "searches across ALL knowledge bases the tenant has access to."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        description=(
+            "Number of chunks to return. Clamped to 20 server-side."
+        ),
+    )
+
+
+def make_search_internal_kb_tool(*, rag_service, kb_repository):
+    """Build a configured ``search_internal_kb`` tool.
+
+    Closure-injects ``rag_service`` and ``kb_repository`` so the graph
+    can build this tool ONCE at compile time (Stage 7.4 hoisting
+    pattern). Tenant + conversation ids are read at call time from
+    the same ``_escalation_ctx`` ContextVar that
+    ``make_escalate_tool`` uses — LLM-supplied args never affect
+    tenant isolation.
+
+    PII contract: returns Markdown with article titles + chunk IDs +
+    snippet preview. Never logs query text or KB content. Caller (the
+    LLM node) decides whether the Markdown flows into a ToolMessage.
+    """
+    _rag = rag_service
+    _kb_repo = kb_repository
+
+    @tool("search_internal_kb", args_schema=SearchInternalKbArgs)
+    async def search_internal_kb(
+        query: str,
+        kb_slug: str | None = None,
+        top_k: int = 5,
+    ) -> str:
+        """Search the tenant's internal knowledge base for relevant articles.
+
+        Use this when:
+        - The automatic RAG retrieval didn't surface a relevant article
+        - You want to search a specific knowledge base (e.g. billing-only)
+        - You need a different angle on the customer's question
+
+        Returns Markdown: top-k chunks with article title + score + snippet.
+        """
+        tenant_id, conversation_id = _current_escalation_ids()
+        if not tenant_id or not conversation_id:
+            log.warning(
+                "agent.graph.search_internal_kb_context_missing",
+                error_type="EscalationContextMissing",
+            )
+            return "Error: no active conversation context."
+
+        kb = None
+        if kb_slug and hasattr(_kb_repo, "find_by_slug"):
+            try:
+                kb = await _kb_repo.find_by_slug(tenant_id, kb_slug)
+            except Exception as exc:
+                # KB lookup failure must not break the tool — return no KB
+                # filter and let RAG search across all tenant KBs.
+                log.warning(
+                    "agent.graph.search_internal_kb_kb_lookup_failed",
+                    tenant_id=tenant_id,
+                    kb_slug=kb_slug,
+                    error_type=type(exc).__name__,
+                )
+                kb = None
+
+        try:
+            results = await _rag.retrieve(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                query=query.strip()[:500],
+                knowledge_base_id=kb.id if kb else None,
+                top_k=min(top_k, 20),
+            )
+        except Exception as exc:
+            log.warning(
+                "agent.graph.search_internal_kb_retrieve_failed",
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                error_type=type(exc).__name__,
+            )
+            return "Error: knowledge base is temporarily unavailable."
+
+        if not results:
+            return "No relevant articles found."
+
+        lines = [f"Found {len(results)} result(s):"]
+        for r in results:
+            title = r.get("article_title", "Unknown")
+            score = r.get("score", 0.0)
+            chunk_id = r.get("chunk_id", "")
+            content = (r.get("content") or "")[:200]
+            lines.append(f"- **{title}** (score={score:.2f}, chunk={chunk_id}): {content}")
+        return "\n".join(lines)
+
+    return search_internal_kb
+
+
 # Public surface for tests / future tool additions.
 __all__ = [
     "EscalateArgs",
+    "SearchInternalKbArgs",
     "bind_escalation_context",
     "make_escalate_tool",
+    "make_search_internal_kb_tool",
     "reset_escalation_context",
 ]
