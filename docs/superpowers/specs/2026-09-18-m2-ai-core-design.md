@@ -19,7 +19,7 @@
 | A4 | **Demo-act4** | 3 张新截图(工具调用 / Ticket 详情 / QA 评分 chip) | 0.5 周 |
 | A5 | **README + 状态表** | Stage 12 / 13 / 14 三行 ✅,技术债追加 3-4 条 | 0.5 周 |
 
-**总估**:6-9 周,4 个 Phase 串行(Stage 12 → 13 → 14 → 15)。
+**总估**:6-9 周,3 个实现 Stage(Stage 12 → 13 → 14)+ 1 个 README/recap Stage(Stage 15)串行。
 
 ### 1.2 不做(显式 skip)
 
@@ -97,7 +97,7 @@ M2.B 内容(预计 4-6 周):
 | `agent/graph/nodes.py:llm_node` | `tool_calls[:1]` first-wins → 全 loop,直到 LLM 不再调 tool | M1 技术债 #6 |
 | `conversation/models.py` | 加 `ticket_id: Mapped[str \| None]` 字段 + 索引 | A2 |
 | `channel/inbound.py:_on_ai_message_persisted` | 钩子 enqueue `qa_judge_task` | A3 |
-| `core/config.py` | 加 `qa_judge_model`、`qa_judge_provider`、`qa_score_threshold_alert`(默认 0.3) | A3 |
+| `core/config.py` | 加 `qa_judge_model`、`qa_judge_provider`、`qa_score_threshold_alert`(默认 0.3,任一维度 < 0.3 即 flagged) | A3 |
 | `deploy/docker-compose.yml` | 加 judge provider env vars | A3 |
 
 ---
@@ -242,7 +242,7 @@ async def search_internal_kb(
     results = await rag_service.retrieve(
         tenant_id=ctx.tenant_id,
         conversation_id=ctx.conversation_id,
-        query=query.strip()[:500],        # 截断防注入
+        query=query.strip()[:500],        # 500 字符 = M1 RAGService 上限(对齐)
         knowledge_base_id=kb.id if kb else None,
         top_k=min(top_k, 20),
     )
@@ -253,6 +253,7 @@ async def search_internal_kb(
 - 与 `escalate_to_human` 共享同一 `_current_escalation_ids` ContextVar
 - 与 M1 `retrieve_node` 互补:retrieve_node 自动跑固定一次,这个 tool 让 LLM 主动决定"再查一次或换一个角度"
 - LangChain `@tool` 自动生成 JSON Schema → LLM 知道何时/怎么调
+- `query[:500]` 截断与 M1 `RAGService.retrieve` 已有的输入上限对齐,避免下游 Qdrant 一次性打爆 batch
 
 ### 4.2 Ticket 创建(A2)
 
@@ -334,8 +335,8 @@ Judge prompt:
 | `search_internal_kb` query 注入 | `query.strip()[:500]` + 走 RAG 现有 sanitizer | 静默截断 |
 | Ticket 非法状态转移 | `InvalidTransition` 异常(400) | 前端 toast |
 | 工单超 SLA 未响应 | `qa_sla_alert_worker` 每分钟扫,`lumen_qa_sla_breached_total` inc | dashboard 红条(M3 接 PagerDuty) |
-| Judge LLM 失败 | 重试 3 次仍失败 → `qa_judge_failures_total` inc + 不写 score | metric 暴露 |
-| Judge 超时(>10s) | Arq 重试 3 次后丢弃 | metric |
+| Judge LLM 失败 | 重试 1 次仍失败 → `qa_judge_failures_total` inc + 不写 score | metric 暴露 |
+| Judge 超时(>10s) | Arq 重试 1 次后丢弃 | metric |
 | DB migration 失败 | Alembic 失败 → uvicorn 启动失败,k8s readiness 不就绪(沿用 11.4) | 部署 pause |
 
 ### 5.2 租户隔离
@@ -357,7 +358,8 @@ Judge prompt:
 
 ### 5.5 Judge 输出一致性
 
-- `with_structured_output(JsonSchema)` 强制 JSON Schema,失败重试 1 次(主 LLM 重试 3 次;Judge 失败代价小,让 metric 暴露)
+- `with_structured_output(JsonSchema)` 强制 JSON Schema,失败重试 1 次(主 LLM 重试 3 次;Judge 失败代价小,让 metric 暴露 — M1 design §8.1 "Outbox + 重放"策略的轻量版本)
+- **超时 10s**:Judge 模型是 1-3B 参数小模型,正常 <2s;10s 已是异常。Arq task 默认 timeout 是 60s,我们专门覆盖到 10s,失败立即 metric 暴露 + 不阻塞 worker 队列
 - 分数钳位 `[0,1]`,超界视为 Judge 失败,丢弃
 
 ---
@@ -418,7 +420,7 @@ M2.A 完成时:
 - [ ] `pytest --collect-only` 0 errors
 - [ ] `lumen_qa_*` 指标在 `/metrics` 可见
 - [ ] demo-act4 三张截图存在 `images/`
-- [ ] README 状态表新增 Stage 12 / 13 / 14 三行 ✅
+- [ ] README 状态表新增 Stage 12 / 13 / 14 / 15 四行 ✅
 - [ ] Judge LLM 测试用 mock,生产用 `minimax-m2.7-highspeed`
 - [ ] 1 个真实工单端到端跑通:客户发问 → AI 回复 + tool 调用 + Ticket 自动创建 → QA 评分异步落
 - [ ] M2.B 仍占位,设计上不阻塞
