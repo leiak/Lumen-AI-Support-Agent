@@ -242,16 +242,38 @@ def make_llm_node(
     The returned coroutine:
       1. Assembles the message list:
          ``[SystemMessage(M1_SYSTEM_PROMPT), *rag_messages, *messages]``.
-      2. Calls ``LLMClient.chat()`` — with ``tools=[...]`` schema
-         dicts if ``tools`` was provided to the factory or built
-         from ``conv_service`` + state.
-      3. Dispatches any ``escalate_to_human`` tool call back to the
-         matching LangChain tool. On success sets
-         ``state["escalated"] = True`` and stores the customer-facing
-         message in ``state["escalation_message"]``.
-      4. Returns ``{"final_text": response.content}`` on success or
-         ``{"final_text": FALLBACK_MESSAGE}`` on any exception /
-         empty content (fail-safe).
+      2. Calls ``LLMClient.chat()`` (or ``stream_chat`` when the
+         caller passed an ``on_delta`` callback) — with
+         ``tools=[...]`` schema dicts if ``tools`` was provided to
+         the factory or built from ``conv_service`` + state.
+      3. Dispatches every tool call the LLM emits in a loop (Stage 12
+         Task 2 — pre-Task-2 the node used a ``tool_calls[:1]``
+         first-wins shortcut that dispatched only the first tool
+         call and dropped the rest). For each successful dispatch
+         the node appends a ``ToolMessage``-equivalent
+         ``ChatMessage(role=TOOL, content=...)`` row to the running
+         message list, then re-invokes the LLM via ``client.chat``
+         (loop iterations always use the non-streaming surface —
+         the customer's first-text UX is driven by the *initial*
+         stream; subsequent re-invocations are batched). The loop
+         bails out via :data:`_MAX_TOOL_ITERATIONS` = 5 so a
+         misbehaving provider cannot keep the customer turn alive
+         forever.
+      4. Escalation short-circuit — when a successful
+         ``escalate_to_human`` dispatch lands mid-batch the node
+         returns ``{"escalated": True, "escalation_message": ...}``
+         immediately (no LLM re-invocation) so the graph's
+         conditional edge routes to the escalation terminal.
+         Sibling tool_calls in the same response are logged as
+         ``extra_tool_calls_ignored`` and not dispatched.
+      5. Returns ``{"final_text": response.content}`` on the normal
+         text path or ``{"final_text": FALLBACK_MESSAGE}`` on any
+         exception / empty content (fail-safe).
+
+    Every return path also includes ``tool_iterations`` (read from
+    ``state["tool_iterations"]`` on entry, incremented on each
+    loop dispatch) so downstream metrics can observe the iteration
+    count without parsing log lines.
 
     This node is the last node in the graph and **must never
     raise** — a raise here would crash the graph and leave the
@@ -261,10 +283,33 @@ def make_llm_node(
     ---------------------------
 
     If ``tool.ainvoke(...)`` raises (network blip, transient DB
-    error, etc.) the node logs a WARNING with ``error_type`` and
-    falls back to ``escalated=False`` so the LLM's normal text
-    response (or :data:`FALLBACK_MESSAGE`) is preserved. A failed
-    escalation MUST NOT take down the customer turn.
+    error, unknown tool name, etc.) the node logs a WARNING with
+    ``error_type`` and writes a structured
+    ``"Error: tool '<name>' failed (<error_type>)"`` (or
+    ``"Error: unknown tool '<name>'"``) string into the
+    ToolMessage content. The loop then CONTINUES — the LLM sees
+    the error on the next invocation and can retry, fall back to
+    a text answer, or call a different tool. A failed dispatch
+    NEVER aborts the customer turn.
+
+    The escalation tool is the one exception: ``escalate_to_human``
+    is a *terminal* tool. Once it succeeds the conversation has
+    already been flipped at the DB level by its side effect, so
+    calling the LLM again would only risk the model overriding
+    the escalation. We short-circuit on successful
+    ``escalate_to_human`` dispatch (see step 4 above).
+
+    Streaming-vs-non-streaming split
+    --------------------------------
+
+    The FIRST LLM call uses ``stream_chat`` when ``state`` carries
+    an ``on_delta`` callback so the customer sees incremental text
+    deltas over the WS layer. ALL subsequent re-invocations inside
+    the loop use ``client.chat`` (non-streaming) for determinism —
+    the streaming path's text-delta contract is only meaningful
+    for the initial response. A WS hiccup during the initial
+    stream is logged + ignored so the customer turn still
+    completes.
 
     Parameters
     ----------
@@ -300,6 +345,13 @@ def make_llm_node(
     async def _node(state: AgentState) -> dict[str, Any]:
         tenant_id = state["tenant_id"]
 
+        # Stage 12 / Task 2 — seed the iteration counter from the
+        # state default so the value is observable for metrics /
+        # debugging. The loop increments this on each successful
+        # dispatch; every return path below includes
+        # ``tool_iterations`` so downstream consumers can read it.
+        iterations = int(state.get("tool_iterations") or 0)
+
         # Defensive guard — mirrors the retrieve_node guard.
         # LangGraph fills missing keys with None; an absent
         # ``messages`` list would crash ``_to_llm_chat_message``
@@ -311,7 +363,10 @@ def make_llm_node(
                 tenant_id=tenant_id,
                 conversation_id=state["conversation_id"],
             )
-            return {"final_text": FALLBACK_MESSAGE}
+            return {
+                "final_text": FALLBACK_MESSAGE,
+                "tool_iterations": iterations,
+            }
 
         # Resolve the per-turn toolset. Test wiring passes a
         # pre-built ``tools`` list; production lets the node
@@ -407,7 +462,10 @@ def make_llm_node(
                 conversation_id=state["conversation_id"],
                 error_type=type(exc).__name__,
             )
-            return {"final_text": FALLBACK_MESSAGE}
+            return {
+                "final_text": FALLBACK_MESSAGE,
+                "tool_iterations": iterations,
+            }
         except Exception as exc:
             # Defence-in-depth safety net — should NEVER fire
             # because the typed set above covers every documented
@@ -420,7 +478,10 @@ def make_llm_node(
                 conversation_id=state["conversation_id"],
                 error_type=type(exc).__name__,
             )
-            return {"final_text": FALLBACK_MESSAGE}
+            return {
+                "final_text": FALLBACK_MESSAGE,
+                "tool_iterations": iterations,
+            }
 
         # ---- Tool call loop (Stage 12 / Task 2) -------------------
         # The LLM may decide to invoke zero or more tools before
@@ -457,7 +518,6 @@ def make_llm_node(
         # write the error string into the ToolMessage and continue.
         # PII-safe logging throughout: opaque IDs, error_type
         # names, no message content, no tool args, no tool results.
-        iterations = 0
 
         while True:
             tool_calls = getattr(response, "tool_calls", None) or []
@@ -478,7 +538,10 @@ def make_llm_node(
                     conversation_id=state["conversation_id"],
                     iterations=iterations,
                 )
-                return {"final_text": FALLBACK_MESSAGE}
+                return {
+                    "final_text": FALLBACK_MESSAGE,
+                    "tool_iterations": iterations,
+                }
 
             # Dispatch every tool call in the response. For each
             # dispatch we may either (a) append a ToolMessage and
@@ -589,6 +652,7 @@ def make_llm_node(
                         )
                         if tool_succeeded
                         else tool_result_str,
+                        "tool_iterations": iterations,
                     }
 
                 # Otherwise: append the ToolMessage-equivalent to
@@ -625,7 +689,10 @@ def make_llm_node(
                     conversation_id=state["conversation_id"],
                     error_type=type(exc).__name__,
                 )
-                return {"final_text": FALLBACK_MESSAGE}
+                return {
+                    "final_text": FALLBACK_MESSAGE,
+                    "tool_iterations": iterations,
+                }
             except Exception as exc:
                 log.warning(
                     "agent.graph.llm_failed_unexpected",
@@ -633,7 +700,10 @@ def make_llm_node(
                     conversation_id=state["conversation_id"],
                     error_type=type(exc).__name__,
                 )
-                return {"final_text": FALLBACK_MESSAGE}
+                return {
+                    "final_text": FALLBACK_MESSAGE,
+                    "tool_iterations": iterations,
+                }
 
         # ---- Loop exit (no more tool_calls) -----------------------
         text = response.content.strip() if isinstance(response.content, str) else ""
@@ -643,9 +713,15 @@ def make_llm_node(
                 tenant_id=tenant_id,
                 conversation_id=state["conversation_id"],
             )
-            return {"final_text": FALLBACK_MESSAGE}
+            return {
+                "final_text": FALLBACK_MESSAGE,
+                "tool_iterations": iterations,
+            }
 
-        return {"final_text": response.content}
+        return {
+            "final_text": response.content,
+            "tool_iterations": iterations,
+        }
 
     return _node
 
@@ -682,30 +758,6 @@ def make_escalation_node() -> Callable[
         return {"final_text": message}
 
     return _node
-
-
-def _fallback_to_text(
-    response: Any,
-    tenant_id: str,
-    state: AgentState,
-) -> dict[str, Any]:
-    """Reduce a successful LLM response to its text portion when
-    tool dispatch fails.
-
-    Returns ``{"final_text": <response.content or FALLBACK_MESSAGE>}``
-    — we deliberately do NOT include ``escalated: False`` so the
-    state default propagates. Never raises.
-    """
-    text = getattr(response, "content", None) or ""
-    text = text.strip() if isinstance(text, str) else ""
-    if not text:
-        log.warning(
-            "agent.graph.tool_fallback_empty",
-            tenant_id=tenant_id,
-            conversation_id=state["conversation_id"],
-        )
-        return {"final_text": FALLBACK_MESSAGE}
-    return {"final_text": text}
 
 
 def _extract_tool_args(call: dict[str, Any]) -> dict[str, Any]:

@@ -229,7 +229,7 @@ async def test_llm_node_returns_text() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": "hi"}
+    assert result["final_text"] == "hi"
 
 
 @pytest.mark.asyncio
@@ -311,7 +311,7 @@ async def test_llm_node_fallback_on_exception() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": FALLBACK_MESSAGE}
+    assert result["final_text"] == FALLBACK_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -323,7 +323,7 @@ async def test_llm_node_fallback_on_empty_content() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": FALLBACK_MESSAGE}
+    assert result["final_text"] == FALLBACK_MESSAGE
 
 
 # ----- build_agent_graph --------------------------------------------------
@@ -668,7 +668,7 @@ async def test_llm_node_no_tool_call_sets_escalated_false() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": "hi from llm"}
+    assert result["final_text"] == "hi from llm"
     # The node MUST NOT advertise ``escalated: False`` — that's
     # the state default and including it would couple the test
     # to internal LangGraph merge semantics.
@@ -740,7 +740,7 @@ async def test_llm_node_tool_call_failure_writes_error_to_tool_message_and_conti
     # The LLM's *second* response is what the customer sees; the
     # original ``fallback text`` content of the first response is
     # no longer the final answer.
-    assert result == {"final_text": "recovered after error"}
+    assert result["final_text"] == "recovered after error"
     assert "escalated" not in result
 
 
@@ -838,7 +838,7 @@ async def test_graph_escalation_node_is_trivial_passthrough() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": "Connecting you with a colleague"}
+    assert result["final_text"] == "Connecting you with a colleague"
 
 
 # ----- Stage 7.4: state-machine polish + metrics -------------------------
@@ -917,7 +917,7 @@ async def test_retrieve_node_handles_none_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_node_handles_multiple_tool_calls_first_wins() -> None:
+async def test_llm_node_short_circuits_on_first_successful_escalation() -> None:
     """Stage 7.4 — when the LLM returns 2+ tool calls, the node
     dispatches ONLY the first and logs a WARNING for the rest.
     """
@@ -986,7 +986,7 @@ async def test_llm_node_handles_typed_llm_exceptions() -> None:
         with _StructlogCapture() as capture:
             result = await node(state)
 
-        assert result == {"final_text": FALLBACK_MESSAGE}
+        assert result["final_text"] == FALLBACK_MESSAGE
         # The typed-catch path logged a WARNING carrying
         # ``error_type`` matching the exception class name.
         assert capture.has_event("agent.graph.llm_failed")
@@ -1130,7 +1130,7 @@ async def test_llm_node_streams_deltas_when_on_delta_provided() -> None:
 
     result = await node(state)
 
-    assert result == {"final_text": "Hello there"}
+    assert result["final_text"] == "Hello there"
     assert deltas_received == ["Hel", "lo"]
     # stream_chat was used (chat must NOT be invoked on the streaming path)
     assert client.chat.called is False
