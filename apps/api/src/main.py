@@ -9,11 +9,16 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from core.config import get_settings
-from core.health import aggregate_health
+from core.health import aggregate_health, liveness, readiness
 from core.logging import configure_logging, get_logger
 from core.metrics import prometheus_metrics_middleware, render_metrics
 from core.qdrant import close_qdrant_client
 from core.redis import close_redis, get_redis
+from core.request_context import (
+    bind_request_context,
+    clear_request_context,
+    get_request_id,
+)
 from knowledge.startup import ensure_qdrant_collection
 from llm_client.embeddings import aclose_default_client
 
@@ -70,6 +75,39 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def request_context_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Stage 11.2: bind a per-request id into structlog contextvars.
+
+    Reads ``X-Request-ID`` from the inbound request (clients / upstream
+    proxies use it for end-to-end tracing) or generates a ULID. The id
+    is bound via ``bind_request_context`` which both stores it in the
+    module-level ``ContextVar`` AND calls
+    ``structlog.contextvars.bind_contextvars`` so every log line emitted
+    during the request inherits it automatically (the
+    ``merge_contextvars`` processor is the first link in the structlog
+    chain configured by :func:`core.logging.configure_logging`).
+
+    The id is echoed back in ``X-Request-ID`` so the client can correlate
+    a 5xx response with the server-side log search.
+
+    Order: this middleware runs **before** ``metrics_middleware`` so the
+    request id is available for log lines emitted from inside the metrics
+    middleware (none today, but cheap insurance against future additions).
+    """
+    inbound = request.headers.get("x-request-id")
+    rid = bind_request_context(request_id=inbound)
+    try:
+        response = await call_next(request)
+    finally:
+        clear_request_context()
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+@app.middleware("http")
 async def metrics_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
@@ -79,9 +117,32 @@ async def metrics_middleware(
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    body, all_ok = await aggregate_health()
+    body, all_ok = await readiness()
     # 200 when all components are healthy; 503 when degraded so that load
     # balancers / k8s probes / alerting can detect the failure.
+    return JSONResponse(status_code=200 if all_ok else 503, content=body)
+
+
+@app.get("/health/live")
+async def health_live() -> JSONResponse:
+    """Stage 11.4: process liveness — never touches deps.
+
+    Used by Kubernetes ``livenessProbe``. Returning 200 means "the
+    process is responsive"; a dependency outage MUST NOT cause this
+    endpoint to fail (that would restart pods and amplify the outage).
+    """
+    return JSONResponse(status_code=200, content=liveness())
+
+
+@app.get("/health/ready")
+async def health_ready() -> JSONResponse:
+    """Stage 11.4: dependency readiness — 503 on degraded.
+
+    Used by Kubernetes ``readinessProbe`` / load-balancer health
+    checks. Reflects whether the process can actually serve traffic
+    given the current state of its dependencies.
+    """
+    body, all_ok = await readiness()
     return JSONResponse(status_code=200 if all_ok else 503, content=body)
 
 

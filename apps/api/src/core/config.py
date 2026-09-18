@@ -64,15 +64,47 @@ class Settings(BaseSettings):
     ollama_base_url: str | None = Field(default=None, alias="OLLAMA_BASE_URL")
     default_llm_model: str = Field(default="claude-3-5-sonnet-20241022", alias="DEFAULT_LLM_MODEL")
 
+    # Embedding model used for KB indexing + retrieval. Default mirrors
+    # OpenAI's text-embedding-3-small (1536 dim, cosine). The matching
+    # vector dimension is resolved by ``knowledge.qdrant_client.vector_size_for_model``
+    # at collection-create time — adding a new model requires extending
+    # that dispatch (the failure mode is loud, not silent).
+    default_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        alias="DEFAULT_EMBEDDING_MODEL",
+    )
+
     # MiniMax (OpenAI-compatible). When MINIMAX_API_KEY is set the default LLM
     # factory prefers MiniMax over Anthropic/OpenAI.
     minimax_api_key: str | None = Field(default=None, alias="MINIMAX_API_KEY")
     minimax_base_url: str | None = Field(default=None, alias="MINIMAX_BASE_URL")
     minimax_model: str | None = Field(default=None, alias="MINIMAX_MODEL")
 
+    # Doubao / Volcano Engine Ark (OpenAI-compatible). When DOUBAO_API_KEY
+    # is set the embedding client routes through ``doubao_base_url`` instead
+    # of OpenAI's default. Use ``doubao-embedding`` (1024 dim) or
+    # ``doubao-embedding-large`` (2048 dim) via ``DEFAULT_EMBEDDING_MODEL``.
+    # If DOUBAO_API_KEY is unset the client falls back to ``openai_api_key``.
+    doubao_api_key: str | None = Field(default=None, alias="DOUBAO_API_KEY")
+    doubao_base_url: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/v3",
+        alias="DOUBAO_BASE_URL",
+    )
+
     # Observability
     log_level: str = "INFO"
     service_name: str = "ai-customer-api"
+
+    # Stage 11.4: build-time service version. The Dockerfile passes
+    # ``--build-arg GIT_SHA=$(git rev-parse --short HEAD)`` which surfaces
+    # here as ``SERVICE_VERSION``; the default ``dev`` keeps local
+    # ``uvicorn main:app`` runs from printing a misleading "0.1.0" while
+    # an unreleased commit is in flight.
+    service_version: str = Field(default="dev", alias="SERVICE_VERSION")
+
+    # Build-time git sha. ``GIT_SHA`` is injected by the Dockerfile; not
+    # exposed via /health (the version label is enough for triage).
+    git_sha: str | None = Field(default=None, alias="GIT_SHA")
 
     # CORS / widget origin allowlist (M1: single global allowlist).
     # Applied to both the HTTP CORS middleware and the WebSocket origin

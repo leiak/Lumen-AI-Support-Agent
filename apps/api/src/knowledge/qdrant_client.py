@@ -27,6 +27,44 @@ DEFAULT_VECTOR_SIZE = 1536
 # text-embedding-3-* and matches the spec.
 DEFAULT_DISTANCE = "Cosine"
 
+# Maps an embedding model name to its vector dimensionality. ``vector_size_for_model``
+# consults this table and refuses to guess for unknown entries so a misconfigured
+# ``DEFAULT_EMBEDDING_MODEL`` fails loudly at Qdrant collection-create time
+# instead of silently truncating vectors at upsert. Extend this map when
+# adding new providers (e.g. self-hosted Ollama, Cohere, Voyage, etc.).
+EMBEDDING_VECTOR_SIZES: dict[str, int] = {
+    # OpenAI text-embedding-3 family
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    # OpenAI legacy
+    "text-embedding-ada-002": 1536,
+    # Doubao / Volcano Engine Ark — OpenAI-compatible at /v3/embeddings
+    "doubao-embedding": 1024,
+    "doubao-embedding-large": 2048,
+    # Doubao multimodal (text+image) — only verified dimension for vision variants.
+    # Plain text still works via the OpenAI-compatible endpoint, but full
+    # multimodal input requires code changes (Stage 10+).
+    "doubao-embedding-vision": 2048,
+}
+
+
+def vector_size_for_model(model: str) -> int:
+    """Return the expected vector dimensionality for an embedding model name.
+
+    Raises ``ValueError`` (not ``KeyError``) so a startup-time misconfig
+    surfaces as a clear ``ConfigError`` rather than crashing the Qdrant
+    SDK with a low-level ``UnexpectedResponse``.
+    """
+    try:
+        return EMBEDDING_VECTOR_SIZES[model]
+    except KeyError as e:
+        raise ValueError(
+            f"Unknown embedding model {model!r}. Add it to "
+            "knowledge.qdrant_client.EMBEDDING_VECTOR_SIZES so we know its "
+            "vector dimensionality. Known models: "
+            f"{sorted(EMBEDDING_VECTOR_SIZES)}"
+        ) from e
+
 # Default collection name for chunk embeddings. Single collection for M1;
 # per-tenant / per-KB isolation will come via Qdrant payload filters or
 # aliases (see spec 6.x).

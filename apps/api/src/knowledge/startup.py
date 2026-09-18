@@ -9,11 +9,12 @@ unavailable, and the health endpoint will report the degraded state.
 """
 from __future__ import annotations
 
+from core.config import get_settings
 from core.logging import get_logger
 from knowledge.qdrant_client import (
     DEFAULT_COLLECTION,
     DEFAULT_DISTANCE,
-    DEFAULT_VECTOR_SIZE,
+    vector_size_for_model,
     ensure_collection,
 )
 
@@ -27,16 +28,24 @@ async def ensure_qdrant_collection() -> bool:
     any failure. The return value is informational — callers should
     not abort startup on False; the /health endpoint will surface the
     real status.
+
+    Vector size is derived from the configured embedding model via
+    :func:`knowledge.qdrant_client.vector_size_for_model`. An unknown
+    model raises ``ValueError`` so a misconfigured
+    ``DEFAULT_EMBEDDING_MODEL`` fails loud at boot, not silent later.
     """
+    settings = get_settings()
+    vector_size = vector_size_for_model(settings.default_embedding_model)
     log.info(
         "qdrant.collection.starting",
         collection=DEFAULT_COLLECTION,
-        vector_size=DEFAULT_VECTOR_SIZE,
+        vector_size=vector_size,
         distance=DEFAULT_DISTANCE,
+        embedding_model=settings.default_embedding_model,
     )
     success = await ensure_collection(
         name=DEFAULT_COLLECTION,
-        vector_size=DEFAULT_VECTOR_SIZE,
+        vector_size=vector_size,
         distance=DEFAULT_DISTANCE,
     )
     if success:

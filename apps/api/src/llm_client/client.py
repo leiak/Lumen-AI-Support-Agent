@@ -4,6 +4,7 @@ import random
 import uuid
 from collections.abc import AsyncIterator
 
+from core.business_metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL
 from llm_client.exceptions import (
     InvalidRequest,
     OutputInvalid,
@@ -69,15 +70,65 @@ class LLMClient:
                     completion_tokens=resp.completion_tokens,
                     request_id=request_id,
                 )
+                # Stage 11.3: success metric. We only inc on the final
+                # successful attempt — earlier retries that failed and
+                # bounced are accounted by the failure-path incs below.
+                _provider = self.default_provider.name
+                LLM_CALLS_TOTAL.labels(
+                    provider=_provider, model=resp.model, outcome="success"
+                ).inc()
+                LLM_TOKENS_TOTAL.labels(
+                    provider=_provider, model=resp.model, direction="input"
+                ).inc(resp.prompt_tokens)
+                LLM_TOKENS_TOTAL.labels(
+                    provider=_provider, model=resp.model, direction="output"
+                ).inc(resp.completion_tokens)
                 return resp
-            except (RateLimited, InvalidRequest):
-                # 429 / 4xx: don't retry, propagate immediately
+            except RateLimited as e:
+                # 429: don't retry, propagate immediately. Outcome label
+                # mirrors the exception class name so dashboards can
+                # split "rate_limited" vs "invalid_request" cleanly.
+                LLM_CALLS_TOTAL.labels(
+                    provider=self.default_provider.name,
+                    model=request.model,
+                    outcome="rate_limited",
+                ).inc()
                 raise
-            except (ProviderUnavailable, OutputInvalid) as e:
+            except InvalidRequest as e:
+                # 4xx (other than 429): same as RateLimited — propagate.
+                LLM_CALLS_TOTAL.labels(
+                    provider=self.default_provider.name,
+                    model=request.model,
+                    outcome="invalid_request",
+                ).inc()
+                raise
+            except ProviderUnavailable as e:
+                # 5xx / network: inc the retryable outcome and back off.
+                # We inc once per attempt that hit this branch; the
+                # final-exhaustion raise below is not a separate inc.
+                LLM_CALLS_TOTAL.labels(
+                    provider=self.default_provider.name,
+                    model=request.model,
+                    outcome="unavailable",
+                ).inc()
                 last_exc = e
                 if attempt == max_retries:
                     break
                 # Exponential backoff with jitter: 0..0.5s + 2^attempt, capped at 8s
+                backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
+                await asyncio.sleep(backoff)
+                attempt += 1
+            except OutputInvalid as e:
+                # Provider returned unparseable response. Treat as a
+                # retryable failure (same code path as unavailable).
+                LLM_CALLS_TOTAL.labels(
+                    provider=self.default_provider.name,
+                    model=request.model,
+                    outcome="output_invalid",
+                ).inc()
+                last_exc = e
+                if attempt == max_retries:
+                    break
                 backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
                 await asyncio.sleep(backoff)
                 attempt += 1
@@ -99,14 +150,45 @@ class LLMClient:
         should keep using :meth:`chat`.
         """
         request_id = uuid.uuid4().hex
-        async for item in self.default_provider.stream(request):
-            if isinstance(item, ChatResponse):
-                self.usage.enqueue(
-                    tenant_id=self.tenant_id,
-                    provider=self.default_provider.name,
-                    model=item.model,
-                    prompt_tokens=item.prompt_tokens,
-                    completion_tokens=item.completion_tokens,
-                    request_id=request_id,
-                )
-            yield item
+        provider = self.default_provider.name
+        # Track whether we ever saw a final ChatResponse — if not, the
+        # stream failed (or never produced a terminal chunk) and we
+        # need to inc the failure outcome. Stage 11.3 metric.
+        saw_final_response = False
+        try:
+            async for item in self.default_provider.stream(request):
+                if isinstance(item, ChatResponse):
+                    saw_final_response = True
+                    self.usage.enqueue(
+                        tenant_id=self.tenant_id,
+                        provider=provider,
+                        model=item.model,
+                        prompt_tokens=item.prompt_tokens,
+                        completion_tokens=item.completion_tokens,
+                        request_id=request_id,
+                    )
+                    LLM_CALLS_TOTAL.labels(
+                        provider=provider, model=item.model, outcome="success"
+                    ).inc()
+                    LLM_TOKENS_TOTAL.labels(
+                        provider=provider, model=item.model, direction="input"
+                    ).inc(item.prompt_tokens)
+                    LLM_TOKENS_TOTAL.labels(
+                        provider=provider, model=item.model, direction="output"
+                    ).inc(item.completion_tokens)
+                yield item
+        except (RateLimited, InvalidRequest, ProviderUnavailable, OutputInvalid) as e:
+            # Streaming has no retry: surface the error after recording
+            # the outcome so the metric reflects the failure.
+            outcome_map = {
+                RateLimited: "rate_limited",
+                InvalidRequest: "invalid_request",
+                ProviderUnavailable: "unavailable",
+                OutputInvalid: "output_invalid",
+            }
+            LLM_CALLS_TOTAL.labels(
+                provider=provider,
+                model=request.model,
+                outcome=outcome_map[type(e)],
+            ).inc()
+            raise

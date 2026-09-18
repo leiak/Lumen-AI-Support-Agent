@@ -29,6 +29,7 @@ from conversation.enums import ConversationStatus, MessageRole
 from conversation.exceptions import ConversationNotClaimableError
 from conversation.models import Conversation, Message
 from conversation.repository import ConversationRepository, MessageRepository
+from core.business_metrics import MESSAGES_TOTAL
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 
@@ -458,6 +459,12 @@ class ConversationService:
         await self._repo.touch_last_activity(
             conversation_id=conversation_id, at=now
         )
+        # Stage 11.3: bump the per-role message counter so the
+        # ``/metrics`` endpoint surfaces aggregate conversation throughput.
+        # ``role`` is the StrEnum value (5 fixed labels), so this stays
+        # well within Prometheus cardinality budget. We do NOT label by
+        # tenant_id — that's billing territory, not metric territory.
+        MESSAGES_TOTAL.labels(role=role.value).inc()
         return persisted
 
     async def list_messages(
