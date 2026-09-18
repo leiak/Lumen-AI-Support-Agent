@@ -856,9 +856,11 @@ async def test_respond_escalation_tool_failure_falls_back_to_text(
         )
 
         assert result is not None
-        # Tool failed -> ``_fallback_to_text`` returns the LLM's
-        # content text. Our stub returned empty content for the
-        # tool call, so the fallback message is FALLBACK_MESSAGE.
+        # Tool failed -> the loop feeds the error back to the LLM via
+        # a ToolMessage so the LLM can recover on the next turn (see
+        # ``make_llm_node`` tool loop in ``agent.graph.nodes``).
+        # Our stub returned empty content for the tool call, so the
+        # fallback message is ``FALLBACK_MESSAGE``.
         assert result.role == MessageRole.AI
         assert isinstance(result.content_text, str) and result.content_text, (
             "respond() should return non-empty text after tool failure"
