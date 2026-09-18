@@ -290,7 +290,47 @@ These are the failure modes surfaced during Stages 9.10 / 9.11.
 - For Act 3, refresh `/kb/{kbId}` once after upload so the audience
   sees the `draft → indexing → indexed` transition.
 
+## Recording the demo
+
+The 13 hand-captured screenshots in `images/01_login.png` … `13_widget_chat_active.png`
+are the historical record of the M1 demo flow. For repeatable capture
+without a presenter, use the automated recorder (Stage 11.5):
+
+```bash
+# bash / Git Bash
+bash tests/e2e/scripts/record-demo.sh
+
+# Windows PowerShell
+.\tests\e2e\scripts\record-demo.ps1
+
+# also stitch one GIF per Act (requires ffmpeg on PATH)
+bash tests/e2e/scripts/record-demo.sh --gif
+```
+
+The script drives headless Chromium through the same three Acts as a
+live presenter and writes **11 PNGs** into `images/demo-act{N}-{step}.png`:
+
+| File                                    | Step                          |
+|-----------------------------------------|-------------------------------|
+| `demo-act1-01-widget-closed.png`        | Customer widget closed        |
+| `demo-act1-02-widget-open.png`          | Widget opened, composer empty |
+| `demo-act1-03-widget-chat-active.png`   | Customer asked about password |
+| `demo-act2-01-login-filled.png`         | Agent login filled            |
+| `demo-act2-02-inbox.png`                | Agent inbox                   |
+| `demo-act2-03-conversation-detail.png`  | Conversation detail           |
+| `demo-act2-04-ai-suggestion.png`        | AI suggestion pane populated  |
+| `demo-act2-05-send-reply.png`           | Agent reply sent              |
+| `demo-act3-01-settings.png`             | Admin tenant settings         |
+| `demo-act3-02-kb-list.png`              | KB list page                  |
+| `demo-act3-03-after-upload.png`         | KB upload (PDF ingested)      |
+
+Prerequisites are the same as the Playwright E2E suite (Postgres +
+Redis + Qdrant up, alembic migrated, seed.py run, web-sdk built). The
+script does **not** stitch an `.mp4` — that needs a presenter and an
+audio track; the recorder only automates the clicks.
+
 ---
 
 _Last verified against:_ `apps/web/src/App.tsx`, `tests/e2e/scripts/seed.py`,
-`apps/web-sdk/src/iframe/chat.ts`, `deploy/docker-compose.yml` — September 2026.
+`apps/web-sdk/src/iframe/chat.ts`, `deploy/docker-compose.yml`,
+`tests/e2e/scripts/record-demo.sh` — September 2026.
