@@ -1,0 +1,1 @@
+"""Ticket domain — independent tables, 1:1 with conversations."""

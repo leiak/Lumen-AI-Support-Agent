@@ -46,6 +46,16 @@ class Conversation(Base):
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # Back-pointer to the ticket (if any) opened for this conversation.
+    # Nullable: most conversations never need a ticket. The ticket table
+    # is the source of truth for the 1:1 relationship (UNIQUE on its
+    # conversation_id), so we don't cascade-delete here — deleting a
+    # ticket does not cascade to the conversation.
+    ticket_id: Mapped[str | None] = mapped_column(
+        String(26),
+        ForeignKey("tickets.id"),
+        nullable=True,
+    )
 
     __table_args__ = (
         Index(
