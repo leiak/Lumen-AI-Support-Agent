@@ -23,11 +23,53 @@ carry only ``conversation_id`` + ``text``; the bubble is keyed by
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
+from core.database import get_session
+from ticket.repository import TicketRepository
+from ticket.service import TicketService
+
+
+def _build_ticket_service_factory() -> Callable[[], TicketService]:
+    """Build a lazy ``TicketService`` factory for the customer-inbound hot path.
+
+    The factory is invoked from inside
+    :meth:`ConversationService.record_message` only when a customer
+    message is being recorded. Each invocation opens its own
+    short-lived DB session via :func:`core.database.get_session` so
+    the ticket creation commits independently of the message insert
+    — a ticket-creation failure must NOT fail the customer message
+    ingest (the customer's turn is the product).
+
+    Returns a callable rather than a pre-built ``TicketService``
+    because ``TicketRepository`` requires a session at construction
+    time; deferring construction until the first customer message
+    means we don't open a DB session at module import / process
+    start.
+    """
+    def _factory() -> TicketService:
+        # ``get_session()`` opens its own short-lived session that
+        # commits on exit. ``TicketService.create`` will call
+        # ``repo.create`` (which flushes) — when the session exits
+        # the commit fires and the ticket is durable. Subsequent
+        # ``get_for_conversation`` queries on the same session are
+        # fine because ``get_session()`` is called fresh each time.
+        # We use the sessionmaker directly so the
+        # ``TicketRepository`` can take an explicit session.
+        from core.database import get_sessionmaker
+
+        session = get_sessionmaker()()
+        return TicketService(
+            repo=TicketRepository(session),
+            sla_policy_default_minutes=60,
+        )
+
+    return _factory
+
 
 # The shared process-wide connection table. Imported by reference (not
 # instantiated here) so that widget.ws.router — which owns the connection
@@ -122,7 +164,20 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
     Returns nothing. A ``None`` from ``find_or_create_for_inbound`` indicates
     the cross-tenant guard tripped — we log and drop.
     """
-    conv_service = ConversationService()
+    conv_service = ConversationService(
+        # Task 6 (M2.A): inject a LAZY ticket-service factory so the
+        # FIRST CUSTOMER message in each conversation auto-creates a
+        # Ticket. The factory is invoked from inside
+        # ``ConversationService.record_message`` only when a customer
+        # message is being recorded — agent-reply and escalation paths
+        # never trigger it.
+        #
+        # The factory opens its own short-lived DB session via
+        # ``get_session()`` so the ticket creation commits
+        # independently of the message insert (a ticket-creation
+        # failure must NOT fail the customer message ingest).
+        ticket_service_factory=_build_ticket_service_factory(),
+    )
     try:
         conversation = await conv_service.find_or_create_for_inbound(
             tenant_id=envelope.tenant_id,

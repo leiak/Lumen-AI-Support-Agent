@@ -28,7 +28,14 @@ const ARTIFACTS = join(HERE, '..', 'artifacts');
 export async function captureFlow(
   page: Page,
   testInfo: TestInfo,
-  name: 'agent-flow-complete' | 'widget-flow-complete',
+  name:
+    | 'agent-flow-complete'
+    | 'widget-flow-complete'
+    // Stage 13 / Task 6 (M2.A): ticket detail flow. The frontend
+    // page does not exist yet — the demo-act4-02.spec.ts spec is
+    // shipped as a stub (skipped) so the contract is in place when
+    // the M2.A frontend ships.
+    | 'ticket-detail-complete',
 ): Promise<void> {
   await mkdir(ARTIFACTS, { recursive: true });
   const filePath = join(ARTIFACTS, `${name}.png`);

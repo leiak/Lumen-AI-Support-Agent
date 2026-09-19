@@ -158,6 +158,7 @@ from channel.api import router as channels_router  # noqa: E402
 from channel.feishu.webhook import router as feishu_webhook_router  # noqa: E402
 from conversation.api import router as conversations_router  # noqa: E402
 from knowledge.api import router as knowledge_router  # noqa: E402
+from ticket.api import router as tickets_router  # noqa: E402
 from widget.api import router as widget_router  # noqa: E402
 from widget.ws.router import router as widget_ws_router  # noqa: E402
 
@@ -168,5 +169,6 @@ app.include_router(channels_router)
 app.include_router(conversations_router)
 app.include_router(feishu_webhook_router)
 app.include_router(knowledge_router)
+app.include_router(tickets_router)
 app.include_router(widget_router)
 app.include_router(widget_ws_router)

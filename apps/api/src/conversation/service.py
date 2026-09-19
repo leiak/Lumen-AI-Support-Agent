@@ -15,13 +15,18 @@ channel adapters (Task 5.2), and the persistence layer
   exception of `record_message`, which raises `ValueError` because the
   caller is the API or channel-adapter boundary and should fail loud
   on tenant mismatch).
+- auto-creating a Ticket on the first CUSTOMER message in a
+  conversation (Task 6, M2.A). The ``ticket_service`` is OPTIONAL —
+  callers that don't pass one (e.g. agent-reply and escalation paths)
+  simply skip the auto-create. Only ``channel.inbound`` injects a
+  TicketService so the customer-inbound hot path generates tickets.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
 
@@ -30,10 +35,72 @@ from conversation.exceptions import ConversationNotClaimableError
 from conversation.models import Conversation, Message
 from conversation.repository import ConversationRepository, MessageRepository
 from core.business_metrics import MESSAGES_TOTAL
-from core.database import get_sessionmaker
+from core.database import get_session, get_sessionmaker
 from core.id_gen import new_id
 
+if TYPE_CHECKING:
+    from ticket.service import TicketService
+
 logger = logging.getLogger(__name__)
+
+
+async def _try_auto_create_ticket(
+    *,
+    factory: Callable[[], "TicketService | None"],
+    tenant_id: str,
+    conversation_id: str,
+    content_text: str,
+) -> None:
+    """Best-effort ticket auto-create hook invoked from ``record_message``.
+
+    Pulled out of ``ConversationService.record_message`` so the
+    customer-inbound hot path stays readable. The factory is invoked
+    lazily so tests that mock ``ConversationService`` never construct
+    a real TicketService at kwargs time.
+
+    All exceptions are caught and logged at WARNING with opaque IDs
+    only — a ticket-creation failure must NOT fail the customer
+    message ingest (the customer's turn is the product).
+    """
+    try:
+        ticket_svc = factory()
+    except Exception as exc:
+        logger.warning(
+            "conversation ticket factory construction failed",
+            extra={
+                "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return
+    if ticket_svc is None:
+        return
+    try:
+        existing = await ticket_svc.repo.get_for_conversation(
+            conversation_id, tenant_id=tenant_id
+        )
+        if existing is not None:
+            return
+        # ``subject`` is the first 120 chars of the customer message —
+        # PII; we pass it to ``TicketService.create`` only and never
+        # log it. The existing ``ticket_created`` log line in
+        # ``TicketService.create`` carries opaque IDs only.
+        subject = (content_text or "Customer inquiry")[:120]
+        await ticket_svc.create(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            subject=subject,
+        )
+    except Exception as exc:
+        logger.warning(
+            "conversation ticket auto-create failed",
+            extra={
+                "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
+                "error_type": type(exc).__name__,
+            },
+        )
 
 # Default and hard-cap page sizes used by the service layer for tenant /
 # message listing. The repositories' own defaults may differ (see the
@@ -57,6 +124,15 @@ class ConversationService:
         self._repo = repo or ConversationRepository()
         self._message_repo = message_repo or MessageRepository()
         self._clock = clock or (lambda: datetime.now(UTC))
+        # Optional auto-create hook for Tickets (Task 6, M2.A). Set
+        # to a callable that returns a ``TicketService`` (or None to
+        # opt out). The callable is invoked LAZILY inside
+        # ``record_message`` so tests that mock ``ConversationService``
+        # don't pay the cost of constructing one — and so we don't
+        # require a live DB to instantiate a service that might never
+        # be used. ``channel.inbound`` wires this up; agent-reply /
+        # escalation paths leave it None.
+        self._ticket_service_factory: Callable[[], "TicketService | None"] | None = None
 
     # ---- Inbound / lookup ----
 
@@ -465,6 +541,32 @@ class ConversationService:
         # well within Prometheus cardinality budget. We do NOT label by
         # tenant_id — that's billing territory, not metric territory.
         MESSAGES_TOTAL.labels(role=role.value).inc()
+
+        # Task 6 (M2.A): auto-create a Ticket on the first CUSTOMER
+        # message in a conversation. Only the customer-inbound path
+        # wires ``_ticket_service_factory``; agent-reply and
+        # escalation paths leave it None and this branch is a no-op.
+        #
+        # The factory is invoked lazily so tests that mock
+        # ``ConversationService`` never construct a TicketService at
+        # kwargs-evaluation time (which would force a DB connection
+        # during the test's monkeypatch setup).
+        #
+        # ``subject`` is the first 120 chars of the customer message —
+        # that's PII. We pass it to ``TicketService.create`` only;
+        # NEVER log it (the existing ``ticket_created`` log line in
+        # ``TicketService.create`` carries opaque IDs only).
+        if (
+            role == MessageRole.CUSTOMER
+            and self._ticket_service_factory is not None
+        ):
+            await _try_auto_create_ticket(
+                factory=self._ticket_service_factory,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                content_text=content_text,
+            )
+
         return persisted
 
     async def list_messages(

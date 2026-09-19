@@ -134,6 +134,38 @@ class TicketRepository:
         await self.session.flush()
         return ticket
 
+    async def list_events(
+        self, ticket_id: str, *, tenant_id: str
+    ) -> list[TicketEvent]:
+        """Return events for ``ticket_id`` ordered by ``created_at DESC``.
+
+        Defence-in-depth: we first call :meth:`get_by_id` to confirm
+        the ticket is visible to ``tenant_id``. A cross-tenant or
+        missing ticket yields ``[]`` rather than an empty result set
+        built from a hidden cross-tenant match — even though the
+        ``ticket_id`` is an opaque ULID, this keeps tenant scoping
+        symmetric with the rest of the repo.
+
+        Tenant-scoped on the WHERE clause for the events query too
+        (belt + braces — the FK already guarantees the event's
+        ``ticket_id`` belongs to a real ticket, and the ticket's
+        ``tenant_id`` matches ``events.tenant_id`` by FK cascade,
+        but an explicit clause makes the contract clear at the
+        query site).
+        """
+        ticket = await self.get_by_id(ticket_id, tenant_id=tenant_id)
+        if ticket is None:
+            return []
+        stmt = (
+            select(TicketEvent)
+            .where(
+                TicketEvent.ticket_id == ticket_id,
+                TicketEvent.tenant_id == tenant_id,
+            )
+            .order_by(TicketEvent.created_at.desc())
+        )
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def delete_by_id(
         self, ticket_id: str, *, tenant_id: str
     ) -> bool:
