@@ -164,21 +164,21 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
     Returns nothing. A ``None`` from ``find_or_create_for_inbound`` indicates
     the cross-tenant guard tripped — we log and drop.
     """
-    conv_service = ConversationService(
-        # Task 6 (M2.A): inject a LAZY ticket-service factory so the
-        # FIRST CUSTOMER message in each conversation auto-creates a
-        # Ticket. The factory is invoked from inside
-        # ``ConversationService.record_message`` only when a customer
-        # message is being recorded — agent-reply and escalation paths
-        # never trigger it.
-        #
-        # The factory opens its own short-lived DB session via
-        # ``get_session()`` so the ticket creation commits
-        # independently of the message insert (a ticket-creation
-        # failure must NOT fail the customer message ingest).
-        ticket_service_factory=_build_ticket_service_factory(),
-    )
     try:
+        conv_service = ConversationService(
+            # Task 6 (M2.A): inject a LAZY ticket-service factory so the
+            # FIRST CUSTOMER message in each conversation auto-creates a
+            # Ticket. The factory is invoked from inside
+            # ``ConversationService.record_message`` only when a customer
+            # message is being recorded — agent-reply and escalation paths
+            # never trigger it.
+            #
+            # The factory opens its own short-lived DB session via
+            # ``get_session()`` so the ticket creation commits
+            # independently of the message insert (a ticket-creation
+            # failure must NOT fail the customer message ingest).
+            ticket_service_factory=_build_ticket_service_factory(),
+        )
         conversation = await conv_service.find_or_create_for_inbound(
             tenant_id=envelope.tenant_id,
             channel_id=envelope.channel_id,

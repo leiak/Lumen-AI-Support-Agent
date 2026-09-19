@@ -120,6 +120,7 @@ class ConversationService:
         message_repo: MessageRepository | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
+        ticket_service_factory: Callable[[], "TicketService | None"] | None = None,
     ) -> None:
         self._repo = repo or ConversationRepository()
         self._message_repo = message_repo or MessageRepository()
@@ -132,7 +133,7 @@ class ConversationService:
         # require a live DB to instantiate a service that might never
         # be used. ``channel.inbound`` wires this up; agent-reply /
         # escalation paths leave it None.
-        self._ticket_service_factory: Callable[[], "TicketService | None"] | None = None
+        self._ticket_service_factory = ticket_service_factory
 
     # ---- Inbound / lookup ----
 

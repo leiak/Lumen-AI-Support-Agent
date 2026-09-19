@@ -748,3 +748,157 @@ async def test_claim_raises_not_claimable_for_already_claimed(
     session.commit.assert_not_called()
     # The prior agent assignment was NOT overwritten.
     assert conv.assigned_agent_id == "u_other"
+
+
+# ---------------------------------------------------------------------------
+# Stage 13 Task 6 — auto-create-ticket hook smoke tests
+# ---------------------------------------------------------------------------
+#
+# Task 6 code review (commit c281494) flagged that ``_try_auto_create_ticket``
+# had zero test coverage, and that the headline feature (first customer
+# message auto-creates a Ticket) was unreachable because the factory kwarg
+# was never bound to the ConversationService attribute. These tests pin the
+# contract going forward so the next regression is caught at unit-test
+# time, not by a 500 in production.
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_calls_factory_and_creates(monkeypatch):
+    """Happy path: factory returns a TicketService that successfully creates."""
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
+    fake_svc.create = AsyncMock()
+
+    factory_calls = []
+
+    def factory():
+        factory_calls.append(())
+        return fake_svc
+
+    await service_module._try_auto_create_ticket(
+        factory=factory,
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text="How do I reset my password?",
+    )
+
+    assert len(factory_calls) == 1
+    fake_svc.repo.get_for_conversation.assert_awaited_once_with(
+        "c1", tenant_id="t1"
+    )
+    fake_svc.create.assert_awaited_once_with(
+        tenant_id="t1",
+        conversation_id="c1",
+        subject="How do I reset my password?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
+    """Existing ticket for the conversation -> create is NOT called."""
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(
+        return_value=MagicMock(id="t-existing")
+    )
+    fake_svc.create = AsyncMock()
+
+    await service_module._try_auto_create_ticket(
+        factory=lambda: fake_svc,
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text="Another message",
+    )
+
+    fake_svc.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_handles_factory_returning_none():
+    """Factory returning None (opt-out) -> no create call, no exception."""
+    await service_module._try_auto_create_ticket(
+        factory=lambda: None,
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text="msg",
+    )
+    # No assertion needed — just confirm no exception leaks.
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_swallows_factory_construct_failure(caplog):
+    """Factory raising -> WARNING logged, no exception bubbles up."""
+    def bad_factory():
+        raise RuntimeError("db down")
+
+    with caplog.at_level("WARNING"):
+        await service_module._try_auto_create_ticket(
+            factory=bad_factory,
+            tenant_id="t1",
+            conversation_id="c1",
+            content_text="msg",
+        )
+    # WARNING must include opaque IDs (conversation_id, tenant_id) but
+    # NOT the content_text. The structlog formatter merges extra kwargs
+    # onto the record's __dict__, so we assert on the extra keys
+    # directly rather than substring matching (which would also match
+    # parameter names like 'content_text').
+    matching = [
+        r for r in caplog.records
+        if "factory construction failed" in r.getMessage()
+    ]
+    assert matching, "expected a factory-construction-failed WARNING"
+    for r in matching:
+        # The extra kwargs we passed should be on the record
+        assert getattr(r, "conversation_id", None) == "c1"
+        assert getattr(r, "tenant_id", None) == "t1"
+        # The content_text should NOT be present
+        assert not hasattr(r, "content_text")
+        assert not hasattr(r, "subject")
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_swallows_create_failure(caplog):
+    """ticket_svc.create raising -> WARNING logged, no exception bubbles up."""
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
+    fake_svc.create = AsyncMock(side_effect=RuntimeError("FK violation"))
+
+    with caplog.at_level("WARNING"):
+        await service_module._try_auto_create_ticket(
+            factory=lambda: fake_svc,
+            tenant_id="t1",
+            conversation_id="c1",
+            content_text="msg",
+        )
+    assert any("auto-create failed" in str(r.__dict__) for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_try_auto_create_ticket_truncates_subject_to_120_chars():
+    """Subject passed to create is content_text[:120]; never logs the body."""
+    long_text = "x" * 500
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
+    fake_svc.create = AsyncMock()
+
+    await service_module._try_auto_create_ticket(
+        factory=lambda: fake_svc,
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text=long_text,
+    )
+
+    call = fake_svc.create.await_args
+    assert len(call.kwargs["subject"]) == 120
+    assert call.kwargs["subject"] == "x" * 120
+
+
+def test_conversation_service_accepts_ticket_service_factory_kwarg():
+    """Regression guard: the factory kwarg MUST bind to the attribute.
+
+    Task 6 review caught this — without this test, a future refactor that
+    drops the kwarg would silently break the entire auto-create feature.
+    """
+    factory = lambda: None
+    svc = ConversationService(ticket_service_factory=factory)
+    assert svc._ticket_service_factory is factory
