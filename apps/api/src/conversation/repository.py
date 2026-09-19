@@ -25,7 +25,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from conversation.enums import ConversationStatus
+from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
 from core.database import get_session
 
@@ -347,3 +347,38 @@ class MessageRepository:
             )
             result = await session.execute(stmt)
             return int(result.scalar() or 0)
+
+    async def get_last_customer_message(
+        self, *, conversation_id: str, tenant_id: str
+    ) -> Message | None:
+        """Return the most recent CUSTOMER message in a conversation, or None.
+
+        Used by the QA judge worker (Stage 14 / Task 8) to pull the
+        "question" half of the ``(question, answer)`` pair that the
+        Judge LLM scores. Tenant-scoped on the WHERE clause so a
+        cross-tenant ``conversation_id`` returns ``None`` (the
+        conversation service layer is the real boundary — this is
+        defence in depth).
+
+        ``created_at DESC, id DESC`` tiebreak: if two customer
+        messages share a timestamp (rare but possible under
+        timestamp truncation), the more recent ``id`` wins so the
+        "last" message is deterministic.
+        """
+        async with get_session() as session:
+            stmt = (
+                select(Message)
+                .where(
+                    Message.conversation_id == conversation_id,
+                    Message.role == MessageRole.CUSTOMER,
+                    Message.conversation_id.in_(
+                        select(Conversation.id).where(
+                            Conversation.tenant_id == tenant_id
+                        )
+                    ),
+                )
+                .order_by(Message.created_at.desc(), Message.id.desc())
+                .limit(1)
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()

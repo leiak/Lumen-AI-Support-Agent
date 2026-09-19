@@ -30,6 +30,8 @@ from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
 from core.database import get_session
+from core.logging import get_logger
+from qa.worker import build_arq_redis
 from ticket.repository import TicketRepository
 from ticket.service import TicketService
 
@@ -153,6 +155,48 @@ async def _broadcast_ai_complete(
         )
 
 
+async def _enqueue_qa_judge(*, message_id: str, tenant_id: str) -> None:
+    """Stage 14 / Task 8 — enqueue a QA judge task for one AI message.
+
+    Best-effort: a Redis outage must NEVER fail the customer-facing
+    webhook. The AI message is already durably persisted at this
+    point; if Redis is down, the judge job is simply lost (the
+    scoring is an observability signal, not a correctness
+    requirement on the customer path). An operator can replay
+    scoring by re-enqueueing past message ids via a Stage 15+
+    backfill script.
+
+    ``ArqRedis.from_url`` is invoked per-call so we don't carry a
+    long-lived Redis pool across the inbound hot path (the same
+    pattern as ``core.redis.get_redis`` — the connection itself is
+    lazy and reuses one socket once ``enqueue_job`` is awaited).
+    """
+    try:
+        arq_redis = build_arq_redis()
+    except Exception as exc:
+        logger.warning(
+            "channel inbound: QA enqueue setup failed",
+            extra={
+                "message_id": message_id,
+                "tenant_id": tenant_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return
+    try:
+        await arq_redis.enqueue_job("qa_judge_task", message_id)
+    except Exception as exc:
+        logger.warning(
+            "channel inbound: QA enqueue failed",
+            extra={
+                "message_id": message_id,
+                "tenant_id": tenant_id,
+                "error_type": type(exc).__name__,
+            },
+        )
+        return
+
+
 async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
     """Find-or-create the conversation for the inbound envelope and persist the message.
 
@@ -239,6 +283,13 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
                     message_id=ai_message.id,
                     role=ai_response.role,
                     content=ai_response.content_text,
+                )
+                # Stage 14 / Task 8 — non-blocking enqueue of the QA
+                # judge task. Wrapped by ``_enqueue_qa_judge`` so a
+                # Redis outage can't fail the customer webhook.
+                await _enqueue_qa_judge(
+                    message_id=ai_message.id,
+                    tenant_id=envelope.tenant_id,
                 )
                 logger.info(
                     "channel inbound: AI auto-response recorded",
