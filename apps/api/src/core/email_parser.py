@@ -92,11 +92,24 @@ def parse_ses_inbound(payload: bytes) -> ParsedEmail | None:
 
     content_raw = data.get("content", "")
     body_text = content_raw
-    if isinstance(content_raw, str) and content_raw.startswith("{"):
+    # Defensive: SES occasionally returns content as a dict (nested MIME parts
+    # or wrapper objects) instead of a string. Slicing a dict would raise
+    # TypeError. Per parser contract, return None for malformed payloads.
+    if not isinstance(body_text, str):
+        if isinstance(body_text, dict):
+            body_text = body_text.get("data", "") or ""
+            if not isinstance(body_text, str):
+                return None
+        else:
+            return None
+    if isinstance(body_text, str) and body_text.startswith("{"):
         # SES sometimes wraps MIME parts in a nested JSON
         try:
-            nested = json.loads(content_raw)
-            body_text = nested.get("data", content_raw)
+            nested = json.loads(body_text)
+            if isinstance(nested, dict):
+                inner = nested.get("data", body_text)
+                if isinstance(inner, str):
+                    body_text = inner
         except json.JSONDecodeError:
             pass
 

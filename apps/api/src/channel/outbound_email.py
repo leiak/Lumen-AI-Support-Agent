@@ -22,7 +22,30 @@ logger = logging.getLogger(__name__)
 
 
 class EmailSendError(Exception):
-    """Raised when SES SendEmail fails after retries."""
+    """Raised when SES SendEmail fails after retries.
+
+    Attributes:
+        status_code: HTTP status code if the failure was an HTTP response,
+            None if it was a network-level error (timeout, connection refused).
+        error_type: Bounded label for dashboards ('SES4xx' / 'SES5xx' /
+            'timeout' / 'connect_error' / 'unknown'). Mirrors the
+            `error_type` field in the corresponding log extra so callers
+            and dashboards can correlate.
+        attempts: Number of attempts made before giving up (for observability).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_type: str | None = None,
+        attempts: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_type = error_type
+        self.attempts = attempts
 
 
 class EmailOutbound:
@@ -113,15 +136,26 @@ class EmailOutbound:
                             },
                         )
                         raise EmailSendError(
-                            f"SES 4xx: {resp.status_code} {resp.text[:200]}"
+                            f"SES 4xx: {resp.status_code} {resp.text[:200]}",
+                            status_code=resp.status_code,
+                            error_type="SES4xx",
+                            attempts=attempt + 1,
                         )
 
                     # 5xx: retry
                     last_exc = EmailSendError(
-                        f"SES 5xx: {resp.status_code} {resp.text[:200]}"
+                        f"SES 5xx: {resp.status_code} {resp.text[:200]}",
+                        status_code=resp.status_code,
+                        error_type="SES5xx",
+                        attempts=attempt + 1,
                     )
-            except (httpx.HTTPError, TimeoutError) as e:
-                last_exc = e
+            except (httpx.HTTPError, asyncio.TimeoutError) as e:
+                err_label = "timeout" if isinstance(e, asyncio.TimeoutError) else "connect_error"
+                last_exc = EmailSendError(
+                    f"SES network: {err_label}",
+                    error_type=err_label,
+                    attempts=attempt + 1,
+                )
 
             # Exponential backoff (0.5s, 1s, 2s) — capped
             if attempt < self._max_retries - 1:
@@ -130,11 +164,17 @@ class EmailOutbound:
         # PII: no email address in logs (M1 discipline). tenant_id + error class
         # are sufficient for triage; the destination can be looked up via the
         # SES SendEmail MessageId in the SES suppression / bounce dashboard.
+        final = EmailSendError(
+            f"SES exhausted retries: {last_exc}",
+            status_code=getattr(last_exc, "status_code", None),
+            error_type=getattr(last_exc, "error_type", None) or "exhausted",
+            attempts=self._max_retries,
+        )
         logger.warning(
             "email.outbound.exhausted_retries",
             extra={
                 "tenant_id": tenant_id,
-                "error_type": type(last_exc).__name__ if last_exc else "unknown",
+                "error_type": final.error_type,
             },
         )
-        raise EmailSendError(f"SES exhausted retries: {last_exc}")
+        raise final

@@ -121,3 +121,25 @@ async def test_send_reply_returns_message_id(outbound):
             in_reply_to=None, references=[],
         )
     assert msg_id == "ses-xyz-789"
+
+
+@pytest.mark.asyncio
+async def test_send_reply_error_carries_status_code(outbound):
+    """EmailSendError must expose status_code + error_type for downstream handling."""
+    async def fake_post(url, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 403
+        resp.text = "AccessDenied"
+        return resp
+
+    with patch("httpx.AsyncClient.post", side_effect=fake_post):
+        with pytest.raises(EmailSendError) as exc_info:
+            await outbound.send_reply(
+                tenant_id="t1", to_email="a@x.com",
+                subject="s", body_text="b",
+                in_reply_to=None, references=[],
+            )
+    err = exc_info.value
+    assert err.status_code == 403
+    assert err.error_type == "SES4xx"
+    assert err.attempts == 1  # 4xx doesn't retry
