@@ -278,7 +278,13 @@ async def test_qa_judge_increments_failures_on_judge_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_qa_judge_increments_failures_on_unexpected_exception() -> None:
-    """Any non-``JudgeFailure`` exception → ``LUMEN_QA_FAILURES{reason=exc_type}``."""
+    """Any non-``JudgeFailure`` exception → ``LUMEN_QA_FAILURES{reason=exception}``.
+
+    Reason label is mapped to the documented cardinality-bounded set
+    (``timeout / malformed / structured_output_invalid / exception``)
+    instead of leaking ``type(exc).__name__`` as a Prometheus label.
+    See :mod:`core.business_metrics` for the budget.
+    """
     session = _make_session()
     msg = _make_message()
     conv = _make_conversation()
@@ -308,7 +314,146 @@ async def test_qa_judge_increments_failures_on_unexpected_exception() -> None:
         await qa_judge_task(ctx, "m1")
 
     fake_qa_repo.insert.assert_not_called()
-    mock_failures.labels.assert_called_with(reason="RuntimeError")
+    # RuntimeError → "exception" (documented fallback label).
+    mock_failures.labels.assert_called_with(reason="exception")
+
+
+@pytest.mark.asyncio
+async def test_qa_judge_increments_duplicate_metric_on_integrity_error() -> None:
+    """Two workers race on the same message: the loser hits the DB
+    UNIQUE constraint, increments
+    ``LUMEN_QA_FAILURES{reason='duplicate'}``, and returns cleanly
+    (does NOT propagate the IntegrityError).
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    session = _make_session()
+    msg = _make_message()
+    conv = _make_conversation()
+    session.get = AsyncMock(side_effect=[msg, conv])
+
+    judge_output = JudgeOutput(
+        relevance=0.9,
+        safety=0.95,
+        faithfulness=0.85,
+        rationale="good answer",
+    )
+    judge = _make_judge(output=judge_output)
+    judge.is_flagged = MagicMock(return_value=False)
+    ctx: dict[str, Any] = {"judge_client": judge}
+
+    # First insert succeeds, second insert (loser of the race) hits the
+    # UNIQUE constraint. We model the loser by raising IntegrityError
+    # on the insert call directly.
+    fake_qa_repo = MagicMock()
+    fake_qa_repo.exists_for_message = AsyncMock(return_value=False)
+    fake_qa_repo.insert = AsyncMock(
+        side_effect=IntegrityError("insert", None, None)
+    )
+
+    fake_msg_repo = MagicMock()
+    fake_msg_repo.get_last_customer_message = AsyncMock(
+        return_value=_make_message(role=MessageRole.CUSTOMER)
+    )
+
+    with _patch_sessionmaker(session), \
+         patch("qa.worker.QaScoreRepository", return_value=fake_qa_repo), \
+         patch("qa.worker.MessageRepository", return_value=fake_msg_repo), \
+         patch("qa.worker.LUMEN_QA_FAILURES") as mock_failures, \
+         patch("qa.worker.LUMEN_QA_SCORE_LATENCY") as mock_latency, \
+         patch("qa.worker.LUMEN_QA_SCORES") as mock_scores, \
+         patch("qa.worker.LUMEN_QA_FLAGGED") as mock_flagged:
+        mock_latency.time.return_value = _DummyCM()
+        mock_failures.labels.return_value.inc = MagicMock()
+        mock_scores.labels.return_value.inc = MagicMock()
+
+        # Must not raise — the worker catches the IntegrityError and
+        # increments ``reason="duplicate"`` cleanly.
+        await qa_judge_task(ctx, "m1")
+
+    # Insert was attempted (the race reached this point).
+    fake_qa_repo.insert.assert_awaited_once()
+    # Failure counter bumped with the documented "duplicate" reason.
+    mock_failures.labels.assert_called_with(reason="duplicate")
+    # No score/flagged increments because the row never landed.
+    mock_scores.labels.assert_not_called()
+    mock_flagged.inc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_qa_judge_maps_exception_types_to_documented_reason_labels() -> None:
+    """Unexpected exceptions map to bounded reason labels (not
+    ``type(exc).__name__``) to respect the cardinality budget
+    documented in :mod:`core.business_metrics`.
+
+    Covers at least:
+
+    * ``asyncio.TimeoutError`` → ``"timeout"``
+    * ``RuntimeError`` → ``"exception"`` (fallback for unknown types)
+    """
+    import asyncio
+
+    # First case: asyncio.TimeoutError -> "timeout".
+    session_a = _make_session()
+    msg_a = _make_message()
+    conv_a = _make_conversation()
+    session_a.get = AsyncMock(side_effect=[msg_a, conv_a])
+
+    judge_a = _make_judge()
+    judge_a.score = AsyncMock(side_effect=asyncio.TimeoutError())
+    ctx_a: dict[str, Any] = {"judge_client": judge_a}
+
+    fake_qa_repo_a = MagicMock()
+    fake_qa_repo_a.exists_for_message = AsyncMock(return_value=False)
+    fake_qa_repo_a.insert = AsyncMock()
+
+    fake_msg_repo_a = MagicMock()
+    fake_msg_repo_a.get_last_customer_message = AsyncMock(
+        return_value=_make_message(role=MessageRole.CUSTOMER)
+    )
+
+    with _patch_sessionmaker(session_a), \
+         patch("qa.worker.QaScoreRepository", return_value=fake_qa_repo_a), \
+         patch("qa.worker.MessageRepository", return_value=fake_msg_repo_a), \
+         patch("qa.worker.LUMEN_QA_FAILURES") as mock_failures_a, \
+         patch("qa.worker.LUMEN_QA_SCORE_LATENCY") as mock_latency_a:
+        mock_failures_a.labels.return_value.inc = MagicMock()
+        mock_latency_a.time.return_value = _DummyCM()
+
+        await qa_judge_task(ctx_a, "m-timeout")
+
+    mock_failures_a.labels.assert_called_with(reason="timeout")
+
+    # Second case: ValueError -> "exception" (fallback).
+    session_b = _make_session()
+    msg_b = _make_message()
+    conv_b = _make_conversation()
+    session_b.get = AsyncMock(side_effect=[msg_b, conv_b])
+
+    judge_b = _make_judge()
+    judge_b.score = AsyncMock(side_effect=ValueError("bad data"))
+    ctx_b: dict[str, Any] = {"judge_client": judge_b}
+
+    fake_qa_repo_b = MagicMock()
+    fake_qa_repo_b.exists_for_message = AsyncMock(return_value=False)
+    fake_qa_repo_b.insert = AsyncMock()
+
+    fake_msg_repo_b = MagicMock()
+    fake_msg_repo_b.get_last_customer_message = AsyncMock(
+        return_value=_make_message(role=MessageRole.CUSTOMER)
+    )
+
+    with _patch_sessionmaker(session_b), \
+         patch("qa.worker.QaScoreRepository", return_value=fake_qa_repo_b), \
+         patch("qa.worker.MessageRepository", return_value=fake_msg_repo_b), \
+         patch("qa.worker.LUMEN_QA_FAILURES") as mock_failures_b, \
+         patch("qa.worker.LUMEN_QA_SCORE_LATENCY") as mock_latency_b:
+        mock_failures_b.labels.return_value.inc = MagicMock()
+        mock_latency_b.time.return_value = _DummyCM()
+
+        await qa_judge_task(ctx_b, "m-value")
+
+    mock_failures_b.labels.assert_called_with(reason="exception")
 
 
 # ---------------------------------------------------------------------------

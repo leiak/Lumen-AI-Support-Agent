@@ -44,12 +44,15 @@ Design constraints
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 from arq import cron
 from arq.connections import ArqRedis
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from conversation.enums import MessageRole
 from conversation.models import Conversation, Message
@@ -64,6 +67,12 @@ from core.business_metrics import (
 from core.config import get_settings
 from core.database import get_sessionmaker
 from core.logging import get_logger
+from llm_client.exceptions import (
+    InvalidRequest,
+    OutputInvalid,
+    ProviderUnavailable,
+    RateLimited,
+)
 from qa.judge import JudgeClient, JudgeFailure, JudgeInput
 from qa.repository import QaScoreRepository
 from ticket.enums import TicketStatus
@@ -195,9 +204,12 @@ async def qa_judge_task(ctx: dict[str, Any], message_id: str) -> None:
             return
 
         # Last customer message — the "question" the AI replied to.
-        # Uses a fresh session via the MessageRepository helper to
-        # keep the read consistent with the worker's outer
-        # transaction (the helper opens its own session).
+        # ``MessageRepository()`` is instantiated with no args and
+        # internally opens its own short-lived session via
+        # ``async with get_session()`` — a SEPARATE transaction from
+        # the worker's outer session above. That's fine: the result
+        # is only used as a "question" string passed to the Judge,
+        # never for any persistence decision.
         msg_repo = MessageRepository()
         last_customer = await msg_repo.get_last_customer_message(
             conversation_id=msg.conversation_id,
@@ -227,10 +239,33 @@ async def qa_judge_task(ctx: dict[str, Any], message_id: str) -> None:
             )
             return
         except Exception as exc:  # noqa: BLE001 — best-effort worker
-            LUMEN_QA_FAILURES.labels(reason=type(exc).__name__).inc()
+            # Map exception types to the documented
+            # ``LUMEN_QA_FAILURES`` reason labels to keep metric
+            # cardinality bounded (see business_metrics.py:71).
+            # ``OutputInvalid`` is a single class — we map it to
+            # ``"malformed"`` (the Judge's JSON-decode / parse-error
+            # variant). Structured-output schema mismatches are
+            # reported by the Judge client as ``JudgeFailure``
+            # (handled above with ``reason="judge_failed"``).
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                reason = "timeout"
+            elif isinstance(exc, RateLimited):
+                reason = "rate_limited"
+            elif isinstance(exc, InvalidRequest):
+                reason = "invalid_request"
+            elif isinstance(exc, OutputInvalid):
+                reason = "malformed"
+            elif isinstance(exc, ProviderUnavailable):
+                reason = "unavailable"
+            elif isinstance(exc, json.JSONDecodeError):
+                reason = "malformed"
+            else:
+                reason = "exception"
+            LUMEN_QA_FAILURES.labels(reason=reason).inc()
             log.warning(
                 "qa.judge.unexpected_error",
                 message_id=message_id,
+                tenant_id=tenant_id,
                 error_type=type(exc).__name__,
             )
             return
@@ -238,38 +273,54 @@ async def qa_judge_task(ctx: dict[str, Any], message_id: str) -> None:
         overall = (output.relevance + output.safety + output.faithfulness) / 3.0
         flagged = judge.is_flagged(output)
 
-        await qa_repo.insert(
-            tenant_id=tenant_id,
-            message_id=message_id,
-            judge_model=judge.model,
-            relevance=output.relevance,
-            safety=output.safety,
-            faithfulness=output.faithfulness,
-            overall=overall,
-            rationale=output.rationale,
-            flagged=flagged,
-        )
-
-        for dim, val in (
-            ("relevance", output.relevance),
-            ("safety", output.safety),
-            ("faithfulness", output.faithfulness),
-            ("overall", overall),
-        ):
-            LUMEN_QA_SCORES.labels(dimension=dim, bucket=_bucket(val)).inc()
-
-        if flagged:
-            LUMEN_QA_FLAGGED.inc()
-            # Opaque IDs only — the rationale (and the question /
-            # answer it was scored against) is PII-adjacent and must
-            # never appear in worker logs.
-            log.warning(
-                "qa.judge.flagged",
+        try:
+            await qa_repo.insert(
+                tenant_id=tenant_id,
                 message_id=message_id,
                 judge_model=judge.model,
+                relevance=output.relevance,
+                safety=output.safety,
+                faithfulness=output.faithfulness,
+                overall=overall,
+                rationale=output.rationale,
+                flagged=flagged,
             )
 
-        await session.commit()
+            for dim, val in (
+                ("relevance", output.relevance),
+                ("safety", output.safety),
+                ("faithfulness", output.faithfulness),
+                ("overall", overall),
+            ):
+                LUMEN_QA_SCORES.labels(dimension=dim, bucket=_bucket(val)).inc()
+
+            if flagged:
+                LUMEN_QA_FLAGGED.inc()
+                # Opaque IDs only — the rationale (and the question /
+                # answer it was scored against) is PII-adjacent and must
+                # never appear in worker logs.
+                log.warning(
+                    "qa.judge.flagged",
+                    message_id=message_id,
+                    judge_model=judge.model,
+                )
+
+            await session.commit()
+        except IntegrityError:
+            # Two workers raced past the ``exists_for_message`` check
+            # and both tried to insert; the DB UNIQUE constraint
+            # (``uq_qa_scores_message``) caught the loser. The
+            # ``exists_for_message`` pre-check is best-effort
+            # (TOCTOU); this handler is the real backstop. Count the
+            # dup attempt and return cleanly so Arq doesn't mark the
+            # job as failed.
+            LUMEN_QA_FAILURES.labels(reason="duplicate").inc()
+            log.warning(
+                "qa.judge.duplicate_score",
+                message_id=message_id,
+                tenant_id=tenant_id,
+            )
+            return
 
 
 # ---------------------------------------------------------------------------
