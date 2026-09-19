@@ -127,11 +127,13 @@ class EmailOutbound:
             if attempt < self._max_retries - 1:
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
+        # PII: no email address in logs (M1 discipline). tenant_id + error class
+        # are sufficient for triage; the destination can be looked up via the
+        # SES SendEmail MessageId in the SES suppression / bounce dashboard.
         logger.warning(
             "email.outbound.exhausted_retries",
             extra={
                 "tenant_id": tenant_id,
-                "to_email": to_email,
                 "error_type": type(last_exc).__name__ if last_exc else "unknown",
             },
         )
