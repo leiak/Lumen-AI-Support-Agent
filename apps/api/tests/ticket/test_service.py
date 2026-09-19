@@ -155,7 +155,9 @@ async def test_transition_to_cancelled_clears_conversation_ticket_id(mock_repo):
         tenant_id="t1",
     )
     mock_conv_repo.clear_ticket_id.assert_awaited_once_with(
-        conversation_id="c-existing", tenant_id="t1"
+        session=mock_repo.session,
+        conversation_id="c-existing",
+        tenant_id="t1",
     )
 
 

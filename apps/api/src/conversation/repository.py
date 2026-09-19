@@ -211,7 +211,7 @@ class ConversationRepository:
             return list(result.scalars().all())
 
     async def clear_ticket_id(
-        self, *, conversation_id: str, tenant_id: str
+        self, *, session: AsyncSession, conversation_id: str, tenant_id: str
     ) -> bool:
         """NULL the back-pointer ``conversations.ticket_id``.
 
@@ -220,26 +220,30 @@ class ConversationRepository:
         ``conversations.ticket_id`` (declared in Task 4) blocks any
         future DELETE of the ticket while the conversation still
         points at it, so we MUST null the back-pointer on cancel.
+
+        The caller owns ``session`` and is responsible for the
+        surrounding ``commit()`` / ``rollback()``. Accepting an
+        external session (rather than opening ``get_session()``
+        internally) keeps the NULL write atomic with the ticket
+        status update that triggered the cancel — if the outer
+        transaction rolls back, both writes revert together.
+
         Tenant-scoped on the WHERE clause so a foreign
         ``conversation_id`` is silently ignored (returns
-        ``rowcount == 0``).
-
-        Returns ``True`` when a row was updated, ``False`` otherwise
-        (missing row OR cross-tenant). The service treats the
-        ``False`` return as a soft no-op — the caller (Task 6) is
-        not informed.
+        ``rowcount == 0``). Returns ``True`` when a row was updated,
+        ``False`` otherwise (missing row OR cross-tenant). The
+        service treats the ``False`` return as a soft no-op.
         """
-        async with get_session() as session:
-            stmt = (
-                update(Conversation)
-                .where(
-                    Conversation.id == conversation_id,
-                    Conversation.tenant_id == tenant_id,
-                )
-                .values(ticket_id=None)
+        stmt = (
+            update(Conversation)
+            .where(
+                Conversation.id == conversation_id,
+                Conversation.tenant_id == tenant_id,
             )
-            result = await session.execute(stmt)
-            return result.rowcount > 0
+            .values(ticket_id=None)
+        )
+        result = await session.execute(stmt)
+        return result.rowcount > 0
 
     async def get_by_id_for_update(
         self,

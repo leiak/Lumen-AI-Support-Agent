@@ -12,9 +12,11 @@ Responsibilities:
   illegal transition never reaches the database.
 * Writing one :class:`TicketEvent` row per state change.
 * Coordinating the cross-table cleanup on CANCELLED — transitioning
-  to ``CANCELLED`` also NULLs ``conversations.ticket_id`` so the
-  ticket can later be deleted without tripping the RESTRICT FK
-  declared on the back-pointer (see Task 4 follow-up note #2).
+  to ``CANCELLED`` also NULLs ``conversations.ticket_id`` (in the
+  same SQLAlchemy session as the status update, so the two writes
+  commit atomically) so the ticket can later be deleted without
+  tripping the RESTRICT FK declared on the back-pointer (see Task 4
+  follow-up note #2).
 
 PII discipline
 --------------
@@ -144,8 +146,10 @@ class TicketService:
            missing yields ``TicketNotFound``.
         3. Update status (with optional resolved/closed timestamps).
         4. If ``target == CANCELLED`` AND ``conv_repo`` was injected,
-           NULL ``conversations.ticket_id`` — otherwise deleting the
-           ticket later would fail with a RESTRICT FK violation.
+           NULL ``conversations.ticket_id`` (using the ticket repo's
+           session so the cleanup is atomic with step 3) — otherwise
+           deleting the ticket later would fail with a RESTRICT FK
+           violation.
         5. Append the audit row.
         6. Log (opaque IDs only).
         """
@@ -170,11 +174,15 @@ class TicketService:
 
         # CANCELLED cleanup: null the conversations.ticket_id back
         # pointer so the ticket can later be deleted without
-        # tripping the RESTRICT FK. Best-effort — if no conv_repo
-        # was injected (e.g. in a worker-driven flow), the caller is
+        # tripping the RESTRICT FK. Threads the ticket repo's
+        # session so the NULL write is atomic with the status
+        # update — if the outer transaction rolls back, both writes
+        # revert together. Best-effort — if no conv_repo was
+        # injected (e.g. in a worker-driven flow), the caller is
         # responsible for cleaning up the conversation row.
         if target == TicketStatus.CANCELLED and self.conv_repo is not None:
             await self.conv_repo.clear_ticket_id(
+                session=self.repo.session,
                 conversation_id=ticket.conversation_id,
                 tenant_id=ticket.tenant_id,
             )
