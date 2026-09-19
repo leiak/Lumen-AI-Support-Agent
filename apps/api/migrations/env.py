@@ -21,6 +21,7 @@ from knowledge import (
 from llm_client import (
     models as llm_models,  # noqa: F401  -- import for Alembic autogenerate metadata
 )
+from ticket import models as ticket_models  # noqa: F401  -- import for Alembic autogenerate metadata
 from tenant import models  # noqa: F401  -- import for Alembic autogenerate metadata
 
 config = context.config
