@@ -43,10 +43,11 @@ from agent.graph.nodes import (
     make_retrieve_node,
 )
 from agent.graph.state import AgentState
-from agent.graph.tools import make_escalate_tool
+from agent.graph.tools import make_escalate_tool, make_search_internal_kb_tool
 from conversation.service import ConversationService
 from core.logging import get_logger
 from knowledge.rag_service import RAGService
+from knowledge.repository import KnowledgeBaseRepository
 from llm_client.client import LLMClient
 
 log = get_logger(__name__)
@@ -98,6 +99,7 @@ def build_agent_graph(
     llm_client_factory: LLMClientFactory,
     model: str,
     conv_service: ConversationService | None = None,
+    kb_repository: KnowledgeBaseRepository | None = None,
 ) -> Any:
     """Build and compile the M1 agent graph.
 
@@ -106,7 +108,9 @@ def build_agent_graph(
     rag_service:
         Tenant-scoped RAG service. The retrieve node calls
         :meth:`RAGService.build_context_for_query` against the
-        latest customer turn.
+        latest customer turn. The ``search_internal_kb`` tool
+        (Stage 12 / Task 4) calls :meth:`RAGService.retrieve`
+        to power LLM-driven on-demand searches.
     llm_client_factory:
         Per-tenant ``LLMClient`` factory. Same factory the
         pre-graph ``SimpleResponder`` used; the LLM node calls
@@ -121,6 +125,14 @@ def build_agent_graph(
         time (Stage 7.4). The tool reads its tenant / conversation
         IDs from the module-level ``ContextVar`` bound by
         :class:`SimpleResponder` at the start of each turn.
+    kb_repository:
+        Stage 12 / Task 4 — knowledge-base repository. When
+        supplied (production), the graph hoists the
+        ``search_internal_kb`` tool alongside the escalation tool
+        so the LLM can advertise and invoke it. Defaults to a
+        real :class:`KnowledgeBaseRepository` so production code
+        never has to pass it explicitly; tests can pass a mock
+        (or omit to bypass the search tool entirely).
 
     Returns
     -------
@@ -139,17 +151,31 @@ def build_agent_graph(
     """
     graph: Any = StateGraph(AgentState)
 
-    # ---- Stage 7.4: hoist tool construction --------------------------
+    # ---- Stage 7.4 + Stage 12 / Task 4: hoist tool construction -----
     # Build the escalation tool ONCE here (when conv_service is
-    # provided) so the per-turn hot path doesn't rebuild the
-    # LangChain ``@tool`` decorator's StructuredTool each time.
-    # Per-turn tenant / conversation IDs flow through the
-    # module-level ``ContextVar`` set by SimpleResponder.
-    hoisted_tools = (
-        [make_escalate_tool(conv_service=conv_service)]
-        if conv_service is not None
-        else None
-    )
+    # provided) and the search_internal_kb tool ONCE here (when
+    # kb_repository is provided) so the per-turn hot path doesn't
+    # rebuild the LangChain ``@tool`` decorator's StructuredTool
+    # each time. Per-turn tenant / conversation IDs flow through
+    # the module-level ``ContextVar`` set by SimpleResponder.
+    hoisted_tools: list[Any] = []
+    if conv_service is not None:
+        hoisted_tools.append(
+            make_escalate_tool(conv_service=conv_service)
+        )
+    if kb_repository is not None:
+        # Stage 12 / Task 4 — wire the KB-search tool into the
+        # production graph so the LLM sees it advertised and can
+        # invoke it for on-demand retrieval. The repo + RAG service
+        # are the two surfaces the tool needs; both are
+        # tenant-isolated at the source (see knowledge.repository /
+        # knowledge.rag_service).
+        hoisted_tools.append(
+            make_search_internal_kb_tool(
+                rag_service=rag_service,
+                kb_repository=kb_repository,
+            )
+        )
 
     # Nodes ----------------------------------------------------------
     graph.add_node("retrieve", make_retrieve_node(rag_service=rag_service))

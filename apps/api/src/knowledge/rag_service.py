@@ -44,7 +44,9 @@ Design constraints
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
+from core.database import get_session
 from knowledge.models import KnowledgeBase
 from knowledge.repository import KnowledgeBaseRepository
 from knowledge.retriever import (
@@ -318,6 +320,280 @@ class RAGService:
             knowledge_base_name=kb.name,
             retrieval_score_max=score_max,
         )
+
+    async def retrieve(
+        self,
+        *,
+        tenant_id: str,
+        query: str,
+        conversation_id: str | None = None,
+        kb_slug: str | None = None,
+        knowledge_base_id: str | None = None,
+        top_k: int = DEFAULT_TOP_K,
+        score_threshold: float | None = DEFAULT_SCORE_THRESHOLD,
+    ) -> list[dict[str, Any]]:
+        """Run tenant-scoped retrieval and return structured snippets.
+
+        Companion surface to :meth:`build_context_for_query`. Where
+        ``build_context_for_query`` returns a pre-formatted Markdown
+        block ready for prompt injection, ``retrieve`` returns a
+        list of structured snippet dicts so a caller (today: the
+        ``search_internal_kb`` LangChain tool) can format them as
+        it sees fit.
+
+        Stage 12 / Task 4 — added to close the production-wiring
+        gap flagged by the final cross-stage review. The previous
+        tool body called ``_rag.retrieve(...)`` which never existed,
+        so the LLM never advertised ``search_internal_kb`` at
+        runtime. ``retrieve`` is the real seam.
+
+        Each returned dict carries the following keys (PII-safe —
+        opaque ULIDs only, never log them; the LLM-facing tool
+        already controls PII at the markdown-rendering boundary):
+
+        * ``chunk_id`` (``str``) — the Qdrant point ID; stable across
+          re-indexes of the same chunk.
+        * ``article_id`` (``str``) — the parent article ULID.
+        * ``article_title`` (``str``) — the article's display title;
+          useful for the LLM's citation context.
+        * ``content`` (``str``) — the chunk text (full, not
+          truncated — the caller decides how much to surface).
+        * ``score`` (``float``) — the Qdrant cosine similarity;
+          higher is more relevant.
+
+        KB scope resolution
+        -------------------
+
+        1. ``kb_slug`` provided → look up via
+           :meth:`KnowledgeBaseRepository.find_by_slug`. If the slug
+           does not exist for this tenant (including cross-tenant),
+           return ``[]`` (the tool degrades to "search all KBs" /
+           "no KB found" gracefully).
+        2. ``knowledge_base_id`` provided → search that single KB
+           directly. (The ID is trusted because it flows from the
+           repo lookup, not from the LLM.)
+        3. Neither provided → fan out across all of the tenant's
+           KBs, merging the per-KB result lists into a single
+           score-sorted top-k.
+
+        Tenant scope is enforced at TWO layers (defense in depth):
+
+        * The Qdrant ``search_chunks`` helper carries
+          ``tenant_id`` + ``knowledge_base_id`` payload filters.
+        * The :meth:`ChunkRepository.list_by_point_ids` DB
+          hydration also carries ``tenant_id`` in its WHERE clause.
+
+        Parameters
+        ----------
+        tenant_id:
+            Opaque tenant ULID. REQUIRED.
+        query:
+            Free-form user text. Empty / whitespace-only queries
+            return ``[]`` without raising.
+        conversation_id:
+            Optional log breadcrumb only — does not affect
+            retrieval.
+        kb_slug:
+            Optional slug for KB scoping. When supplied, the
+            tenant-scoped KB lookup resolves it to a
+            ``knowledge_base_id``; a missing slug returns ``[]``.
+        knowledge_base_id:
+            Optional explicit KB override. Mutually consistent
+            with ``kb_slug`` — when both are supplied,
+            ``kb_slug`` wins (more specific).
+        top_k:
+            Max snippets to return. Default
+            :attr:`DEFAULT_TOP_K`. Values <= 0 clamp to 1.
+        score_threshold:
+            Optional minimum cosine similarity. Default
+            :attr:`DEFAULT_SCORE_THRESHOLD`. Pass ``0.0`` /
+            ``None`` to admit every hit.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Structured snippets sorted by score (highest first),
+            capped at ``top_k``. May be empty.
+
+        Notes
+        -----
+        Never raises on tenant / KB lookup failure — the search
+        tool depends on this so the LLM sees "No relevant articles
+        found" rather than a hard tool error.
+        """
+        # ---- empty query is a no-op ---------------------------------
+        if not query or not query.strip():
+            log.info(
+                "knowledge.rag.retrieve_empty_query",
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+            )
+            return []
+
+        # Clamp top_k to a sensible positive range; a buggy caller
+        # cannot tank the prompt with top_k=-1 or top_k=10**6.
+        effective_top_k = max(1, int(top_k))
+
+        # ---- KB scope resolution -----------------------------------
+        kb_ids: list[str] | None = None
+        resolved_kb: KnowledgeBase | None = None
+        if kb_slug is not None:
+            try:
+                resolved_kb = await self._kb_repo.find_by_slug(
+                    tenant_id=tenant_id, slug=kb_slug
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning(
+                    "knowledge.rag.kb_slug_lookup_failed",
+                    tenant_id=tenant_id,
+                    error_type=type(exc).__name__,
+                )
+                resolved_kb = None
+            if resolved_kb is None:
+                # Slug doesn't exist (or cross-tenant). The tool
+                # surfaces this as "No relevant articles found" —
+                # same UX as "no hits" but with the slug filter
+                # preserved so a probing caller can't enumerate
+                # slugs across tenants via response differentiation.
+                log.info(
+                    "knowledge.rag.kb_slug_not_found",
+                    tenant_id=tenant_id,
+                    knowledge_base_id=None,
+                )
+                return []
+            kb_ids = [resolved_kb.id]
+        elif knowledge_base_id is not None:
+            kb_ids = [knowledge_base_id]
+        else:
+            # Fan out across the tenant's KBs. M1 typically has
+            # one KB per tenant, but the multi-KB future is on the
+            # M2 roadmap; the implementation already supports it.
+            try:
+                all_kbs = await self._kb_repo.list_by_tenant(
+                    tenant_id=tenant_id, limit=100
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning(
+                    "knowledge.rag.kb_list_failed",
+                    tenant_id=tenant_id,
+                    error_type=type(exc).__name__,
+                )
+                return []
+            if not all_kbs:
+                return []
+            kb_ids = [kb.id for kb in all_kbs]
+
+        # ---- fan-out retrieval across scoped KBs ------------------
+        from knowledge.retriever import (
+            EmbeddingError as _RetrieverEmbeddingError,
+            KnowledgeBaseNotFoundError,
+            retrieve_chunks,
+        )
+
+        aggregated: list[Any] = []
+        per_kb_failures = 0
+        for kb_id in kb_ids:
+            try:
+                chunks = await retrieve_chunks(
+                    tenant_id=tenant_id,
+                    knowledge_base_id=kb_id,
+                    query=query,
+                    top_k=effective_top_k,
+                    score_threshold=score_threshold,
+                )
+            except KnowledgeBaseNotFoundError:
+                # A concurrent ``delete_kb`` could have wiped the
+                # KB between list_by_tenant and retrieve_chunks.
+                # Skip silently — the fan-out is best-effort.
+                per_kb_failures += 1
+                continue
+            except _RetrieverEmbeddingError:
+                # Embedding layer failure. Skip this KB so a single
+                # bad KB doesn't poison the whole turn.
+                per_kb_failures += 1
+                continue
+            except Exception as exc:
+                # Catch-all — per-KB failures must not abort the
+                # whole fan-out. PII-safe log payload.
+                log.warning(
+                    "knowledge.rag.retrieve_per_kb_failed",
+                    tenant_id=tenant_id,
+                    knowledge_base_id=kb_id,
+                    error_type=type(exc).__name__,
+                )
+                per_kb_failures += 1
+                continue
+            aggregated.extend(chunks)
+
+        if not aggregated:
+            return []
+
+        # ---- merge + sort + top-k ----------------------------------
+        # Retriever returns ``RetrievedChunk`` objects (highest score
+        # first per KB). Merge into a single score-sorted list.
+        aggregated.sort(key=lambda c: float(c.score), reverse=True)
+        top = aggregated[:effective_top_k]
+
+        # ---- hydrate article titles --------------------------------
+        # ``RetrievedChunk`` carries ``article_id`` but not
+        # ``article_title``. Bulk-fetch Article rows so each
+        # snippet gets a stable, human-readable title.
+        title_by_article = await self._article_titles_for(
+            tenant_id=tenant_id, article_ids=[t.article_id for t in top]
+        )
+
+        snippets: list[dict[str, Any]] = []
+        for t in top:
+            snippets.append(
+                {
+                    "chunk_id": t.qdrant_point_id or "",
+                    "article_id": t.article_id,
+                    "article_title": title_by_article.get(
+                        t.article_id, ""
+                    ),
+                    "content": t.text,
+                    "score": float(t.score),
+                }
+            )
+
+        log.info(
+            "knowledge.rag.retrieve_completed",
+            tenant_id=tenant_id,
+            kb_count=len(kb_ids),
+            hit_count=len(snippets),
+            per_kb_failures=per_kb_failures,
+            score_max=(
+                max((s["score"] for s in snippets), default=0.0)
+            ),
+        )
+
+        return snippets
+
+    async def _article_titles_for(
+        self,
+        *,
+        tenant_id: str,
+        article_ids: list[str],
+    ) -> dict[str, str]:
+        """Bulk-load ``Article.title`` for a list of article IDs.
+
+        Returns a dict keyed by article_id; IDs that don't resolve
+        (drift, mid-flight delete) are simply absent from the
+        returned map so the caller can fall back to ``""``.
+        """
+        if not article_ids:
+            return {}
+        # Local imports so the module remains importable in unit
+        # tests that mock the lower-level surfaces.
+        from knowledge.models import Article
+
+        async with get_session() as session:
+            stmt = select(Article.id, Article.title).where(
+                Article.tenant_id == tenant_id,
+                Article.id.in_(article_ids),
+            )
+            rows = list((await session.execute(stmt)).all())
+        return {row[0]: (row[1] or "") for row in rows}
 
     async def _resolve_kb(
         self,

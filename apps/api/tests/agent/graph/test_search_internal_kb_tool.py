@@ -86,7 +86,9 @@ async def test_search_internal_kb_filters_by_kb_slug(mock_rag_service, mock_kb_r
         await tool.ainvoke({"query": "x", "kb_slug": "acme-billing", "top_k": 3})
     finally:
         reset_escalation_context(token)
-    mock_kb_repo.find_by_slug.assert_awaited_once_with("t1", "acme-billing")
+    mock_kb_repo.find_by_slug.assert_awaited_once_with(
+        tenant_id="t1", slug="acme-billing"
+    )
     _, kwargs = mock_rag_service.retrieve.call_args
     assert kwargs["knowledge_base_id"] == "kb-acme"
     assert kwargs["top_k"] == 3
@@ -100,3 +102,32 @@ async def test_search_internal_kb_requires_tenant_context(mock_rag_service, mock
     # the llm_node tool-loop in Task 2 can record it and continue.
     result = await tool.ainvoke({"query": "x"})
     assert "error" in result.lower() or "context" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_internal_kb_calls_find_by_slug_without_defensive_hasattr(
+    mock_rag_service, mock_kb_repo
+):
+    """Stage 12 / Task 4 — the production wiring now guarantees
+    ``KnowledgeBaseRepository.find_by_slug`` exists, so the tool calls
+    it unconditionally (no more ``hasattr`` defensive guard).
+
+    Pins the contract by asserting ``find_by_slug`` was awaited
+    whenever the LLM supplies a ``kb_slug`` — even if the repo's
+    implementation surface looks "wrong" (e.g. a test double that
+    raises on attribute access). The production tool is expected
+    to surface a hard wiring regression immediately, not silently
+    drop the slug filter.
+    """
+    tool = make_search_internal_kb_tool(
+        rag_service=mock_rag_service, kb_repository=mock_kb_repo
+    )
+    token = bind_escalation_context(tenant_id="t1", conversation_id="conv1")
+    try:
+        await tool.ainvoke({"query": "x", "kb_slug": "any-slug"})
+    finally:
+        reset_escalation_context(token)
+
+    mock_kb_repo.find_by_slug.assert_awaited_once_with(
+        tenant_id="t1", slug="any-slug"
+    )

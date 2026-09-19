@@ -334,9 +334,19 @@ def make_search_internal_kb_tool(
             return "Error: empty query."
 
         kb = None
-        if kb_slug and hasattr(_kb_repo, "find_by_slug"):
+        if kb_slug:
+            # Stage 12 / Task 4 — ``find_by_slug`` is now a real
+            # method on :class:`KnowledgeBaseRepository`. The
+            # previous ``hasattr`` defensive guard was a Stage-7.4
+            # shim while the repo grew the surface; production
+            # wiring now guarantees the method exists. A repo
+            # implementation that omits it would surface as an
+            # ``AttributeError`` immediately rather than silently
+            # dropping the slug filter — that's the M2 contract.
             try:
-                kb = await _kb_repo.find_by_slug(tenant_id, kb_slug)
+                kb = await _kb_repo.find_by_slug(
+                    tenant_id=tenant_id, slug=kb_slug
+                )
             except Exception as exc:
                 # KB lookup failure must not break the tool — return no KB
                 # filter and let RAG search across all tenant KBs.
@@ -350,6 +360,13 @@ def make_search_internal_kb_tool(
                 kb = None
 
         try:
+            # Stage 12 / Task 4 — the tool threads the resolved
+            # ``knowledge_base_id`` (from the slug lookup above)
+            # directly into ``RAGService.retrieve`` so the RAG
+            # service does NOT redo the slug lookup. When the LLM
+            # didn't supply a slug, ``kb`` is ``None`` and
+            # ``knowledge_base_id=None`` lets ``retrieve`` fan out
+            # across the tenant's KBs.
             results = await _rag.retrieve(
                 tenant_id=tenant_id,
                 conversation_id=conversation_id,

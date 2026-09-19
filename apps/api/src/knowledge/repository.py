@@ -148,6 +148,54 @@ class KnowledgeBaseRepository:
             )
             return list((await session.execute(stmt)).scalars().all())
 
+    async def find_by_slug(
+        self, *, tenant_id: str, slug: str
+    ) -> KnowledgeBase | None:
+        """Look up a KB by tenant-scoped slug. Returns ``None`` on miss.
+
+        Stage 12 / Task 4 — added so the ``search_internal_kb``
+        LangChain tool can resolve the LLM-supplied ``kb_slug``
+        argument to a concrete ``knowledge_base_id`` for the Qdrant
+        payload filter. The ``UNIQUE (tenant_id, slug)`` constraint
+        (see :class:`knowledge.models.KnowledgeBase.__table_args__`)
+        guarantees at most one match per tenant; the query relies on
+        this to return either a single row or ``None``.
+
+        Tenant isolation: the WHERE clause carries ``tenant_id``
+        explicitly. A slug that exists for tenant A is INVISIBLE to
+        tenant B — ``find_by_slug`` returns ``None`` rather than
+        raising, so the search tool can degrade gracefully to
+        "search across all of the tenant's KBs" without surfacing a
+        hard error to the LLM.
+
+        PII discipline: ``slug`` is not logged — slugs can carry
+        tenant-meaningful identifiers. The caller (the agent tool)
+        is responsible for keeping ``slug`` out of log payloads.
+
+        Parameters
+        ----------
+        tenant_id:
+            Opaque tenant ULID. REQUIRED — every read is scoped to
+            this tenant.
+        slug:
+            URL-safe slug to look up.
+
+        Returns
+        -------
+        KnowledgeBase | None
+            The matching row, or ``None`` when the slug does not
+            exist for this tenant (including the cross-tenant case).
+        """
+        async with get_session() as session:
+            stmt = (
+                select(KnowledgeBase)
+                .where(
+                    KnowledgeBase.tenant_id == tenant_id,
+                    KnowledgeBase.slug == slug,
+                )
+            )
+            return (await session.execute(stmt)).scalar_one_or_none()
+
     async def get_default_for_tenant(
         self, *, tenant_id: str
     ) -> KnowledgeBase | None:

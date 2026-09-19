@@ -236,7 +236,9 @@ async def test_search_internal_kb_tool_invoked_through_graph_loop() -> None:
     # Critical: tenant_id must come from the ContextVar (set by
     # SimpleResponder before invoking the graph), NOT from the LLM's
     # tool_call args. This is the cross-tenant isolation contract.
-    kb_repo.find_by_slug.assert_awaited_once_with(tenant_id, "support")
+    kb_repo.find_by_slug.assert_awaited_once_with(
+        tenant_id=tenant_id, slug="support"
+    )
 
     # ---- The RAG ``retrieve`` saw the right args ------------------
     rag_service.retrieve.assert_awaited_once()

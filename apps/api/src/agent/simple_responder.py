@@ -49,6 +49,7 @@ from conversation.models import Message
 from conversation.service import ConversationService
 from core.logging import get_logger
 from knowledge.rag_service import RAGService
+from knowledge.repository import KnowledgeBaseRepository
 from llm_client.client import LLMClient
 from llm_client.types import ChatRequest
 from llm_client.types import MessageRole as LLMMessageRole
@@ -117,6 +118,7 @@ class SimpleResponder:
         conv_service: ConversationService | None = None,
         llm_client_factory: LLMClientFactory | None = None,
         rag_service: RAGService | None = None,
+        kb_repository: KnowledgeBaseRepository | None = None,
         model: str | None = None,
     ) -> None:
         self._conv_service = conv_service or ConversationService()
@@ -129,6 +131,12 @@ class SimpleResponder:
         # default to a real ``RAGService()`` instance here so production
         # code never has to pass one explicitly.
         self._rag_service = rag_service or RAGService()
+        # Stage 12 / Task 4 — the KB-search tool
+        # (``search_internal_kb``) needs a ``KnowledgeBaseRepository``
+        # to resolve LLM-supplied slugs to KB ids. Defaults to a
+        # real instance so production code never has to pass one
+        # explicitly; tests can pass a mock.
+        self._kb_repository = kb_repository or KnowledgeBaseRepository()
         self._model = model or _resolve_default_model()
         # Compiled LangGraph agent graph. Built lazily on first
         # ``respond()`` and reused thereafter. ``Any`` because
@@ -144,6 +152,12 @@ class SimpleResponder:
                 llm_client_factory=self._llm_client_factory,
                 model=self._model,
                 conv_service=self._conv_service,
+                # Stage 12 / Task 4 — wire the KB-search tool
+                # into the production graph so the LLM sees it
+                # advertised and can invoke it. Both
+                # ``rag_service`` and ``kb_repository`` are the
+                # seams the tool requires.
+                kb_repository=self._kb_repository,
             )
         return self._graph
 
