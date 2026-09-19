@@ -64,8 +64,8 @@ LLM_TOKENS_TOTAL = Counter(
 # Cardinality budget (matches the docstring at the top of this file):
 #
 # * lumen_qa_scores_total{dimension, bucket}
-#     dimension: relevance / safety / faithfulness (3)
-#     bucket: low / medium / high (3) => 9 series
+#     dimension: relevance / safety / faithfulness / overall (4)
+#     bucket: low / medium / high (3) => 12 series
 # * lumen_qa_flagged_total{} — unlabelled, 1 series
 # * lumen_qa_judge_failures_total{reason}
 #     reason: timeout / malformed / exception / structured_output_invalid (4)

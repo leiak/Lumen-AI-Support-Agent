@@ -63,9 +63,11 @@ M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
    ┌──────────────────┐    ┌────────────────────┐    ┌──────────────────┐
    │  retrieve_node   │    │     llm_node       │    │  tools (7.2+)    │
    │  RAGService →    │    │  LLMClient.chat    │    │  escalate_to_    │
-   │  Qdrant MUST     │    │  tool_calls[:1]    │    │  human           │
-   │  filter          │    │  CHAT_TEMP=0.7     │    │  (ContextVar-    │
-   │                  │    │  MAX_TOK=512       │    │   bound tenant)  │
+   │  Qdrant MUST     │    │  tool loop (max=5) │    │  human           │
+   │  filter          │    │  CHAT_TEMP=0.7     │    │  search_internal_│
+   │                  │    │  MAX_TOK=512       │    │  kb (Stage 12)   │
+   │                  │    │                    │    │  (ContextVar-    │
+   │                  │    │                    │    │   bound tenant)  │
    └────────┬─────────┘    └─────────┬──────────┘    └────────┬─────────┘
             │                        │                         │
             ▼                        ▼                         ▼
@@ -191,10 +193,10 @@ docker compose up -d postgres redis qdrant
 
 ### QA 质检指标 (M2.A / Stage 14)
 
-- `lumen_qa_scores_total{dimension, bucket}` — Judge LLM 给 AI 回复的 3 维度评分计数(`dimension ∈ {relevance, accuracy, tone}`, `bucket ∈ {low, mid, high}`)
-- `lumen_qa_flagged_total` — 任一维度 < 0.3 的 AI 回复数(M3 接 alerting)
+- `lumen_qa_scores_total{dimension, bucket}` — Judge LLM 给 AI 回复的 4 维度评分计数(`dimension ∈ {relevance, safety, faithfulness, overall}`, `bucket ∈ {low, medium, high}`)
+- `lumen_qa_flagged_total` — 任一维度 < 0.4 的 AI 回复数(M3 接 alerting)
 - `lumen_qa_judge_failures_total{reason}` — Judge 调用失败计数(`reason ∈ {timeout, malformed, exception}`)
-- `lumen_sla_breached_total{priority}` — 触发 SLA 超时未响应的工单计数(`priority ∈ {P1, P2, P3}`;M3 接 PagerDuty)
+- `lumen_sla_breached_total{priority}` — 触发 SLA 超时未响应的工单计数(`priority ∈ {P0, P1, P2, P3}`;M3 接 PagerDuty)
 - `lumen_qa_judge_latency_seconds` — Judge 调用耗时直方图(无 labels,~12 buckets)
 
 QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露。Judge LLM 与主 Agent LLM 解耦 — Agent 用 MiniMax Haiku 路由时,Judge 可独立配 MiniMax / DeepSeek / 本地小模型。
@@ -287,6 +289,11 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 - `POST /api/v1/agents/conversations/{id}/claim` — 原子认领 (SELECT FOR UPDATE + status + assigned_agent_id 检查)
 - `POST /api/v1/agents/conversations/{id}/suggest-reply` — AI 建议回复 (READ-ONLY, 返回 suggested_text + citations + turn_kind)
 
+### Tickets (M2.A / Stage 13)
+- `GET /api/v1/tickets/{ticket_id}` — 详情 (admin / agent;404 on 缺失或跨租户,反枚举)
+- `POST /api/v1/tickets/{ticket_id}/transition` — 状态机迁移 (`200` 成功 / `404` 缺失 / `409 Conflict` 非法迁移)
+- `GET /api/v1/tickets/{ticket_id}/events` — 工单审计事件日志 (按时间倒序;空列表 = `200 []`)
+
 ## 已知技术债 / Stage 10+ 关注点
 
 1. **`_reset_db_singletons` autouse fixture** 在多个集成测试文件重复 — Stage 10 集中到 `apps/api/tests/conftest.py`
@@ -294,7 +301,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 3. ~~**真实 OpenAI M1 阈值校准** — `make eval-rag-real` 路径待 Stage 10 实施~~ — Stage 10.3 完成 (`eval-rag-real` 现在跑真实 Doubao embedding,校准 `DEFAULT_SCORE_THRESHOLD=0.45`)
 4. **多模态 RAG** — `_log_ocr_todo_once` 留待 Stage 7+ 接 vision model
 5. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
-6. **第二 tool / 工具循环** — 当前 `tool_calls[:1]` first-wins,第二个 tool 时改 loop-until-no-tool-calls
+6. ~~**第二 tool / 工具循环** — 当前 `tool_calls[:1]` first-wins,第二个 tool 时改 loop-until-no-tool-calls~~ — Stage 12 已替换为完整 tool loop(最多 5 轮)
 7. ~~**LLM 流式已到引擎层未接 WS** — provider/client 流式已实现,客户会话 `message.delta` 帧待接入~~ — Stage 10.1 完成 (`src/channel/inbound.py` 已有 `_broadcast_ai_delta` / `_stream_delta`,2 个 E2E 测试覆盖)
 8. **业务指标当前无 tenant_id label** — Stage 11.3 故意不加避免 Prometheus 基数爆炸;按需租户维度走 `llm_usage` 表(账单路径)
 9. **demo mp4 留 presenter** — Stage 11.5 自动化脚本只产 11 张 PNG;mp4 需要 presenter + 音频,自动化做不出

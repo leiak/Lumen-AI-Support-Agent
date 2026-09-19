@@ -29,7 +29,6 @@ from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
-from core.database import get_session
 from core.logging import get_logger
 from qa.worker import build_arq_redis
 from ticket.repository import TicketRepository
