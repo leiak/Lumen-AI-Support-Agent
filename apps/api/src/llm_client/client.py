@@ -53,11 +53,11 @@ class LLMClient:
         smaller / different model from the per-tenant default without
         inheriting its provider wiring.
 
-        **STUB**: Task 7 wires only the two well-known provider ids
-        (``minimax`` and ``anthropic``). Task 8 will replace this with
-        a router that picks from any registered provider based on the
-        configured ``provider`` string. Unknown providers raise
-        :class:`ValueError` so the misconfiguration is loud, not silent.
+        TODO(Task 8): replace stub with a router that picks from any
+        registered provider based on the configured ``provider``
+        string. Currently wires only ``minimax`` and ``anthropic``.
+        Unknown providers raise :class:`ValueError` so the
+        misconfiguration is loud, not silent.
 
         ``tenant_id`` defaults to ``"qa-judge"`` because the Judge
         worker runs outside any request context (no tenant
@@ -98,10 +98,11 @@ class LLMClient:
     ) -> BaseModel:
         """Call the underlying provider and parse the response into ``schema``.
 
-        **STUB**: Task 7's stub simply invokes ``chat`` with the same
-        ``messages``, parses the response ``content`` as JSON, and
-        returns ``schema(**parsed)``. Task 8 will replace this with
-        provider-native structured output (OpenAI's
+        TODO(Task 8): replace stub with provider-native structured
+        output (OpenAI's ``response_format={"type": "json_schema"}``,
+        Anthropic's tool use, etc.). The current implementation simply
+        invokes ``chat`` with the same messages, parses the response
+        ``content`` as JSON, and returns ``schema(**parsed)``.
         ``response_format={"type": "json_schema"}``, Anthropic's tool
         use, etc.). The stub is good enough for unit tests that mock
         it directly with a ``MagicMock`` / ``AsyncMock``.

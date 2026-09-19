@@ -69,7 +69,7 @@ LLM_TOKENS_TOTAL = Counter(
 # * lumen_qa_flagged_total{} — unlabelled, 1 series
 # * lumen_qa_judge_failures_total{reason}
 #     reason: timeout / malformed / exception / structured_output_invalid (4)
-# * lumen_qa_sla_breached_total{priority}
+# * lumen_sla_breached_total{priority}
 #     priority: low / normal / high / urgent (4) => 4 series
 # * lumen_qa_judge_latency_seconds — Histogram, no labels, ~12 buckets
 #
@@ -92,8 +92,8 @@ LUMEN_QA_FAILURES = Counter(
     ("reason",),
 )
 
-LUMEN_QA_SLA_BREACHED = Counter(
-    "lumen_qa_sla_breached_total",
+LUMEN_SLA_BREACHED = Counter(
+    "lumen_sla_breached_total",
     "Tickets that breached SLA without resolution.",
     ("priority",),
 )
@@ -112,6 +112,6 @@ __all__ = [
     "LUMEN_QA_FLAGGED",
     "LUMEN_QA_SCORE_LATENCY",
     "LUMEN_QA_SCORES",
-    "LUMEN_QA_SLA_BREACHED",
+    "LUMEN_SLA_BREACHED",
     "MESSAGES_TOTAL",
 ]

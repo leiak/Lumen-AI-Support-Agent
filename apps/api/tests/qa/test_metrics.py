@@ -15,7 +15,7 @@ from core.business_metrics import (
     LUMEN_QA_FLAGGED,
     LUMEN_QA_SCORE_LATENCY,
     LUMEN_QA_SCORES,
-    LUMEN_QA_SLA_BREACHED,
+    LUMEN_SLA_BREACHED,
 )
 
 
@@ -58,10 +58,10 @@ def test_lumen_qa_failures_increments() -> None:
     assert after == before + 1
 
 
-def test_lumen_qa_sla_breached_increments() -> None:
-    before = _counter_value(LUMEN_QA_SLA_BREACHED, priority="high")
-    LUMEN_QA_SLA_BREACHED.labels(priority="high").inc()
-    after = _counter_value(LUMEN_QA_SLA_BREACHED, priority="high")
+def test_lumen_sla_breached_increments() -> None:
+    before = _counter_value(LUMEN_SLA_BREACHED, priority="high")
+    LUMEN_SLA_BREACHED.labels(priority="high").inc()
+    after = _counter_value(LUMEN_SLA_BREACHED, priority="high")
     assert after == before + 1
 
 
