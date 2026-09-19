@@ -106,6 +106,20 @@ class Settings(BaseSettings):
     # exposed via /health (the version label is enough for triage).
     git_sha: str | None = Field(default=None, alias="GIT_SHA")
 
+    # Stage 14 / Task 7 — real-time QA judge configuration.
+    #
+    # ``qa_judge_model`` default is a placeholder (the M2.B rollout will
+    # pick the actual model). The Judge client MUST be configured with
+    # a provider that ``LLMClient`` knows how to build; only the
+    # well-known provider ids ("minimax" / "anthropic") are valid until
+    # the routing layer ships (see llm_client/client.py with_config
+    # stub).
+    qa_judge_model: str = Field(default="minimax-m2.7-highspeed", alias="QA_JUDGE_MODEL")
+    qa_judge_provider: str = Field(default="minimax", alias="QA_JUDGE_PROVIDER")
+    qa_score_threshold_alert: float = Field(default=0.3, alias="QA_SCORE_THRESHOLD_ALERT")
+    qa_judge_timeout_seconds: float = Field(default=10.0, alias="QA_JUDGE_TIMEOUT_SECONDS")
+    qa_judge_max_retries: int = Field(default=1, alias="QA_JUDGE_MAX_RETRIES")
+
     # CORS / widget origin allowlist (M1: single global allowlist).
     # Applied to both the HTTP CORS middleware and the WebSocket origin
     # check in `widget/ws/router.py`. Production must override this via

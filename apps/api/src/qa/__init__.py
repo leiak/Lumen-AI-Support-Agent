@@ -1,0 +1,1 @@
+"""Real-time QA — Arq-judge AI messages with a small LLM."""

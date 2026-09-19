@@ -1,8 +1,12 @@
 """High-level LLM client: wraps a provider, adds retry, records usage."""
 import asyncio
+import json
 import random
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
+
+from pydantic import BaseModel
 
 from core.business_metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL
 from llm_client.exceptions import (
@@ -12,7 +16,7 @@ from llm_client.exceptions import (
     RateLimited,
 )
 from llm_client.providers.base import BaseProvider
-from llm_client.types import ChatRequest, ChatResponse
+from llm_client.types import ChatMessage, ChatRequest, ChatResponse
 from llm_client.usage import UsageRecorder
 
 
@@ -34,6 +38,107 @@ class LLMClient:
         self.default_provider = default_provider
         self.tenant_id = tenant_id
         self.usage = usage_recorder or UsageRecorder()
+
+    @classmethod
+    def with_config(
+        cls,
+        *,
+        provider: str,
+        model: str,
+        tenant_id: str = "qa-judge",
+    ) -> "LLMClient":
+        """Build an LLMClient wired to a specific (provider, model) pair.
+
+        Used by the QA Judge (Stage 14 / Task 7) so the judge can use a
+        smaller / different model from the per-tenant default without
+        inheriting its provider wiring.
+
+        **STUB**: Task 7 wires only the two well-known provider ids
+        (``minimax`` and ``anthropic``). Task 8 will replace this with
+        a router that picks from any registered provider based on the
+        configured ``provider`` string. Unknown providers raise
+        :class:`ValueError` so the misconfiguration is loud, not silent.
+
+        ``tenant_id`` defaults to ``"qa-judge"`` because the Judge
+        worker runs outside any request context (no tenant
+        ContextVar). The usage-recording path uses this for the
+        ``llm_usage`` row.
+        """
+        # Local imports — avoids a cycle through core.config at import
+        # time (the conftest fixture resets core.config singletons
+        # before tests, so we must read settings lazily).
+        from core.config import get_settings
+        from llm_client.providers.anthropic_provider import AnthropicProvider
+        from llm_client.providers.openai_provider import OpenAIProvider
+
+        s = get_settings()
+        if provider == "minimax":
+            base_url = s.minimax_base_url or "https://api.minimaxi.com/v1"
+            default_provider: BaseProvider = OpenAIProvider(
+                api_key=s.minimax_api_key or "",
+                model=model,
+                base_url=base_url,
+            )
+        elif provider == "anthropic":
+            default_provider = AnthropicProvider(
+                api_key=s.anthropic_api_key or "",
+                model=model,
+            )
+        else:
+            raise ValueError(f"Unknown QA judge provider: {provider}")
+        return cls(default_provider=default_provider, tenant_id=tenant_id)
+
+    async def chat_with_structured_output(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        schema: type[BaseModel],
+        model: str,
+        timeout: float = 10.0,
+    ) -> BaseModel:
+        """Call the underlying provider and parse the response into ``schema``.
+
+        **STUB**: Task 7's stub simply invokes ``chat`` with the same
+        ``messages``, parses the response ``content`` as JSON, and
+        returns ``schema(**parsed)``. Task 8 will replace this with
+        provider-native structured output (OpenAI's
+        ``response_format={"type": "json_schema"}``, Anthropic's tool
+        use, etc.). The stub is good enough for unit tests that mock
+        it directly with a ``MagicMock`` / ``AsyncMock``.
+
+        Raises:
+            OutputInvalid: if the response is not parseable JSON or the
+                parsed dict cannot construct ``schema``.
+            asyncio.TimeoutError: if the underlying ``chat`` doesn't
+                return within ``timeout`` seconds.
+        """
+        chat_request = ChatRequest(
+            model=model,
+            messages=[
+                # ``ChatMessage`` requires a typed ``MessageRole``;
+                # callers pass dicts (system/user) so we coerce here.
+                ChatMessage(
+                    role=m["role"],  # type: ignore[arg-type]
+                    content=m["content"],
+                )
+                for m in messages
+            ],
+        )
+
+        async def _call() -> ChatResponse:
+            return await self.chat(chat_request)
+
+        response = await asyncio.wait_for(_call(), timeout=timeout)
+        try:
+            parsed = json.loads(response.content)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise OutputInvalid(f"judge response not JSON: {response.content[:200]}") from e
+        try:
+            return schema(**parsed)
+        except Exception as e:
+            raise OutputInvalid(
+                f"judge response did not match schema {schema.__name__}: {e}"
+            ) from e
 
     async def aclose(self) -> None:
         """Flush pending usage and close the underlying provider's HTTP client."""

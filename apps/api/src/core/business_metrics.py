@@ -38,7 +38,7 @@ well under 200 — Prometheus doesn't even blink.
 """
 from __future__ import annotations
 
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 
 MESSAGES_TOTAL = Counter(
     "lumen_messages_total",
@@ -59,4 +59,59 @@ LLM_TOKENS_TOTAL = Counter(
 )
 
 
-__all__ = ["LLM_CALLS_TOTAL", "LLM_TOKENS_TOTAL", "MESSAGES_TOTAL"]
+# Stage 14 / Task 7 — real-time QA judge metrics.
+#
+# Cardinality budget (matches the docstring at the top of this file):
+#
+# * lumen_qa_scores_total{dimension, bucket}
+#     dimension: relevance / safety / faithfulness (3)
+#     bucket: low / medium / high (3) => 9 series
+# * lumen_qa_flagged_total{} — unlabelled, 1 series
+# * lumen_qa_judge_failures_total{reason}
+#     reason: timeout / malformed / exception / structured_output_invalid (4)
+# * lumen_qa_sla_breached_total{priority}
+#     priority: low / normal / high / urgent (4) => 4 series
+# * lumen_qa_judge_latency_seconds — Histogram, no labels, ~12 buckets
+#
+# Total: ~20 series. Well under Prometheus' default 100k cap.
+
+LUMEN_QA_SCORES = Counter(
+    "lumen_qa_scores_total",
+    "QA judge scores by dimension and bucket (low/medium/high).",
+    ("dimension", "bucket"),
+)
+
+LUMEN_QA_FLAGGED = Counter(
+    "lumen_qa_flagged_total",
+    "AI messages flagged because at least one dimension < threshold.",
+)
+
+LUMEN_QA_FAILURES = Counter(
+    "lumen_qa_judge_failures_total",
+    "Judge LLM call failures (timeout / malformed / exception / structured_output_invalid).",
+    ("reason",),
+)
+
+LUMEN_QA_SLA_BREACHED = Counter(
+    "lumen_qa_sla_breached_total",
+    "Tickets that breached SLA without resolution.",
+    ("priority",),
+)
+
+LUMEN_QA_SCORE_LATENCY = Histogram(
+    "lumen_qa_judge_latency_seconds",
+    "Time spent in Judge LLM call (seconds).",
+    buckets=(0.5, 1.0, 2.0, 5.0, 10.0),
+)
+
+
+__all__ = [
+    "LLM_CALLS_TOTAL",
+    "LLM_TOKENS_TOTAL",
+    "LUMEN_QA_FAILURES",
+    "LUMEN_QA_FLAGGED",
+    "LUMEN_QA_SCORE_LATENCY",
+    "LUMEN_QA_SCORES",
+    "LUMEN_QA_SLA_BREACHED",
+    "MESSAGES_TOTAL",
+]
