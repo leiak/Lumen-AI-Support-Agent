@@ -22,6 +22,10 @@
 | 9 | 前端 + Web Widget UI (agent SPA + 客户 widget SDK + iframe UI + CORS/origin + Playwright E2E + demo script) | ✅ | 116 backend + 98 frontend + 10 e2e |
 | 10 | 集成 + 可观测性 (LLM streaming → WS `message.delta` + 可配置 embedding + Doubao 路由 + 真实 RAG eval 阈值校准) | ✅ | 75 streaming + RAG eval |
 | 11 | M1 收尾 (request_id 贯穿 + 业务指标 + /health 拆分 + demo 录屏 + CI 镜像构建) | ✅ | +20 core + 5 health |
+| 12 | M2.A — `search_internal_kb` 工具 + `llm_node` tool loop(兑现 M1 tech-debt #6) | ✅ | 131 agent tests |
+| 13 | M2.A — Ticket 领域 (独立 3 表 + 7 态状态机 + SLA 策略 + auto-create) | ✅ | 33 ticket tests |
+| 14 | M2.A — 实时质检 (Arq `qa_judge_worker` + 独立小 Judge LLM + `lumen_qa_*` 指标) | ✅ | 36 qa tests |
+| 15 | M2.A — 收尾 (README + demo-act4 + 已知技术债 + memory) | ✅ | 0 new tests, 3 demo screenshots |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -185,6 +189,16 @@ docker compose up -d postgres redis qdrant
 - 中间件 re-raise 异常,5xx 由 FastAPI 统一响应并计数,不影响错误处理链
 - 每个 HTTP 请求生成 `request_id`(`X-Request-ID` 透传或 ULID),出现在响应头 + 所有 structlog 日志 + 后续业务指标中(Stage 11.2)
 
+### QA 质检指标 (M2.A / Stage 14)
+
+- `lumen_qa_scores_total{dimension, bucket}` — Judge LLM 给 AI 回复的 3 维度评分计数(`dimension ∈ {relevance, accuracy, tone}`, `bucket ∈ {low, mid, high}`)
+- `lumen_qa_flagged_total` — 任一维度 < 0.3 的 AI 回复数(M3 接 alerting)
+- `lumen_qa_judge_failures_total{reason}` — Judge 调用失败计数(`reason ∈ {timeout, malformed, exception}`)
+- `lumen_sla_breached_total{priority}` — 触发 SLA 超时未响应的工单计数(`priority ∈ {P1, P2, P3}`;M3 接 PagerDuty)
+- `lumen_qa_judge_latency_seconds` — Judge 调用耗时直方图(无 labels,~12 buckets)
+
+QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露。Judge LLM 与主 Agent LLM 解耦 — Agent 用 MiniMax Haiku 路由时,Judge 可独立配 MiniMax / DeepSeek / 本地小模型。
+
 ### Demo 录制
 
 详细演示流程见 [`docs/demo-script.md`](docs/demo-script.md)。自动化截图见
@@ -286,6 +300,10 @@ docker compose up -d postgres redis qdrant
 9. **demo mp4 留 presenter** — Stage 11.5 自动化脚本只产 11 张 PNG;mp4 需要 presenter + 音频,自动化做不出
 10. **Plan 10.4 LLM/tracing spans 留 M3** — M1 close-out 只做 request_id 贯穿(Stage 11.2);OpenTelemetry 留到 M3 LLM Gateway
 11. **Plan 10.7 K8s manifests 留 M3/M4** — M1 docker-compose 单区域部署够用
+12. **`search_internal_kb` 只查 KB 文本** — Stage 12 只检索 Qdrant 文本块;Stage 12.5/M2.B 接 vision/多模态(图/PDF 图表)
+13. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(M2.A 之前用 `/inbox/{id}` 旁边 panel 占位,`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
+14. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批用真实 AI 回复跑 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
+15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
 
 ## 仓库信息
 

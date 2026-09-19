@@ -224,6 +224,44 @@ Recap of M1 capabilities:
 - **PII discipline** — `core.logging.get_logger` (structlog),
   opaque IDs only, no customer message text in logs.
 
+## Act 4: AI 工具调用 + 工单 + QA (M2.A,可选)
+
+**Story**:延续 Act 1-3 流程,展示 M2.A 在 M1 基础上新加的三块能力 — agent 能主动查 KB、每一次客户来信都自动建 Ticket、AI 回复会异步被 Judge LLM 评分。
+
+**前置条件**(M2.A 增量):
+
+- 已 `alembic upgrade head`(包含 ticket 三表 + `sla_policies` 迁移)
+- `.env` 加:`QA_JUDGE_ENABLED=true` + `QA_JUDGE_MODEL=<小模型,如 deepseek-chat>` + `JUDGE_SCORE_THRESHOLD=0.3`
+- 已启 Arq worker:`arq apps.api.src.workers.settings.WorkerSettings`(`qa_judge_worker` 后台消费 Judge 任务)
+- `apps/web` 已 build + 部署 ticket 详情页路由(若未部署,见 § "Ticket 工单当前无 UI" 已知技术债)
+
+**Steps**
+
+1. 回到 Act 1 的 widget 标签页,客户发 "How do I reset my password?"。AI 回复里出现 "我查了 KB: account-management" 字样,DevTools Network 面板看到 WS `tool_call` 帧 → `tool_result` 帧 → `message.complete` 帧 — 这就是 `search_internal_kb` tool 跑完一轮再回 LLM 的证据
+2. 切换到 admin (`admin@demo.test`),打开 `/tickets`(若路由已就绪)或查 DB:`SELECT id, status, priority, sla_deadline_at FROM tickets ORDER BY created_at DESC LIMIT 1;` — 每条新客户消息背后都有 P2 / `status=NEW` / `sla_deadline_at = now + 60min` 的 Ticket 自动创建
+3. 切回 agent (`agent@demo.test`) 进 `/inbox/{id}`,等 5-30s,AI 回复气泡右上角出现 QA 评分 chip(绿/黄/红 3 色对应 3 维度均分:>0.7 绿 / 0.3-0.7 黄 / 任一维度 <0.3 红)
+4. 可选 — 打开 `http://localhost:8000/metrics` 搜 `lumen_qa_`,应看到 `lumen_qa_scores_total` / `lumen_qa_flagged_total` / `lumen_qa_judge_failures_total` / `lumen_sla_breached_total` / `lumen_qa_judge_latency_seconds` 5 个新指标全部出现(计数器从 0 开始累加)
+
+**What to point out**
+
+- **Tool loop 是真在跑** — 不是 mock,M2.A 的 `make_llm_node` 用 `_MAX_TOOL_ITERATIONS = 5` 替代了 M1 的 `tool_calls[:1]`,LLM 看到 tool 结果后再决定怎么回
+- **Ticket auto-create** — 客户第一次发消息即触发,Stage 13 在 `ConversationService.record_message` 后置 hook,无需人工介入;SLA 策略可按 priority 调(`SlaPolicy` 表已 seed 默认值)
+- **QA 异步不阻塞主流程** — AI 回复已经发出 + 客户已经收到,Judge 在 Arq worker 后台慢慢打分;失败/超时只增加 `lumen_qa_judge_failures_total` 计数,不影响 conversation
+- **PII 不进 metric** — 所有 `lumen_qa_*` 指标 label 都不带 `tenant_id`(避免基数爆炸)+ 不带 message_id(避免反向 trace 客户原文)
+
+**截图说明**
+
+本 Act 对应 3 张截图:
+
+- `images/demo-act4-01-tool-call.png` — widget 面板显示 AI 回复里出现 "我查了 KB"
+- `images/demo-act4-02-ticket-detail.png` — admin `/tickets/{id}` 或 DB 查询结果
+- `images/demo-act4-03-qa-dashboard.png` — `/inbox/{id}` AI 气泡右上角的 QA 评分 chip
+
+**捕获状态(截至 Stage 15 close-out)**
+
+- `demo-act4-01` / `demo-act4-02` — **未生成**(Playwright spec `tests/e2e/demo-act4.spec.ts` / `tests/e2e/demo-act4-02.spec.ts` 已写,跑真 stack 后产 PNG)
+- `demo-act4-03` — **占位 PNG 已 commit**(1x1 stub,65 bytes),真截图需真 stack + 等待 5-30s 让 Judge worker 跑完。补抓命令:`npx playwright test tests/e2e/demo-act4-03.spec.ts`(Stage 15 暂未写 spec,沿用 `demo-act4.spec.ts` 模式补)
+
 ## Demo data reset
 
 Between demo runs, wipe the seeded rows (the seed script is
