@@ -210,6 +210,37 @@ class ConversationRepository:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def clear_ticket_id(
+        self, *, conversation_id: str, tenant_id: str
+    ) -> bool:
+        """NULL the back-pointer ``conversations.ticket_id``.
+
+        Called by :class:`ticket.service.TicketService` when a ticket
+        is transitioned to ``CANCELLED`` — the RESTRICT FK on
+        ``conversations.ticket_id`` (declared in Task 4) blocks any
+        future DELETE of the ticket while the conversation still
+        points at it, so we MUST null the back-pointer on cancel.
+        Tenant-scoped on the WHERE clause so a foreign
+        ``conversation_id`` is silently ignored (returns
+        ``rowcount == 0``).
+
+        Returns ``True`` when a row was updated, ``False`` otherwise
+        (missing row OR cross-tenant). The service treats the
+        ``False`` return as a soft no-op — the caller (Task 6) is
+        not informed.
+        """
+        async with get_session() as session:
+            stmt = (
+                update(Conversation)
+                .where(
+                    Conversation.id == conversation_id,
+                    Conversation.tenant_id == tenant_id,
+                )
+                .values(ticket_id=None)
+            )
+            result = await session.execute(stmt)
+            return result.rowcount > 0
+
     async def get_by_id_for_update(
         self,
         *,
