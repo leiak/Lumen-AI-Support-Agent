@@ -151,12 +151,21 @@ async def metrics() -> Response:
     return render_metrics()
 
 
+logger = get_logger("email")
+
+
 from agent.api import router as agents_router  # noqa: E402
+from agent.simple_responder import SimpleResponder  # noqa: E402
 from agent.ws import router as agents_ws_router  # noqa: E402
 from auth.api import router as auth_router  # noqa: E402
 from channel.api import router as channels_router  # noqa: E402
 from channel.feishu.webhook import router as feishu_webhook_router  # noqa: E402
+from channel.inbound_email import handle_email_inbound  # noqa: E402
+from channel.models import Channel  # noqa: E402
+from channel.outbound_email import EmailOutbound  # noqa: E402
 from conversation.api import router as conversations_router  # noqa: E402
+from core.database import get_sessionmaker  # noqa: E402
+from core.email_parser import parse_ses_inbound  # noqa: E402
 from knowledge.api import router as knowledge_router  # noqa: E402
 from ticket.api import router as tickets_router  # noqa: E402
 from widget.api import router as widget_router  # noqa: E402
@@ -172,3 +181,88 @@ app.include_router(knowledge_router)
 app.include_router(tickets_router)
 app.include_router(widget_router)
 app.include_router(widget_ws_router)
+
+
+# Stage 16 / M2.B — SES inbound webhook. Returns 200 for ALL outcomes
+# (ok / duplicate / malformed / unknown recipient) so SES stops
+# retrying. The handler also fans an AI auto-reply out via the
+# configured EmailOutbound client.
+_email_outbound = EmailOutbound(
+    region=_settings.aws_region,
+    from_address=_settings.ses_from_address,
+    aws_access_key_id=_settings.aws_access_key_id,
+    aws_secret_access_key=_settings.aws_secret_access_key,
+)
+
+
+@app.post("/api/v1/email/inbound")
+async def email_inbound_webhook(request: Request):
+    """SES inbound webhook. Always returns 200.
+
+    SES retries on 5xx — we MUST return 200 to stop the retry storm,
+    even for malformed payloads (logged + dropped). The 4 outcomes:
+
+    * ``ok`` — customer message persisted (and AI auto-reply generated
+      when ``ai_handling`` is on).
+    * ``duplicate`` — ``email_message_id_header`` already seen (SES
+      retry).
+    * ``dropped`` — payload was malformed, the recipient ``to_address``
+      did not resolve to an EmailChannel for the tenant, or no tenant
+      context was supplied.
+    """
+    payload = await request.body()
+    parsed = parse_ses_inbound(payload)
+    if parsed is None:
+        logger.warning("email.inbound.malformed_payload")
+        return {"status": "dropped"}
+
+    # Resolve tenant from X-Tenant-ID header (demo path). Production
+    # would look up the tenant via the EmailChannel row's
+    # ``config_json["tenant_id"]`` instead.
+    tenant_id = request.headers.get("X-Tenant-ID", _settings.default_tenant_id)
+    if not tenant_id:
+        logger.warning("email.inbound.no_tenant_resolved")
+        return {"status": "dropped"}
+
+    # Look up EmailChannel by ``to_address`` for this tenant. The
+    # ``address`` lives inside ``Channel.config_json`` JSONB — we
+    # compare via ``astext`` so the index can be used (the GIN index
+    # is on the column, not on the expression; the lookup is cheap
+    # enough at demo volumes without one).
+    sm = get_sessionmaker()
+    async with sm() as session:
+        from sqlalchemy import select
+
+        from channel.enums import ChannelType
+
+        channel = (
+            await session.execute(
+                select(Channel)
+                .where(
+                    Channel.tenant_id == tenant_id,
+                    Channel.type == ChannelType.EMAIL,
+                    Channel.config_json["address"].astext == parsed.to_address,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if channel is None:
+            # ``to_address`` is OUR OWN SES recipient (the company's
+            # support address), not customer PII — safe to log at
+            # WARNING for routing triage.
+            logger.warning(
+                "email.inbound.unknown_recipient",
+                extra={"to_address": parsed.to_address},
+            )
+            return {"status": "dropped"}
+
+    result = await handle_email_inbound(
+        tenant_id=tenant_id,
+        parsed=parsed,
+        channel_id=channel.id,
+        responder_factory=lambda: SimpleResponder(),
+        outbound=_email_outbound,
+    )
+    if result is None:
+        return {"status": "duplicate"}
+    return {"status": "ok", **result.__dict__}

@@ -56,6 +56,16 @@ class Conversation(Base):
         ForeignKey("tickets.id"),
         nullable=True,
     )
+    # M2.B / Stage 16 — email channel thread routing. ``email_thread_id``
+    # is the SES thread key (In-Reply-To > References[0] > self
+    # message_id); conversations sharing the same thread belong to the
+    # same customer dialog. ``email_message_id_header`` is the RFC-2822
+    # ``Message-ID`` of the most recently processed email; the UNIQUE
+    # constraint on this column is the SES-retry dedup boundary.
+    email_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    email_message_id_header: Mapped[str | None] = mapped_column(
+        String(128), nullable=True
+    )
 
     __table_args__ = (
         Index(

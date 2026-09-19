@@ -120,6 +120,22 @@ class Settings(BaseSettings):
     qa_judge_timeout_seconds: float = Field(default=10.0, alias="QA_JUDGE_TIMEOUT_SECONDS")
     qa_judge_max_retries: int = Field(default=1, alias="QA_JUDGE_MAX_RETRIES")
 
+    # Stage 16 / M2.B — AWS / SES outbound credentials. The inbound webhook
+    # resolves the tenant + EmailChannel by ``to_address``; outbound uses
+    # these credentials to call SES SendEmail v2 directly (no boto3).
+    # ``aws_*_id`` / ``aws_*_key`` default to empty strings so the API
+    # still boots without credentials — outbound will simply fail at
+    # send time, which is the right failure mode for a demo / CI env.
+    aws_region: str = Field(default="us-east-1", alias="AWS_REGION")
+    aws_access_key_id: str = Field(default="", alias="AWS_ACCESS_KEY_ID")
+    aws_secret_access_key: str = Field(default="", alias="AWS_SECRET_ACCESS_KEY")
+    ses_from_address: str = Field(default="support@demo.test", alias="SES_FROM_ADDRESS")
+    # Demo fallback for the email inbound webhook when no X-Tenant-ID
+    # header is supplied. Production wires this via the EmailChannel
+    # row's ``config_json["tenant_id"]`` lookup; this default keeps the
+    # single-tenant demo path working.
+    default_tenant_id: str = Field(default="", alias="DEFAULT_TENANT_ID")
+
     # CORS / widget origin allowlist (M1: single global allowlist).
     # Applied to both the HTTP CORS middleware and the WebSocket origin
     # check in `widget/ws/router.py`. Production must override this via
