@@ -94,8 +94,7 @@ M4 的整体目标是落地一个**生产可用的 LLM Gateway**。M4.A 是入�
 
 - `apps/api/src/agent/llm_factory.py`:
   - `_default_llm_client_factory(tenant_id)` → 返回 `LLMGateway`。
-  - 新增 `default_resolver_for(gateway) -> Callable[[ChatRequest], BaseProvider]` 辅助。
-  - 新增 `make_client_for_request(gateway, request)` 工厂(供 with_config 之外的高级用法)。
+  - 新增 `default_resolver(gateway) -> Callable[[ChatRequest], BaseProvider]` 辅助(返回 `gateway.resolve`,纯转发,便于调用点注入)。
 
 - 5 个调用点迁移(每个仅改 1-2 行):
   - `apps/api/src/agent/simple_responder.py`
@@ -139,7 +138,7 @@ resp = await client.chat(ChatRequest(model="ignored", messages=[...]))
 # 实际请求: MiniMax provider,model="MiniMax-M3",route_mode="pinned"
 ```
 
-`with_config` 返回的 pinned resolver 是闭包:忽略 `request.model`,直接返回预绑定的 provider 对象。LLMClient 在 `chat_with_structured_output` 中需要把 `request.model` 改写为 pinned 的 model 名,以便 metric 中记录正确 model 字段 — 在 `LLMClient.chat()` 入口处处理(检测 resolver 是否有 `_pinned_model` 属性,有则覆盖 request.model)。
+`with_config` 返回的 pinned resolver 是闭包:忽略 `request.model`,直接返回预绑定的 provider 对象。但为了 metric label 中 `model` 字段准确,`LLMClient.chat()` 入口处会用 `isinstance(resolver, _PinnedResolver)` 检测;若是,先 `request = request.model_copy(update={"model": resolver._pinned_model})` 再传给 provider。`_PinnedResolver` 是 `Protocol` 类(PEP 544 结构化子类),不依赖私有属性嗅探。
 
 ---
 
@@ -178,7 +177,7 @@ resp = await client.chat(ChatRequest(model="ignored", messages=[...]))
 - `lumen_llm_calls_total{provider, model, outcome}` — Stage 11.3 已发布
 - `lumen_llm_tokens_total{provider, model, direction}` — Stage 11.3 已发布
 
-**新增 label**:在两个 metric 上加 `route_mode`,枚举值固定 4 个(`auto` / `pinned` / `unknown_model` / `resolver_error`),总基数不变(从原本的 ~500 时间序列变成 ~2000,Prometheus 完全可承受)。
+**新增 label**:在两个 metric 上加 `route_mode`,枚举值固定 4 个(`auto` / `pinned` / `unknown_model` / `resolver_error`),基数 ~4x。既有 labels 估算:provider ~5 × model ~30 × outcome ~5 = ~750 时间序列;加 route_mode 后 ~3000。Prometheus 完全可承受。
 
 > 兼容性:既有 dashboard / alert 规则已按 `{provider, model, outcome}` 聚合。新增 label 是**安全的维度补充**,不会破坏既有查询(它们只是少了 route_mode 维度,聚合时 sum 不变)。
 
