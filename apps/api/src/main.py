@@ -294,4 +294,10 @@ async def email_inbound_webhook(request: Request):
         # so the caller can correlate the conversation_id.
         return {"status": "duplicate"}
     status = "duplicate" if result.is_duplicate else "ok"
-    return {"status": status, **result.__dict__}
+    return {
+        "status": status,
+        "conversation_id": result.conversation_id,
+        "message_id": result.message_id,
+        "ai_message_id": result.ai_message_id,
+        "ai_content": result.ai_content,
+    }
