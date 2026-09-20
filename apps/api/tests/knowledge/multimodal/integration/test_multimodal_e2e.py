@@ -492,3 +492,126 @@ def test_retriever_rrf_fusion_empty():
     from knowledge.multimodal.retriever import MultimodalRetriever
 
     assert MultimodalRetriever._rrf_fuse([], []) == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_pdf_text_chunks_indexed_to_article_chunks(
+    tenant_factory: Tenant,
+    tmp_path,
+) -> None:
+    """Uploading a PDF writes text chunks into the article_chunks Qdrant
+    collection (tech debt #18) in addition to image vectors.
+
+    Asserts:
+    - embed_texts is called once with the PDF's text chunks
+    - qdrant.upsert is called with collection_name="article_chunks"
+    - Each point carries source_type="pdf_text" + page_num + chunk_index
+    - Point count matches len(text_chunks)
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from qdrant_client import AsyncQdrantClient
+
+    from tests.fixtures._generate_pdfs import make_table_pdf
+
+    # 1. Mock Qdrant client to capture upsert calls.
+    #    We avoid ``spec=AsyncQdrantClient`` because the real spec
+    #    includes async-context-manager dunders that don't survive
+    #    ``MagicMock`` cleanly. A plain MagicMock with the methods
+    #    we touch explicitly is enough for this test.
+    qdrant_mock = MagicMock()
+    qdrant_mock.upsert = AsyncMock()
+    qdrant_mock.get_collections = AsyncMock(
+        return_value=MagicMock(collections=[])
+    )
+    # ``ensure_image_collection`` short-circuits to True when the
+    # collection already exists, so we don't have to mock
+    # ``create_collection`` against a real Qdrant server.
+    qdrant_mock.collection_exists = AsyncMock(return_value=True)
+
+    # 2. Mock embed_texts to return deterministic 1536-dim vectors.
+    #    ``embed_texts`` returns an ``EmbeddingResult`` dataclass, but
+    #    since the test only inspects upsert() payloads we don't need
+    #    a real dataclass — a plain dict with the same shape works
+    #    (the API will read ``.vectors`` off it; we adapt below).
+    fake_vectors: list[list[float]] = []
+
+    async def fake_embed_texts(*, texts: list[str], **kwargs):
+        for t in texts:
+            fake_vectors.append([float(len(t))] + [0.0] * 1535)
+        # Return an object that quacks like EmbeddingResult.
+        from llm_client.types import EmbeddingResult
+        return EmbeddingResult(
+            vectors=fake_vectors[-len(texts):],
+            model="fake-model",
+            prompt_tokens=0,
+            total_tokens=0,
+        )
+
+    # 3. Mock vision embedder (1024-dim is the real DoubaoVisionEmbedder default).
+    fake_image_vector = [0.1] * 1024
+
+    # 4. Generate a small multi-page PDF via the reportlab fixture.
+    #    ``make_table_pdf`` writes to disk (takes a ``path: str``),
+    #    so write into ``tmp_path`` and read the bytes back.
+    pdf_path = tmp_path / "table.pdf"
+    make_table_pdf(str(pdf_path))
+    pdf_bytes = pdf_path.read_bytes()
+
+    # 5. Build app + client
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(kb_multimodal_router)
+    token = create_access_token(
+        tenant_id=tenant_factory.id, user_id="admin-1", role="admin"
+    )
+
+    with patch(
+        "knowledge.multimodal.api.get_qdrant_client", return_value=qdrant_mock
+    ), \
+         patch("llm_client.embeddings.embed_texts", side_effect=fake_embed_texts), \
+         patch(
+             "knowledge.multimodal.api.DoubaoVisionEmbedder",
+             return_value=_mock_embedder(),
+         ), \
+         patch(
+             "knowledge.multimodal.api.get_object_store",
+             return_value=_mock_object_store(),
+         ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.post(
+                "/api/v1/kb-articles/multimodal",
+                data={"kb_slug": "test-kb", "title": "Test"},
+                headers={"Authorization": f"Bearer {token}"},
+                files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
+            )
+
+    assert resp.status_code in (200, 201), resp.text
+
+    # 6. Assert: at least one upsert call targeted article_chunks.
+    article_chunks_calls = [
+        call for call in qdrant_mock.upsert.call_args_list
+        if call.kwargs.get("collection_name") == "article_chunks"
+    ]
+    assert article_chunks_calls, (
+        "expected at least one upsert to article_chunks; "
+        f"got collections: {[c.kwargs.get('collection_name') for c in qdrant_mock.upsert.call_args_list]}"
+    )
+
+    # 7. Assert payload shape — every article_chunks point carries
+    #    the expected pdf_text metadata.
+    for call in article_chunks_calls:
+        for point in call.kwargs["points"]:
+            payload = point.payload
+            assert payload["tenant_id"] == tenant_factory.id
+            assert payload["kb_slug"] == "test-kb"
+            assert payload["source_type"] == "pdf_text"
+            assert "page_num" in payload
+            assert "chunk_index" in payload
+            assert "text" in payload
+            assert isinstance(point.vector, list)
+            assert len(point.vector) == 1536
