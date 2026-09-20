@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class ExtractedPdf:
     text_chunks: list[str]
+    # ``text_chunk_pages[i]`` is the 1-indexed PDF page number that
+    # ``text_chunks[i]`` was extracted from. Parallel to
+    # ``text_chunks`` (same length, same order) so callers can zip
+    # them together to build per-page metadata (used by the M2.B
+    # multimodal upload handler when indexing PDF text chunks into
+    # the ``article_chunks`` Qdrant collection — see
+    # ``knowledge.multimodal.api.upload_multimodal``).
+    text_chunk_pages: list[int]
     screenshot_pages: list[tuple[int, bytes]]  # (page_number_1_indexed, png_bytes)
 
 
@@ -47,6 +55,7 @@ class PdfProcessor:
         (text_chunks + screenshots collected so far).
         """
         text_chunks: list[str] = []
+        text_chunk_pages: list[int] = []
         screenshot_pages: list[tuple[int, bytes]] = []
 
         try:
@@ -70,6 +79,11 @@ class PdfProcessor:
                             chunk = page_text[i : i + self._chunk_size]
                             if chunk.strip():
                                 text_chunks.append(chunk)
+                                # Track the 1-indexed PDF page each
+                                # chunk was extracted from so the
+                                # downstream indexer can stamp
+                                # ``page_num`` on the Qdrant payload.
+                                text_chunk_pages.append(page_idx)
 
                     # 2. Key-page detection (images OR tables)
                     try:
@@ -97,7 +111,11 @@ class PdfProcessor:
             )
             # Return partial result
 
-        return ExtractedPdf(text_chunks=text_chunks, screenshot_pages=screenshot_pages)
+        return ExtractedPdf(
+            text_chunks=text_chunks,
+            text_chunk_pages=text_chunk_pages,
+            screenshot_pages=screenshot_pages,
+        )
 
     def _screenshot_page(self, pdf_bytes: bytes, page_num_1_indexed: int) -> bytes | None:
         """Render one page to PNG via pdf2image (poppler).

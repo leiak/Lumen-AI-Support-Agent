@@ -559,7 +559,10 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
     with patch(
         "knowledge.multimodal.api.get_qdrant_client", return_value=qdrant_mock
     ), \
-         patch("llm_client.embeddings.embed_texts", side_effect=fake_embed_texts), \
+         patch(
+             "knowledge.multimodal.api.embed_texts",
+             side_effect=fake_embed_texts,
+         ), \
          patch(
              "knowledge.multimodal.api.DoubaoVisionEmbedder",
              return_value=_mock_embedder(),

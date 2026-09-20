@@ -56,7 +56,10 @@ from knowledge.models import KbMultimodalArticle
 from knowledge.multimodal.embedder import DoubaoVisionEmbedder
 from knowledge.multimodal.pdf_processor import PdfProcessor
 from knowledge.multimodal.storage import ObjectStoreError, get_object_store
+from knowledge.qdrant_client import DEFAULT_COLLECTION
 from knowledge.startup import ensure_image_collection
+from llm_client.embeddings import EmbeddingError, embed_texts
+from qdrant_client.models import PointStruct
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/kb-articles", tags=["kb-multimodal"])
@@ -269,11 +272,89 @@ async def upload_multimodal(
     finally:
         await embedder.aclose()
 
+    # 3.5. Resolve the Qdrant client once. Both the text-chunk
+    #      upsert (3.5 below) and the image-vector upsert
+    #      (section 4) need it; resolving it here avoids a second
+    #      singleton lookup in section 4.
+    qdrant = get_qdrant_client()
+
+    # 3.6. Index PDF text chunks into the article_chunks collection
+    #      (tech debt #18). Mirrors the M1 worker
+    #      (:func:`knowledge.worker.index_article`) payload keys
+    #      (``tenant_id``, ``kb_slug``, ``article_id``) plus
+    #      ``source_type="pdf_text"`` + ``page_num`` + ``chunk_index``
+    #      so the MultimodalRetriever's existing RRF merge over
+    #      ``DEFAULT_COLLECTION`` + ``kb_image_vectors`` returns
+    #      PDF text in the same result set as regular KB articles.
+    text_chunks: list[str] = (
+        list(extracted.text_chunks) if mime_type == "application/pdf" else []
+    )
+    text_chunk_pages: list[int] = (
+        list(extracted.text_chunk_pages) if mime_type == "application/pdf" else []
+    )
+    if text_chunks:
+        try:
+            embed_result = await embed_texts(
+                texts=text_chunks,
+                tenant_id=tenant_id,
+            )
+            text_points = [
+                PointStruct(
+                    id=new_id(),
+                    vector=vec,
+                    payload={
+                        "tenant_id": tenant_id,
+                        "kb_slug": kb_slug,
+                        "article_id": article_id,
+                        "source_type": "pdf_text",
+                        "page_num": page_num,
+                        "chunk_index": idx,
+                        "text": text,
+                    },
+                )
+                for idx, (page_num, text, vec)
+                in enumerate(
+                    zip(
+                        text_chunk_pages,
+                        text_chunks,
+                        embed_result.vectors,
+                    )
+                )
+            ]
+            await qdrant.upsert(
+                collection_name=DEFAULT_COLLECTION,
+                points=text_points,
+                wait=True,
+            )
+        except EmbeddingError as exc:
+            log.warning(
+                "kb.multimodal.text_embedding_failed",
+                tenant_id=tenant_id,
+                kb_slug=kb_slug,
+                article_id=article_id,
+                error_type=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="embedding service unavailable"
+            ) from exc
+        except Exception as exc:
+            # Defense in depth: a Qdrant outage must not crash the
+            # upload.
+            log.warning(
+                "kb.multimodal.text_upsert_failed",
+                tenant_id=tenant_id,
+                kb_slug=kb_slug,
+                article_id=article_id,
+                error_type=type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail="vector store unavailable"
+            ) from exc
+
     # 4. Insert image vectors into the kb_image_vectors Qdrant
     #    collection. We ensure the collection exists inside the
     #    handler too (defense against a fresh Qdrant after a
     #    restart that lost the bootstrap window).
-    qdrant = get_qdrant_client()
     ok = await ensure_image_collection(
         qdrant, dimension=embedder.dimension
     )
@@ -289,8 +370,6 @@ async def upload_multimodal(
         )
 
     if image_vectors:
-        from qdrant_client.models import PointStruct
-
         points = [
             PointStruct(
                 id=new_id(),
