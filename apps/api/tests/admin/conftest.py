@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from auth.jwt import create_access_token
 from core.database import get_session, get_sessionmaker, reset_engine, reset_sessionmaker
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
@@ -75,4 +76,48 @@ async def sample_tenant() -> AsyncIterator[Tenant]:
         await _delete_tenant(tenant.id)
 
 
-__all__ = ["async_client", "db_session", "sample_tenant"]
+def auth_headers(token: str) -> dict[str, str]:
+    """Build the ``Authorization`` header dict for a JWT bearer token."""
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def admin_token_for():
+    """Return a callable that issues an admin JWT for the given tenant.
+
+    Usage in a test::
+
+        async def test_x(async_client, sample_tenant, admin_token_for):
+            token = admin_token_for(tenant_id=sample_tenant.id, user_id="admin-1")
+            resp = await async_client.get("/api/v1/admin/kb-drafts",
+                                           headers=auth_headers(token))
+    """
+
+    def _make(*, tenant_id: str, user_id: str = "admin-1") -> str:
+        return create_access_token(
+            tenant_id=tenant_id, user_id=user_id, role="admin"
+        )
+
+    return _make
+
+
+@pytest.fixture
+def non_admin_token_for():
+    """Return a callable that issues a non-admin (agent) JWT for the given tenant."""
+
+    def _make(*, tenant_id: str, user_id: str = "agent-1") -> str:
+        return create_access_token(
+            tenant_id=tenant_id, user_id=user_id, role="agent"
+        )
+
+    return _make
+
+
+__all__ = [
+    "admin_token_for",
+    "async_client",
+    "auth_headers",
+    "db_session",
+    "non_admin_token_for",
+    "sample_tenant",
+]
