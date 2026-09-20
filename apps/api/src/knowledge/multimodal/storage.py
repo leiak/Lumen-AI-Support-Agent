@@ -34,7 +34,7 @@ class S3ObjectStore:
     def __init__(
         self,
         *,
-        endpoint: str,
+        endpoint: str | None,
         bucket: str,
         access_key: str,
         secret_key: str,
@@ -43,7 +43,8 @@ class S3ObjectStore:
     ) -> None:
         self._bucket = bucket
         self._max_retries = max_retries
-        # Lazy client — boto3 client creation can be slow
+        # Eager init — boto3 client is constructed once per S3ObjectStore
+        # instance and reused for the lifetime of the store.
         self._client = boto3.client(
             "s3",
             endpoint_url=endpoint,
@@ -70,13 +71,19 @@ class S3ObjectStore:
         return response["Body"].read()
 
     def get_url(self, key: str) -> str:
-        """Return a URL string. For local dev (MinIO) this is the endpoint URL;
-        for production S3, it could be a presigned URL or a CDN URL.
+        """Return a URL string.
+
+        For MinIO (dev with explicit ``endpoint_url``), uses the endpoint URL.
+        For AWS S3 (production, boto3 auto-resolves to ``*.amazonaws.com``),
+        uses virtual-hosted–style URL.
         """
-        client = self._client
-        # endpoint_url is set on the client; meta.endpoint_url returns it
-        endpoint = client.meta.endpoint_url.rstrip("/")
-        return f"{endpoint}/{self._bucket}/{key}"
+        endpoint = (self._client.meta.endpoint_url or "").rstrip("/")
+        if endpoint and ".amazonaws.com" not in endpoint:
+            # Custom endpoint (e.g. MinIO) — path-style URL is fine.
+            return f"{endpoint}/{self._bucket}/{key}"
+        # Real AWS S3 — virtual-hosted–style URL (canonical form).
+        region = self._client.meta.region_name or "us-east-1"
+        return f"https://{self._bucket}.s3.{region}.amazonaws.com/{key}"
 
     def delete(self, key: str) -> None:
         """Delete an object. No-op if not found."""
@@ -98,3 +105,11 @@ def get_object_store() -> S3ObjectStore:
         access_key=s.object_store_access_key,
         secret_key=s.object_store_secret_key,
     )
+
+
+def reset_object_store() -> None:
+    """Clear the lru_cache so the next call re-reads settings.
+
+    For test isolation parity with :func:`core.config.reset_settings`.
+    """
+    get_object_store.cache_clear()

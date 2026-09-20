@@ -18,6 +18,7 @@ import asyncio
 import base64
 import logging
 from dataclasses import dataclass
+from typing import ClassVar
 
 import httpx
 
@@ -32,14 +33,20 @@ class EmbeddingResult:
 
 class VisionEmbedder:
     """Abstract interface — concrete implementations below."""
-    dimension: int = 1024
+    dimension: ClassVar[int] = 1024
 
     async def encode(self, image_bytes: bytes, *, mime_type: str) -> EmbeddingResult:
         raise NotImplementedError
 
 
 class DoubaoVisionEmbedder(VisionEmbedder):
-    """Calls Doubao multimodal embeddings API via OpenAI-compatible shape."""
+    """Calls Doubao multimodal embeddings API via OpenAI-compatible shape.
+
+    The :class:`httpx.AsyncClient` is long-lived (one per embedder
+    instance) so the HTTP connection pool is reused across calls.
+    Callers MUST ``await embedder.aclose()`` when done (or use the
+    embedder as an async context manager).
+    """
 
     def __init__(
         self,
@@ -56,16 +63,26 @@ class DoubaoVisionEmbedder(VisionEmbedder):
         self._model = model
         self._timeout = timeout_seconds
         self._max_retries = max_retries
+        self._client = httpx.AsyncClient(timeout=self._timeout)
+
+    async def aclose(self) -> None:
+        """Close the underlying :class:`httpx.AsyncClient`."""
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "DoubaoVisionEmbedder":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()
 
     async def _post(self, payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._base_url}/embeddings",
-                json=payload,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-            )
-            resp.raise_for_status()
-            return resp.json()
+        resp = await self._client.post(
+            f"{self._base_url}/embeddings",
+            json=payload,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def encode(self, image_bytes: bytes, *, mime_type: str) -> EmbeddingResult:
         # Graceful degradation: no key configured
@@ -91,7 +108,7 @@ class DoubaoVisionEmbedder(VisionEmbedder):
                 resp = await self._post(payload)
                 vec = resp["data"][0]["embedding"]
                 return EmbeddingResult(vector=vec, model=self._model)
-            except (httpx.HTTPStatusError, httpx.HTTPError) as e:
+            except httpx.HTTPError as e:
                 last_exc = e
                 if attempt < self._max_retries - 1:
                     await asyncio.sleep(0.5 * (2 ** attempt))

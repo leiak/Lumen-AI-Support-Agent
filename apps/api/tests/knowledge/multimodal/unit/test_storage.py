@@ -57,21 +57,10 @@ def test_botocore_client_uses_adaptive_retry_config(store):
     call is counted) varies across botocore versions. We only assert
     the mode here + that total attempts >= 3 (the SLO we care about).
     """
-    import boto3
-    from botocore.client import Config
-
-    # Re-build the client with the same params and assert its config.
-    rebuilt = boto3.client(
-        "s3",
-        endpoint_url="http://localhost:9000",
-        aws_access_key_id="ak",
-        aws_secret_access_key="sk",
-        region_name="us-east-1",
-        config=Config(retries={"max_attempts": 3, "mode": "adaptive"}),
-    )
-    retries = rebuilt.meta.config.retries
-    assert retries["mode"] == "adaptive"
-    assert retries["total_max_attempts"] >= 3
+    config = store._client.meta.config
+    # botocore normalizes max_attempts → total_max_attempts
+    assert config.retries["mode"] == "adaptive"
+    assert config.retries["total_max_attempts"] >= 3
 
 
 def test_put_propagates_client_error_without_app_retry(store):
@@ -98,3 +87,22 @@ def test_get_url_returns_cdn_style(store):
     url = store.get_url("kb/img.png")
     assert "test-bucket" in url
     assert "kb/img.png" in url
+
+
+def test_get_url_for_real_s3_when_no_endpoint():
+    """Real AWS S3 (no ``endpoint_url``) → virtual-hosted–style URL.
+
+    Defends against the production crash where ``meta.endpoint_url`` is
+    ``None`` (real AWS, no override) and ``rstrip("/")`` would raise
+    ``AttributeError``. The fallback builds the canonical S3 URL.
+    """
+    store = S3ObjectStore(
+        endpoint=None,  # No endpoint → real AWS S3
+        bucket="prod-bucket",
+        access_key="ak",
+        secret_key="sk",
+        region="us-west-2",
+    )
+    url = store.get_url("kb/img.png")
+    assert url == "https://prod-bucket.s3.us-west-2.amazonaws.com/kb/img.png"
+    assert "localhost" not in url

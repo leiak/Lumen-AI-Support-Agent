@@ -1,18 +1,22 @@
 """Tests for Doubao vision embedder (M2.B / Stage 17)."""
 import pytest
+import pytest_asyncio
 from unittest.mock import patch, AsyncMock, MagicMock
 from knowledge.multimodal.embedder import (
     DoubaoVisionEmbedder, VisionEmbedder, EmbeddingResult,
 )
 
 
-@pytest.fixture
-def embedder():
-    return DoubaoVisionEmbedder(
+@pytest_asyncio.fixture
+async def embedder():
+    """Async fixture — closes the long-lived httpx client on teardown."""
+    e = DoubaoVisionEmbedder(
         api_key="test-key",
         base_url="https://ark.cn-beijing.volces.com/api/v3",
         model="doubao-embedding-vision",
     )
+    yield e
+    await e.aclose()
 
 
 @pytest.mark.asyncio
@@ -58,12 +62,16 @@ async def test_encode_retries_on_5xx(embedder):
 async def test_encode_returns_empty_when_api_key_missing():
     """Empty api_key → return zero vector + warning (graceful degradation)."""
     embedder = DoubaoVisionEmbedder(api_key="", base_url="x", model="y")
-    result = await embedder.encode(b"data", mime_type="image/png")
+    try:
+        result = await embedder.encode(b"data", mime_type="image/png")
+    finally:
+        await embedder.aclose()
     assert len(result.vector) == 1024
     assert all(v == 0.0 for v in result.vector)
 
 
 def test_embedder_dim_is_1024():
     """The vector dimension must match Qdrant collection config."""
-    embedder = DoubaoVisionEmbedder(api_key="x", base_url="x", model="x")
-    assert embedder.dimension == 1024
+    # ClassVar — read directly from the class, no need to instantiate.
+    assert DoubaoVisionEmbedder.dimension == 1024
+    assert VisionEmbedder.dimension == 1024
