@@ -138,11 +138,12 @@ Add `test_image_collection_alias_created_for_doubao` — assert `kb_image_vector
 
 ## Migration of existing data
 
-The `kb_image_vectors` collection (created by M2.B) is renamed to `kb_image_vectors_doubao`. Two options:
-- **(a) Qdrant collection rename** — Qdrant doesn't support rename; instead use snapshot + recreate + alias
-- **(b) Drop and recreate** — destructive; only acceptable if M2.B image data is non-production
+**No migration needed.** Qdrant supports **collection aliases** natively (https://qdrant.tech/documentation/concepts/collections/#collection-aliases). On startup, `ensure_image_collection` creates the per-provider physical collection (e.g. `kb_image_vectors_doubao`) and registers `kb_image_vectors` as an alias pointing at it. Existing data in `kb_image_vectors` (created by M2.B) is already on the physical collection that the alias will point to; no data movement required.
 
-**Decision: (b) + log a WARNING at startup if `kb_image_vectors` exists without the alias.** New deployments use the alias; old deployments drop the legacy collection on first boot after upgrade. Image embeddings are recomputed on next PDF upload.
+Implementation:
+1. `qdrant_client.create_collection(collection_name="kb_image_vectors_doubao", vectors_config=VectorParams(size=1024, distance=Distance.COSINE))` — idempotent (catches "already exists")
+2. `qdrant_client.update_collection_aliases(changes=[AliasOperations(create_alias=AliasCreation(alias_name="kb_image_vectors", collection_name="kb_image_vectors_doubao"))])` — idempotent (catches "alias exists")
+3. Old deployments that have `kb_image_vectors` as a **physical collection** (no alias): on first boot after upgrade, `ensure_image_collection` detects this and (a) creates `kb_image_vectors_doubao` as a new collection, (b) creates the alias — Qdrant does not allow an alias name to clash with a physical collection name. The startup logs a WARNING instructing the operator to either rename the legacy collection manually or drop it (image embeddings are recomputed on next PDF upload).
 
 ## PII discipline
 

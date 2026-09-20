@@ -64,7 +64,7 @@ if text_chunks:  # empty list for image-only PDFs
     )
 ```
 
-`text_chunks_n` (line 355) — already persisted on the DB row — stays as-is; it now reflects "what we indexed", not "what we discarded". Add a sibling column `image_chunks_count` if absent (audit value, even though we don't filter on it). Verify by reading the `KbMultimodalArticle` model — if the column is already named generically, rename is unnecessary.
+`text_chunks_n` (line 355) — already persisted on the DB row — stays as-is; it now reflects "what we indexed", not "what we discarded". The companion `image_chunks_count` column already exists on `KbMultimodalArticle` (`knowledge/models.py:295–298`) and is unaffected by this change.
 
 #### `apps/api/src/knowledge/multimodal/retriever.py`
 
