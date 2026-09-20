@@ -22,6 +22,7 @@ from httpx import AsyncClient
 from knowledge.models import Article, KbArticleDraft
 from sqlalchemy import select
 from tenant.models import Tenant
+from tests.admin.conftest import auth_headers
 
 
 @pytest.mark.integration
@@ -388,3 +389,129 @@ async def test_reject_already_rejected_returns_409(
         params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
     )
     assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Tech debt #17 — JWT auth on all 4 endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_list_drafts_without_token_returns_401(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    """No Authorization header → 401 (auth gate fires before tenant filter)."""
+    resp = await async_client.get(
+        "/api/v1/admin/kb-drafts",
+        params={"tenant_id": sample_tenant.id},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_list_drafts_with_non_admin_token_returns_403(
+    async_client: AsyncClient,
+    sample_tenant: Tenant,
+    non_admin_token_for,
+) -> None:
+    """Agent role → 403 (require_admin blocks)."""
+    token = non_admin_token_for(tenant_id=sample_tenant.id)
+    resp = await async_client.get(
+        "/api/v1/admin/kb-drafts",
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_draft_without_token_returns_401(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    resp = await async_client.get(
+        f"/api/v1/admin/kb-drafts/{new_id()}",
+        params={"tenant_id": sample_tenant.id},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_approve_without_token_returns_401(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    resp = await async_client.post(
+        f"/api/v1/admin/kb-drafts/{new_id()}/approve",
+        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_approve_with_non_admin_token_returns_403(
+    async_client: AsyncClient,
+    sample_tenant: Tenant,
+    non_admin_token_for,
+) -> None:
+    token = non_admin_token_for(tenant_id=sample_tenant.id)
+    resp = await async_client.post(
+        f"/api/v1/admin/kb-drafts/{new_id()}/approve",
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_reject_without_token_returns_401(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    resp = await async_client.post(
+        f"/api/v1/admin/kb-drafts/{new_id()}/reject",
+        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_approve_uses_jwt_sub_as_reviewer(
+    async_client: AsyncClient,
+    sample_tenant: Tenant,
+    admin_token_for,
+) -> None:
+    """After approve, draft.reviewed_by equals the JWT's sub claim, not a Query param."""
+    sm = get_sessionmaker()
+    draft_id = new_id()
+    async with sm() as session:
+        session.add(
+            KbArticleDraft(
+                id=draft_id,
+                tenant_id=sample_tenant.id,
+                cluster_id=0,
+                source_questions=["q1"],
+                suggested_title="T",
+                suggested_body="b",
+                suggested_tags=[],
+                status="DRAFT",
+            )
+        )
+        await session.commit()
+
+    token = admin_token_for(tenant_id=sample_tenant.id, user_id="custom-admin-id")
+    resp = await async_client.post(
+        f"/api/v1/admin/kb-drafts/{draft_id}/approve",
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with sm() as session:
+        draft_row = (
+            await session.execute(
+                select(KbArticleDraft).where(KbArticleDraft.id == draft_id)
+            )
+        ).scalar_one()
+        assert draft_row.reviewed_by == "custom-admin-id"
