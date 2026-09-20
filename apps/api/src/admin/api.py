@@ -180,7 +180,7 @@ async def list_kb_drafts(
 @router.get("/kb-drafts/{draft_id}")
 async def get_kb_draft(
     draft_id: str,
-    tenant_id: str = Query(...),
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
 ):
     """Return full draft details (incl. full ``suggested_body``).
 
@@ -189,6 +189,7 @@ async def get_kb_draft(
     end-to-end. Cross-tenant access returns 404 (anti-enumeration,
     matching the other per-row endpoints).
     """
+    tenant_id = claims["tenant_id"]
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
