@@ -315,7 +315,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 13. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(M2.A 之前用 `/inbox/{id}` 旁边 panel 占位,`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
 14. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批用真实 AI 回复跑 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
 15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
-16. **Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式
+16. ~~**Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式**~~ — M3 tech-debt #16完成 (webhook 通过 `Channel.config_json["address"]` 反查 `parsed.to_address` 解析 `tenant_id`;`X-Tenant-ID` header 不再用于解析,仅在与解析结果不符时记 WARNING `email.inbound.header_tenant_mismatch`;SES 5xx 重试路径 + 重复 `message_id` 也修复(`EmailInboundResult.is_duplicate` + `conversation_id` 返回);`default_tenant_id` config 字段保留向后兼容,webhook 已不读)
 17. ~~**Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)~~ — M3 tech-debt #17 完成 (4 endpoints `Depends(require_admin)`,`tenant_id` / `reviewer_id` 从 JWT claims 读,17 admin tests)
 18. ~~**PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)~~ — M3 tech-debt #18 完成 (PDF text chunks 入 `article_chunks` Qdrant collection,`source_type="pdf_text"` + `page_num` + `chunk_index` + `text`,`MultimodalRetriever` RRF 检索可见)
 19. **Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由
