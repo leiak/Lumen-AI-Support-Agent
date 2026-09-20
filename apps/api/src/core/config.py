@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -172,6 +172,32 @@ class Settings(BaseSettings):
     doubao_vision_model: str = Field(
         default="doubao-embedding-vision",
         alias="DOUBAO_VISION_MODEL",
+    )
+
+    # Stage 19 / M3 / tech-debt #19: pluggable vision embedder.
+    # ``vision_provider`` selects among Doubao (default, backward-compatible),
+    # OpenAI CLIP ViT-L/14 (768-dim), and Voyage Multimodal 3 (1024-dim).
+    # Each provider writes to its own Qdrant collection; the legacy
+    # ``kb_image_vectors`` name remains an alias for the default
+    # (Doubao) collection — see :func:`knowledge.startup.get_image_collection_name`.
+    vision_provider: Literal["doubao", "openai_clip", "voyage"] = Field(
+        default="doubao", alias="VISION_PROVIDER"
+    )
+
+    openai_clip_api_key: str = Field(default="", alias="OPENAI_CLIP_API_KEY")
+    openai_clip_base_url: str = Field(
+        default="https://api.openai.com/v1",
+        alias="OPENAI_CLIP_BASE_URL",
+    )
+    openai_clip_model: str = Field(
+        default="clip-vit-large-patch14",
+        alias="OPENAI_CLIP_MODEL",
+    )
+
+    voyage_api_key: str = Field(default="", alias="VOYAGE_API_KEY")
+    voyage_model: str = Field(
+        default="voyage-multimodal-3",
+        alias="VOYAGE_MODEL",
     )
 
     object_store_endpoint: str = Field(
