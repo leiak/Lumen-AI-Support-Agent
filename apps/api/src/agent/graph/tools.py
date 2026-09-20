@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.tools import BaseTool, tool
 from pydantic import BaseModel, Field
+from qdrant_client import AsyncQdrantClient
 
 from conversation.service import ConversationService
 from core.logging import get_logger
@@ -398,12 +399,202 @@ def make_search_internal_kb_tool(
     return search_internal_kb
 
 
+# ---------------------------------------------------------------------------
+# Stage 17 / M2.B Task 6 — multimodal KB tool.
+# ---------------------------------------------------------------------------
+#
+# ``search_multimodal_kb`` is a SIBLING to ``search_internal_kb`` rather
+# than a replacement. The two tools serve different retrieval shapes:
+#
+# * ``search_internal_kb`` — text-only RAG over the M1
+#   ``article_chunks`` collection. 131 agent tests pin this contract.
+#   We deliberately do NOT mutate its body to call the new
+#   :class:`MultimodalRetriever` — touching that surface would
+#   cascade into every test that mocks ``rag_service.retrieve``.
+#
+# * ``search_multimodal_kb`` — multimodal RRF-fused retrieval
+#   (text + image collections). Stage 17+ is when the LLM starts
+#   handling screenshots / diagrams in customer conversations,
+#   so the new tool exposes the broader search shape.
+#
+# Both tools share the same per-turn ``_escalation_ctx`` ContextVar
+# binding and the same tenant-isolation invariant: the LLM never
+# supplies ``tenant_id`` — it's always pulled from the ContextVar.
+
+
+class SearchMultimodalKbArgs(BaseModel):
+    """Pydantic schema for ``search_multimodal_kb`` tool arguments."""
+
+    query: str = Field(
+        ...,
+        description=(
+            "Natural-language search query. Will be embedded via the "
+            "tenant's configured text embedding model and matched against "
+            "both the M1 text chunk collection AND the multimodal image "
+            "collection. Results are fused with Reciprocal Rank Fusion."
+        ),
+    )
+    kb_slug: str | None = Field(
+        default=None,
+        description=(
+            "Optional KB slug to narrow the search to one knowledge base. "
+            "If omitted, the search fans out across all KBs the tenant has "
+            "access to."
+        ),
+    )
+    top_k: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "Number of fused results to return. Clamped to [1, 20] "
+            "server-side. The retriever fetches 2x this many from each "
+            "collection before RRF fusion."
+        ),
+    )
+
+
+def make_search_multimodal_kb_tool(
+    *,
+    rag_service: "RAGService",
+    kb_repository: "KnowledgeBaseRepository",
+    qdrant_client: AsyncQdrantClient,
+) -> BaseTool:
+    """Build a configured ``search_multimodal_kb`` tool.
+
+    Stage 17 / M2.B Task 6 — RRF-fused retrieval over the M1 text
+    chunk collection (``article_chunks``) and the new multimodal
+    image collection (``kb_image_vectors``). The text-query path
+    reuses :class:`RAGService` to compute the query embedding (so a
+    misconfigured embedding client fails the same way it would in
+    the existing tool). The image-query path is unused today (the
+    LLM only ever supplies text); the tool accepts ``None`` so the
+    signature stays forward-compatible when Stage 18+ lets the
+    customer paste a screenshot into the chat surface.
+
+    PII contract: returns Markdown with article titles + source-type
+    icons + opaque ULIDs. Never logs the query text or KB content.
+    """
+    _rag = rag_service
+    _kb_repo = kb_repository
+    _qdrant = qdrant_client
+
+    @tool("search_multimodal_kb", args_schema=SearchMultimodalKbArgs)
+    async def search_multimodal_kb(
+        query: str,
+        kb_slug: str | None = None,
+        top_k: int = 5,
+    ) -> str:
+        """Search the tenant's multimodal KB (text + images).
+
+        Use this when:
+        - The customer references a screenshot or diagram
+        - You want to look up diagrams / tables embedded in PDFs
+        - A pure text search returned low-relevance hits
+
+        Returns Markdown: top-k fused results with article title +
+        source-type icon (page emoji).
+        """
+        tenant_id, conversation_id = _current_escalation_ids()
+        if not tenant_id or not conversation_id:
+            log.warning(
+                "agent.graph.search_multimodal_kb_context_missing",
+                error_type="EscalationContextMissing",
+            )
+            return "Error: no active conversation context."
+
+        if not query.strip():
+            return "Error: empty query."
+
+        # ---- 1. resolve kb_slug -> knowledge_base_id (defensive) ----
+        knowledge_base_id: str | None = None
+        if kb_slug:
+            try:
+                kb = await _kb_repo.find_by_slug(
+                    tenant_id=tenant_id, slug=kb_slug
+                )
+            except Exception as exc:
+                log.warning(
+                    "agent.graph.search_multimodal_kb_kb_lookup_failed",
+                    tenant_id=tenant_id,
+                    error_type=type(exc).__name__,
+                )
+                kb = None
+            if kb is None:
+                # Cross-tenant or unknown slug — same UX as
+                # ``search_internal_kb`` (no hits, no enumeration).
+                return "No relevant multimodal articles found."
+            knowledge_base_id = kb.id
+
+        # ---- 2. embed the text query ---------------------------
+        try:
+            # The M1 embeddings module exposes a batch API
+            # (``embed_texts``) — we pass a single-element list and
+            # unwrap. The 500-char cap mirrors ``search_internal_kb``
+            # so an LLM that hallucinates a huge query string can't
+            # blow the embedding context window.
+            from llm_client.embeddings import embed_texts
+
+            embedding_result = await embed_texts(
+                texts=[query.strip()[:500]],
+            )
+            text_embedding = embedding_result.vectors[0]
+        except Exception as exc:
+            log.warning(
+                "agent.graph.search_multimodal_kb_embed_failed",
+                tenant_id=tenant_id,
+                error_type=type(exc).__name__,
+            )
+            return "Error: knowledge base is temporarily unavailable."
+
+        # ---- 3. RRF-fused retrieval ----------------------------
+        try:
+            from knowledge.multimodal.retriever import MultimodalRetriever
+
+            retriever = MultimodalRetriever(
+                _qdrant, top_k=max(1, min(top_k, 20))
+            )
+            hits = await retriever.retrieve(
+                tenant_id=tenant_id,
+                kb_slug=kb_slug,
+                text_query_embedding=text_embedding,
+                image_query_embedding=None,
+                knowledge_base_id=knowledge_base_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "agent.graph.search_multimodal_kb_retrieve_failed",
+                tenant_id=tenant_id,
+                error_type=type(exc).__name__,
+            )
+            return "Error: knowledge base is temporarily unavailable."
+
+        if not hits:
+            return "No relevant multimodal articles found."
+
+        # ---- 4. format Markdown bullets ----------------------
+        lines = [f"Found {len(hits[:5])} multimodal result(s):"]
+        for hit in hits[:5]:
+            title = (hit.metadata or {}).get("title") or "Untitled"
+            icon = "📄" if hit.source_type == "text" else "🖼️"
+            lines.append(
+                f"- {icon} **{title}** "
+                f"(article={hit.article_id}, chunk={hit.chunk_id}, "
+                f"rrf_score={hit.score:.4f})"
+            )
+        return "\n".join(lines)
+
+    return search_multimodal_kb
+
+
 # Public surface for tests / future tool additions.
 __all__ = [
     "EscalateArgs",
     "SearchInternalKbArgs",
+    "SearchMultimodalKbArgs",
     "bind_escalation_context",
     "make_escalate_tool",
     "make_search_internal_kb_tool",
+    "make_search_multimodal_kb_tool",
     "reset_escalation_context",
 ]

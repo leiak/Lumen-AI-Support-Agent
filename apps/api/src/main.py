@@ -14,14 +14,14 @@ from core.config import get_settings
 from core.health import aggregate_health, liveness, readiness
 from core.logging import configure_logging, get_logger
 from core.metrics import prometheus_metrics_middleware, render_metrics
-from core.qdrant import close_qdrant_client
+from core.qdrant import close_qdrant_client, get_qdrant_client
 from core.redis import close_redis, get_redis
 from core.request_context import (
     bind_request_context,
     clear_request_context,
     get_request_id,
 )
-from knowledge.startup import ensure_qdrant_collection
+from knowledge.startup import ensure_image_collection, ensure_qdrant_collection
 from llm_client.embeddings import aclose_default_client
 
 
@@ -39,6 +39,11 @@ async def lifespan(app: FastAPI) -> Any:
     # when Qdrant is briefly unavailable; /health will surface the
     # degraded state.
     await ensure_qdrant_collection()
+    # Stage 17 / M2.B Task 6 — also ensure the multimodal image
+    # collection exists. Failures are logged at WARNING (the hook
+    # itself never raises) so a flaky Qdrant at boot doesn't block
+    # the API; uploads will get a 503 instead of crashing.
+    await ensure_image_collection(await get_qdrant_client())
     yield
     # Close the embedding client's singleton AsyncOpenAI so its HTTPX pool
     # is released; safe even if embed_texts was never called (no-op).
@@ -169,6 +174,7 @@ from conversation.api import router as conversations_router  # noqa: E402
 from core.database import get_sessionmaker  # noqa: E402
 from core.email_parser import parse_ses_inbound  # noqa: E402
 from knowledge.api import router as knowledge_router  # noqa: E402
+from knowledge.multimodal.api import router as kb_multimodal_router  # noqa: E402
 from ticket.api import router as tickets_router  # noqa: E402
 from widget.api import router as widget_router  # noqa: E402
 from widget.ws.router import router as widget_ws_router  # noqa: E402
@@ -180,6 +186,7 @@ app.include_router(channels_router)
 app.include_router(conversations_router)
 app.include_router(feishu_webhook_router)
 app.include_router(knowledge_router)
+app.include_router(kb_multimodal_router)
 app.include_router(tickets_router)
 app.include_router(widget_router)
 app.include_router(widget_ws_router)

@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
     Index,
@@ -247,6 +248,54 @@ class Chunk(Base):
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     qdrant_point_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class KbMultimodalArticle(Base):
+    """Stage 17 / M2.B Task 6 — metadata for an image/PDF KB article.
+
+    The actual file bytes live in S3/MinIO (see
+    :class:`knowledge.multimodal.storage.S3ObjectStore`); the vectors
+    live in the new ``kb_image_vectors`` Qdrant collection.
+
+    This table is intentionally separate from the M1 ``Article`` model
+    so the M1 RAG pipeline (chunks + embeddings + indexer) stays
+    untouched. Multimodal articles are a Stage 17+ capability; mixing
+    the two lifecycles (status=INDEXING vs. simple upload-and-done)
+    would muddy both schemas.
+
+    PII contract: ``title`` may carry customer-meaningful text. It is
+    only logged at INFO when we already have the tenant context, and
+    is NEVER echoed back to a cross-tenant caller (the API never
+    exposes a GET endpoint that returns this row by ID — searches go
+    through Qdrant + RRF which filter on ``tenant_id``).
+    """
+
+    __tablename__ = "kb_multimodal_articles"
+    __table_args__ = (
+        Index(
+            "idx_kb_mm_articles_tenant_kb",
+            "tenant_id",
+            "kb_slug",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    kb_slug: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    file_url: Mapped[str] = mapped_column(Text, nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    text_chunks_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    image_chunks_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
