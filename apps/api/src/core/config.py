@@ -130,10 +130,13 @@ class Settings(BaseSettings):
     aws_access_key_id: str = Field(default="", alias="AWS_ACCESS_KEY_ID")
     aws_secret_access_key: str = Field(default="", alias="AWS_SECRET_ACCESS_KEY")
     ses_from_address: str = Field(default="support@demo.test", alias="SES_FROM_ADDRESS")
-    # Demo fallback for the email inbound webhook when no X-Tenant-ID
-    # header is supplied. Production wires this via the EmailChannel
-    # row's ``config_json["tenant_id"]`` lookup; this default keeps the
-    # single-tenant demo path working.
+    # Historical demo fallback for the email inbound webhook when no
+    # X-Tenant-ID header was supplied. As of tech-debt #16 (shipped), the
+    # webhook resolves tenant identity via Channel reverse-lookup on
+    # ``parsed.to_address`` instead of trusting any header — so this
+    # field is no longer read by the webhook. Retained for backward
+    # compatibility with existing ``.env`` files and external tooling
+    # that may still set ``DEFAULT_TENANT_ID``.
     default_tenant_id: str = Field(default="", alias="DEFAULT_TENANT_ID")
 
     # CORS / widget origin allowlist (M1: single global allowlist).
