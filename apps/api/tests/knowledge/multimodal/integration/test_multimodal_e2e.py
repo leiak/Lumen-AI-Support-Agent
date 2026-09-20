@@ -603,3 +603,140 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
             assert "text" in payload
             assert isinstance(point.vector, list)
             assert len(point.vector) == 1536
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_pdf_text_retrievable_via_search_multimodal_kb(
+    app_client: AsyncClient,
+    tenant_factory: Tenant,
+    auth_headers,
+    tmp_path,
+) -> None:
+    """After PDF upload, the multimodal retriever finds text chunks when
+    the user query semantically matches the PDF body.
+
+    Verifies the data is actually queryable (not just written) — the
+    end-to-end loop is: upload PDF → text chunks land in
+    ``article_chunks`` → :class:`MultimodalRetriever` returns them
+    with ``source_type="text"`` and the original PDF payload.
+
+    Tech debt #18, Task 3.
+    """
+    from knowledge.multimodal.retriever import MultimodalRetriever
+    from tests.fixtures._generate_pdfs import make_text_pdf
+
+    # 1. Generate the PDF on disk. ``make_text_pdf(path)`` has a
+    #    fixed signature (no ``body_text`` kwarg) — it emits a
+    #    3-page password-reset guide which is close enough to the
+    #    semantic intent of the test ("how do I reset my password?").
+    pdf_path = tmp_path / "reset.pdf"
+    make_text_pdf(str(pdf_path))
+    pdf_bytes = pdf_path.read_bytes()
+
+    # 2. Mock Qdrant — capture upsert + serve a deterministic
+    #    retrieval match. The retriever calls ``query_points``
+    #    (qdrant-client >= 1.14 unified API) and reads ``.points``
+    #    off the response, then constructs ``RetrievalHit`` from
+    #    each point's ``.id``, ``.score``, ``.payload``.
+    matched_point = MagicMock()
+    matched_point.id = "p1"
+    matched_point.score = 0.92
+    matched_point.payload = {
+        "tenant_id": tenant_factory.id,
+        "knowledge_base_id": "kb-1",
+        "kb_slug": "test-kb",
+        "article_id": "a1",
+        "source_type": "pdf_text",
+        "page_num": 1,
+        "chunk_index": 0,
+        "text": (
+            "Reset password instructions: go to settings, click "
+            "account, click reset password, and follow the email "
+            "link."
+        ),
+    }
+
+    qdrant_mock = MagicMock()
+    qdrant_mock.upsert = AsyncMock()
+    qdrant_mock.get_collections = AsyncMock(
+        return_value=MagicMock(collections=[])
+    )
+    # ``ensure_image_collection`` short-circuits when the collection
+    # already exists — no need to mock ``create_collection``.
+    qdrant_mock.collection_exists = AsyncMock(return_value=True)
+    qdrant_mock.query_points = AsyncMock(
+        return_value=MagicMock(points=[matched_point])
+    )
+
+    # 3. Mock embed_texts so the upload path doesn't try real
+    #    embeddings. ``EmbeddingResult`` is the real dataclass.
+    async def fake_embed_texts(*, texts: list[str], **kwargs):
+        from llm_client.types import EmbeddingResult
+
+        vectors = [[float(len(t))] + [0.0] * 1535 for t in texts]
+        return EmbeddingResult(
+            vectors=vectors,
+            model="fake-model",
+            prompt_tokens=0,
+            total_tokens=0,
+        )
+
+    with patch(
+        "knowledge.multimodal.api.get_qdrant_client",
+        return_value=qdrant_mock,
+    ), \
+         patch(
+             "knowledge.multimodal.api.embed_texts",
+             side_effect=fake_embed_texts,
+         ), \
+         patch(
+             "knowledge.multimodal.api.DoubaoVisionEmbedder",
+             return_value=_mock_embedder(),
+         ), \
+         patch(
+             "knowledge.multimodal.api.get_object_store",
+             return_value=_mock_object_store(),
+         ):
+        # 4. Upload the PDF — this writes text chunks into
+        #    ``article_chunks`` (asserted by the previous test).
+        resp = await app_client.post(
+            "/api/v1/kb-articles/multimodal",
+            data={"kb_slug": "test-kb", "title": "Reset"},
+            headers=auth_headers,
+            files={"file": ("reset.pdf", pdf_bytes, "application/pdf")},
+        )
+        assert resp.status_code in (200, 201), resp.text
+
+        # 5. Retrieve — construct the retriever against the SAME
+        #    Qdrant mock so the response is deterministic.
+        #    NOTE: the method is ``retrieve()`` (RRF-fused across
+        #    text + image collections), NOT ``search()``. ``top_k``
+        #    is a constructor arg, not a per-call kwarg.
+        retriever = MultimodalRetriever(qdrant_mock, top_k=5)
+        hits = await retriever.retrieve(
+            tenant_id=tenant_factory.id,
+            kb_slug="test-kb",
+            text_query_embedding=[0.0] * 1536,
+            image_query_embedding=None,
+        )
+
+    # 6. Assert: the retriever surfaced the PDF text chunk.
+    assert len(hits) >= 1, (
+        f"retriever returned no hits; the PDF text chunk was "
+        f"written but is not queryable"
+    )
+    top = hits[0]
+    # Text chunks from the article_chunks collection carry
+    # ``source_type="text"`` (image chunks would carry "image").
+    assert top.source_type == "text"
+    # The original payload survives the round trip as ``metadata``.
+    # The PDF-indexing path tags it with ``source_type="pdf_text"``,
+    # ``page_num``, and the chunk text — these are the fields the
+    # agent's tool surface relies on to cite the source.
+    assert top.metadata["source_type"] == "pdf_text"
+    assert "page_num" in top.metadata
+    assert "password" in top.metadata["text"].lower(), (
+        f"matched chunk text does not contain the password-reset "
+        f"content the query asked about: {top.metadata['text']!r}"
+    )
