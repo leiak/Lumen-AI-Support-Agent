@@ -26,8 +26,10 @@
 | 13 | M2.A — Ticket 领域 (独立 3 表 + 7 态状态机 + SLA 策略 + auto-create) | ✅ | 33 ticket tests |
 | 14 | M2.A — 实时质检 (Arq `qa_judge_worker` + 独立小 Judge LLM + `lumen_qa_*` 指标) | ✅ | 36 qa tests |
 | 15 | M2.A — 收尾 (README + demo-act4 + 已知技术债 + memory) | ✅ | 0 new tests, 3 demo screenshots |
-| 17 | M2.B — 多模态 KB (PNG/PDF + Qdrant vision collection + 4 multimodal tests) | ✅ | — |
+| 16 | M2.B — Email 渠道 (SES webhook 路由 + 纯文本回复 + 自动回信 + thread/dedup) | ✅ | 4 parser + 5 outbound + 1 inbound integration |
+| 17 | M2.B — 多模态 KB (PNG/PDF + Qdrant vision collection + RRF 检索 + 上传 API) | ✅ | ~20 multimodal unit + integration |
 | 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration |
+| 19 | M2.B — 收尾 (README + demo-act5 + 已知技术债 #18-20 + memory) | ✅ | 0 new tests, 3 demo stub PNGs |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -315,6 +317,9 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
 16. **Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式
 17. **Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)
+18. **PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)
+19. **Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由
+20. **KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)
 
 ## 仓库信息
 

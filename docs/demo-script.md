@@ -262,6 +262,46 @@ Recap of M1 capabilities:
 - `demo-act4-01` / `demo-act4-02` — **未生成**(Playwright spec `tests/e2e/demo-act4.spec.ts` / `tests/e2e/demo-act4-02.spec.ts` 已写,跑真 stack 后产 PNG)
 - `demo-act4-03` — **占位 PNG 已 commit**(1x1 stub,65 bytes),真截图需真 stack + 等待 5-30s 让 Judge worker 跑完。补抓命令:`npx playwright test tests/e2e/demo-act4-03.spec.ts`(Stage 15 暂未写 spec,沿用 `demo-act4.spec.ts` 模式补)
 
+## Act 5: Email + Multimodal KB + History Mining (M2.B,可选)
+
+**Story**:延续 Act 1-4 流程,展示 M2.B 在 M2.A 基础上新加的三块能力 — 邮件渠道端到端、PDF/图片入库后的多模态 RAG 检索、每周历史会话挖掘出 KB 草稿。
+
+**前置条件**(M2.B 增量):
+
+- 已 `alembic upgrade head`(包含 3 个新迁移:`13_email_thread.py`、`14_kb_multimodal.py`、`15_kb_drafts.py`)
+- `.env` 加 SES / MinIO / Doubao 凭据(`AWS_SES_*` / `S3_ENDPOINT` / `DOUBAO_VISION_API_KEY` 等)
+- 已启 Arq worker:`arq apps.api.src.workers.settings.WorkerSettings`(已注册 `qa_judge_worker` + `history_mining_worker`)
+- 客户邮箱地址:`support@demo.test`(SMTP 抓 SEC `mock-smtp` 容器;生产配 SES SNS confirmation)
+
+**Steps**
+
+1. **邮件渠道**:客户从真实邮箱发一封 `How do I reset password?` 到 `support@demo.test` → SEC `mock-smtp` 触发 POST `/api/v1/email/inbound` → `EmailParser` 解析 SES JSON → `inbound_email.py` 端到端走 `ConversationService.find_or_create_for_inbound` upsert(`email_thread_id` 路由:`in_reply_to` → `references[0]` → 自身 `message_id`)→ AI 自动生成回复 → SES `SendEmail` v2 API 发回。打开收件箱看到完整 thread。
+2. **多模态 KB**:admin (`admin@demo.test`) 进 `/kb` → 上传 PDF "Billing FAQ"(截图用 `docs/sample-docs/billing-faq.pdf`)→ `MultimodalUploader` 流水线:PDF 解析文本切片 + 关键页截图(`pdf_processor.ExtractedPdf`)→ `DoubaoVisionEmbedder` 把图片 embed 入 `kb_image_vectors` collection(1024-dim cosine)→ 上传成功。下次客户问 "billing" 时,`search_multimodal_kb` 工具用 RRF (k=60) 融合 text + image 检索,AI 回复里出现 "📄 文本引用 + 🖼️ 图表截图"。
+3. **历史会话挖掘**:手动触发 `arq apps.api.src.workers.settings.WorkerSettings` 后台 cron(默认每周日 03:00 UTC)→ `HdbscanClusterer` 把 RESOLVED conversations 的所有客服 - 客户消息两两组合向量化 → HDBSCAN 聚类 → `KBDraftGenerator` LLM 生成 KB 草稿 → admin GET `/admin/kb-drafts` 看到列表 → GET `/admin/kb-drafts/{id}` 看完整 body → POST `/admin/kb-drafts/{id}/approve` → 新增 `kb_articles` 行 + 自动 provision `auto-mined-kb` KB。
+
+**What to point out**
+
+- **Email 永远 200** — 即使 payload malformed 也 200 + 记日志,避免 SEC 在 5xx 重试风暴;X-Tenant-ID header 现阶段 demo 用,生产必须 SNS confirmation 或 SigV4(已知技术债 #16)
+- **多模态 RRF** — Reciprocal Rank Fusion (k=60) 稳健融合 text + image 不同 cosine 尺度的排名,避免单一向量空间偏移
+- **JWT 取 tenant** — `POST /api/v1/kb-articles/multimodal` 用 JWT claims 取 `tenant_id`(plan 原 Form tenant_id 是 PII/安全洞)
+- **History mining per-tenant loop** — 一个租户失败不污染整轮;LLM 失败时 fallback 用原始 questions 作为 draft body,cluster 不丢
+- **SELECT FOR UPDATE 防并发双 approve** — admin approve 端点行锁,避免并发 → 2 Article 行
+- **auto-mined-kb 自动 provision** — approve 时若 KB 不存在自动建,无需 admin 手工建 KB
+
+**截图说明**
+
+本 Act 对应 3 张截图:
+
+- `images/demo-act5-01-email.png` — 客户邮件 + AI 自动回复邮件(邮件客户端截图)
+- `images/demo-act5-02-multimodal.png` — admin 上传 PDF 成功 + AI multimodal 检索引用
+- `images/demo-act5-03-history-mining.png` — admin `/admin/kb-drafts` 列表 + approve 后的 kb_articles 行
+
+**捕获状态(截至 Stage 19 close-out)**
+
+- `demo-act5-01` / `demo-act5-02` / `demo-act5-03` — **占位 PNG 已 commit**(1x1 stub,69 bytes,通过 `python images/_generate_stubs.py` 生成)。真截图需真 SEC + MinIO + Doubao credentials + live services。补抓路径:替换占位 PNG 为真实截图(无 Playwright spec,M2.B 端到端 demo 主要靠手动 + 邮件客户端)。
+
+## Demo data reset
+
 ## Demo data reset
 
 Between demo runs, wipe the seeded rows (the seed script is
