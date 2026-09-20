@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EmailInboundResult:
     conversation_id: str
-    message_id: str  # customer message id
+    message_id: str  # customer message id (empty string on duplicate)
     ai_message_id: str | None
     ai_content: str | None  # returned for the caller to send via outbound
+    is_duplicate: bool = False  # True when the message_id was already seen
 
 
 async def _find_conversation_by_thread(
@@ -56,8 +57,14 @@ async def _check_existing_message(
     session: AsyncSession,
     *,
     message_id_header: str,
-) -> bool:
-    """Returns True if we've already processed this email_message_id (SES retry dedup)."""
+) -> Conversation | None:
+    """Return the existing Conversation for this message_id_header, or None.
+
+    The dedup check returns the row (not just a bool) so the caller can
+    include ``conversation_id`` in the duplicate response — useful for
+    the SES retry caller to correlate the duplicate with the original
+    conversation.
+    """
     from sqlalchemy import select
 
     result = await session.execute(
@@ -65,7 +72,7 @@ async def _check_existing_message(
         .where(Conversation.email_message_id_header == message_id_header)
         .limit(1)
     )
-    return result.scalar_one_or_none() is not None
+    return result.scalar_one_or_none()
 
 
 async def handle_email_inbound(
@@ -78,9 +85,16 @@ async def handle_email_inbound(
 ) -> EmailInboundResult | None:
     """Process an inbound email end-to-end.
 
-    Returns None if the message is a duplicate (idempotent), if a
-    concurrent webhook beat us to INSERT (race), or if any DB step
-    fails — the webhook must always return 200 to SES.
+    Returns ``EmailInboundResult`` with ``is_duplicate=True`` when the
+    ``email_message_id_header`` was already seen (idempotent dedup) or
+    when a concurrent webhook beat us to INSERT (UNIQUE race). The
+    caller maps that to ``status="duplicate"`` while keeping the
+    correlation ``conversation_id`` for SES-retry observability.
+
+    Returns ``None`` only when an unhandled DB step raises (logged at
+    ERROR) — the webhook must always return 200 to SES, so the API
+    layer surfaces ``None`` as ``{"status": "duplicate"}`` to keep
+    SES from retry-storming.
 
     NOTEs on tenant auto-create divergence vs widget path:
     The widget path auto-creates a Ticket via ticket_service_factory on
@@ -93,9 +107,10 @@ async def handle_email_inbound(
     try:
         async with sm() as session:
             # 1. Idempotency check — SES retries on 5xx
-            if await _check_existing_message(
+            existing = await _check_existing_message(
                 session, message_id_header=parsed.message_id
-            ):
+            )
+            if existing is not None:
                 logger.info(
                     "email.inbound.duplicate",
                     extra={
@@ -103,7 +118,17 @@ async def handle_email_inbound(
                         "message_id": parsed.message_id,
                     },
                 )
-                return None
+                # Return the conversation_id so the SES retry caller can
+                # correlate the duplicate with the original conversation.
+                # Empty message_id distinguishes "duplicate, nothing new
+                # persisted" from "ok, here's the new message id".
+                return EmailInboundResult(
+                    conversation_id=existing.id,
+                    message_id="",
+                    ai_message_id=None,
+                    ai_content=None,
+                    is_duplicate=True,
+                )
 
             # 2. Find or create conversation by email thread
             conversation = await _find_conversation_by_thread(
@@ -142,7 +167,26 @@ async def handle_email_inbound(
                         },
                     )
                     await session.rollback()
-                    return None
+                    # Look up the winning conversation so the duplicate
+                    # response can include its conversation_id.
+                    winner = await _check_existing_message(
+                        session, message_id_header=parsed.message_id
+                    )
+                    return EmailInboundResult(
+                        conversation_id=winner.id if winner else "",
+                        message_id="",
+                        ai_message_id=None,
+                        ai_content=None,
+                        is_duplicate=True,
+                    )
+                # Commit the new conversation in its own transaction so the
+                # subsequent ``conv_service.record_message(...)`` call —
+                # which opens its OWN session via ``ConversationRepository``
+                # — can see the row. Without this commit, the sub-session
+                # used by ``record_message`` would observe the conversation
+                # as not-yet-committed and raise ValueError, masking the
+                # webhook handling as a 'duplicate' outcome.
+                await session.commit()
             else:
                 # Bump dedup key so a future retry with this same
                 # message_id is caught by _check_existing_message above.

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import AsyncClient
 
+from conversation.enums import MessageRole
 from tenant.models import Tenant
 
 
@@ -26,10 +27,16 @@ async def test_email_inbound_creates_conversation_and_records_message(
         "spamVerdict": {"status": "PASS"},
     }
 
-    # Mock the LLM so the AI auto-reply doesn't actually call Anthropic
+    # Mock the LLM so the AI auto-reply doesn't actually call Anthropic.
+    # ``role`` MUST be a ``MessageRole`` enum value, not a raw string —
+    # ``conversation.service.record_message`` does
+    # ``MESSAGES_TOTAL.labels(role=role.value).inc()`` and would raise
+    # ``AttributeError: 'str' object has no attribute 'value'`` on a
+    # plain string. Pre-existing bug masked by the .astext crash before
+    # the tech-debt #16 refactor.
     fake_response = MagicMock()
     fake_response.content_text = "To reset your password, click here."
-    fake_response.role = "ai"
+    fake_response.role = MessageRole.AI
 
     with patch(
         "agent.simple_responder.SimpleResponder.respond",

@@ -206,14 +206,11 @@ _email_outbound = EmailOutbound(
 )
 
 
-# KNOWN DEBT (M2.B / Task 2 code review):
-# tenant_id is currently sourced from the X-Tenant-ID request header, which
-# is trivially spoofable. Production must verify tenant identity via either:
-#   (a) SNS subscription confirmation (SES inbound sends to an SNS topic;
-#       verify the SigningCertURL against the SNS pinned CA),
-#   (b) AWS SigV4 signature verification on the raw request body, or
-#   (c) a reverse-lookup from the recipient address (Channel.config_json.tenant_id).
-# Tracked as README tech-debt #16 (Stage 19 M2.B close-out).
+# Tech debt #16 (shipped): tenant identity is reverse-looked-up from
+# the Channel row keyed on parsed.to_address. The X-Tenant-ID header is
+# no longer trusted for tenant resolution — it is logged at WARNING if
+# present and disagrees with the resolved tenant (security audit signal).
+# See docs/superpowers/specs/2026-09-20-tech-debt-16-ses-tenant-reverse-lookup-design.md
 
 
 @app.post("/api/v1/email/inbound")
@@ -237,26 +234,23 @@ async def email_inbound_webhook(request: Request):
         logger.warning("email.inbound.malformed_payload")
         return {"status": "dropped"}
 
-    # Resolve tenant from X-Tenant-ID header (demo path). Production
-    # would look up the tenant via the EmailChannel row's
-    # ``config_json["tenant_id"]`` instead.
-    tenant_id = request.headers.get("X-Tenant-ID", _settings.default_tenant_id)
-    if not tenant_id:
-        logger.warning("email.inbound.no_tenant_resolved")
-        return {"status": "dropped"}
-
-    # Look up EmailChannel by ``to_address`` for this tenant. The
-    # ``address`` lives inside ``Channel.config_json`` JSONB — we
-    # compare via ``astext`` so the index can be used.
+    # Tech debt #16: resolve tenant by reverse-lookup on to_address.
+    # The Channel row's tenant_id is the authoritative tenant; we do
+    # NOT trust the X-Tenant-ID header.
     sm = get_sessionmaker()
     async with sm() as session:
+        # Channel.config_json is mapped as JSON (not JSONB) at
+        # channel/models.py — ``.astext`` would raise AttributeError.
+        # ``.as_string()`` is the SQLAlchemy 2.x idiom for JSON: it
+        # compiles to ``config_json ->> 'address'`` (the PostgreSQL
+        # ``->>`` text-extraction operator) and works without an
+        # Alembic migration to JSONB.
         channel = (
             await session.execute(
                 select(Channel)
                 .where(
-                    Channel.tenant_id == tenant_id,
                     Channel.type == ChannelType.EMAIL,
-                    Channel.config_json["address"].astext == parsed.to_address,
+                    Channel.config_json["address"].as_string() == parsed.to_address,
                 )
                 .limit(1)
             )
@@ -271,6 +265,21 @@ async def email_inbound_webhook(request: Request):
             )
             return {"status": "dropped"}
 
+        tenant_id = channel.tenant_id
+
+        # Audit: if X-Tenant-ID was sent and disagrees with the
+        # resolved tenant, surface that as a security signal — could be
+        # a misconfigured client or a probing attempt.
+        header_tenant = request.headers.get("X-Tenant-ID")
+        if header_tenant and header_tenant != tenant_id:
+            logger.warning(
+                "email.inbound.header_tenant_mismatch",
+                extra={
+                    "resolved_tenant_id": tenant_id,
+                    "header_tenant_id": header_tenant,
+                },
+            )
+
     result = await handle_email_inbound(
         tenant_id=tenant_id,
         parsed=parsed,
@@ -279,5 +288,10 @@ async def email_inbound_webhook(request: Request):
         outbound=_email_outbound,
     )
     if result is None:
+        # Only reachable when the outer try/except in handle_email_inbound
+        # swallows an unhandled error and returns None. The duplicate /
+        # race paths now return EmailInboundResult with is_duplicate=True
+        # so the caller can correlate the conversation_id.
         return {"status": "duplicate"}
-    return {"status": "ok", **result.__dict__}
+    status = "duplicate" if result.is_duplicate else "ok"
+    return {"status": status, **result.__dict__}
