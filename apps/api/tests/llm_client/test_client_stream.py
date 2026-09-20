@@ -5,9 +5,10 @@ async-generator protocol with a lightweight in-memory provider and verify both
 the delta forwarding and the usage-accounting behaviour on the final
 ChatResponse.
 """
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, AsyncGenerator
 
 from llm_client.client import LLMClient
+from llm_client.gateway import LLMGateway
 from llm_client.providers.base import BaseProvider
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse, MessageRole
 
@@ -41,8 +42,17 @@ def _make_request() -> ChatRequest:
     )
 
 
+async def _make_client() -> AsyncGenerator[LLMClient, None]:
+    g = LLMGateway(providers={"fake": _FakeStreamProvider()})
+    yield LLMClient(
+        provider_resolver=g.default_resolver,
+        tenant_id="t-1",
+    )
+    await g.aclose_all()
+
+
 async def test_stream_chat_forwards_deltas_then_final_response() -> None:
-    client = LLMClient(default_provider=_FakeStreamProvider(), tenant_id="t-1")
+    client = await _make_client().__anext__()
     items = [item async for item in client.stream_chat(_make_request())]
 
     assert [i for i in items if isinstance(i, str)] == ["one", "two"]
@@ -52,7 +62,7 @@ async def test_stream_chat_forwards_deltas_then_final_response() -> None:
 
 
 async def test_stream_chat_records_usage_on_final_response() -> None:
-    client = LLMClient(default_provider=_FakeStreamProvider(), tenant_id="t-1")
+    client = await _make_client().__anext__()
     items = [item async for item in client.stream_chat(_make_request())]
     # Collect to completion ensures the final sentinel was consumed.
     assert isinstance(items[-1], ChatResponse)

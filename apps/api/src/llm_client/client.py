@@ -1,4 +1,16 @@
-"""High-level LLM client: wraps a provider, adds retry, records usage."""
+"""High-level LLM client: wraps a resolver, adds retry, records usage.
+
+The resolver is the seam between the client and the underlying
+``BaseProvider`` instances. By default the client expects an
+``LLMGateway.default_resolver`` (prefix-based auto-routing), but
+callers that need a pinned (provider, model) pair — QA Judge,
+history mining — inject a :class:`PinnedResolver` from
+``LLMGateway.with_config`` instead.
+
+The client is unaware of how many providers the gateway holds. It
+asks the resolver once per request and forwards the resulting
+``provider.chat`` / ``provider.stream`` call.
+"""
 import asyncio
 import json
 import random
@@ -15,78 +27,73 @@ from llm_client.exceptions import (
     ProviderUnavailable,
     RateLimited,
 )
-from llm_client.providers.base import BaseProvider
+from llm_client.resolvers import PinnedResolver, Resolver, UnknownModelError
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse
 from llm_client.usage import UsageRecorder
 
+# Route-mode label values — keep them as constants so dashboards and
+# alerts reference the same string we increment with.
+ROUTE_AUTO = "auto"
+ROUTE_PINNED = "pinned"
+ROUTE_UNKNOWN_MODEL = "unknown_model"
+ROUTE_RESOLVER_ERROR = "resolver_error"
+
+# Provider label value used when the resolver raised before we could
+# pick a provider. Cardinality stays bounded (single literal string).
+_UNKNOWN_PROVIDER_LABEL = "<unknown>"
+
+
+def _route_mode_for(resolver: Resolver) -> str:
+    """Pick the ``route_mode`` metric label value for a given resolver.
+
+    ``PinnedResolver`` instances carry ``route_mode="pinned"``. Any
+    other callable is treated as ``"auto"`` — the prefix router
+    and any future resolver kind (fallback chain in M4.B, per-tenant
+    BYOK resolver in M4.C) fall under this umbrella.
+    """
+    if isinstance(resolver, PinnedResolver):
+        return ROUTE_PINNED
+    return ROUTE_AUTO
+
 
 class LLMClient:
-    """Wraps a single provider with retry + usage recording.
+    """Wraps a resolver with retry + usage recording.
 
     - Retry: 5xx (ProviderUnavailable), unparseable responses (OutputInvalid)
-    - No retry: 429 (RateLimited), 4xx (InvalidRequest)
+    - No retry: 429 (RateLimited), 4xx (InvalidRequest), unknown model,
+      resolver error
     - On success: enqueue a usage row (flushed via flush_usage())
     """
 
     def __init__(
         self,
         *,
-        default_provider: BaseProvider,
+        provider_resolver: Resolver,
         tenant_id: str,
         usage_recorder: UsageRecorder | None = None,
     ) -> None:
-        self.default_provider = default_provider
+        if provider_resolver is None:
+            raise TypeError("provider_resolver is required")
+        self.provider_resolver = provider_resolver
         self.tenant_id = tenant_id
         self.usage = usage_recorder or UsageRecorder()
+        self._route_mode = _route_mode_for(provider_resolver)
 
-    @classmethod
-    def with_config(
-        cls,
-        *,
-        provider: str,
-        model: str,
-        tenant_id: str = "qa-judge",
-    ) -> "LLMClient":
-        """Build an LLMClient wired to a specific (provider, model) pair.
+    def _resolve_request(self, request: ChatRequest) -> tuple[ChatRequest, str]:
+        """Resolve ``request`` to a (possibly rewritten request, route_mode).
 
-        Used by the QA Judge (Stage 14 / Task 7) so the judge can use a
-        smaller / different model from the per-tenant default without
-        inheriting its provider wiring.
-
-        TODO(Task 8): replace stub with a router that picks from any
-        registered provider based on the configured ``provider``
-        string. Currently wires only ``minimax`` and ``anthropic``.
-        Unknown providers raise :class:`ValueError` so the
-        misconfiguration is loud, not silent.
-
-        ``tenant_id`` defaults to ``"qa-judge"`` because the Judge
-        worker runs outside any request context (no tenant
-        ContextVar). The usage-recording path uses this for the
-        ``llm_usage`` row.
+        For PinnedResolver, ``request.model`` is overwritten with the
+        pinned model so the metric label reflects the actual model used.
+        For all other resolvers, the request is returned unchanged.
         """
-        # Local imports — avoids a cycle through core.config at import
-        # time (the conftest fixture resets core.config singletons
-        # before tests, so we must read settings lazily).
-        from core.config import get_settings
-        from llm_client.providers.anthropic_provider import AnthropicProvider
-        from llm_client.providers.openai_provider import OpenAIProvider
-
-        s = get_settings()
-        if provider == "minimax":
-            base_url = s.minimax_base_url or "https://api.minimaxi.com/v1"
-            default_provider: BaseProvider = OpenAIProvider(
-                api_key=s.minimax_api_key or "",
-                model=model,
-                base_url=base_url,
+        if isinstance(self.provider_resolver, PinnedResolver):
+            return (
+                request.model_copy(
+                    update={"model": self.provider_resolver.model}
+                ),
+                ROUTE_PINNED,
             )
-        elif provider == "anthropic":
-            default_provider = AnthropicProvider(
-                api_key=s.anthropic_api_key or "",
-                model=model,
-            )
-        else:
-            raise ValueError(f"Unknown QA judge provider: {provider}")
-        return cls(default_provider=default_provider, tenant_id=tenant_id)
+        return request, self._route_mode
 
     async def chat_with_structured_output(
         self,
@@ -98,14 +105,9 @@ class LLMClient:
     ) -> BaseModel:
         """Call the underlying provider and parse the response into ``schema``.
 
-        TODO(Task 8): replace stub with provider-native structured
-        output (OpenAI's ``response_format={"type": "json_schema"}``,
-        Anthropic's tool use, etc.). The current implementation simply
-        invokes ``chat`` with the same messages, parses the response
-        ``content`` as JSON, and returns ``schema(**parsed)``.
-        ``response_format={"type": "json_schema"}``, Anthropic's tool
-        use, etc.). The stub is good enough for unit tests that mock
-        it directly with a ``MagicMock`` / ``AsyncMock``.
+        (Stub implementation kept verbatim from M1; future M4+ tasks may
+        wire provider-native structured output. The stub is good enough
+        for unit tests that mock it directly with ``MagicMock`` / ``AsyncMock``.)
 
         Raises:
             OutputInvalid: if the response is not parseable JSON or the
@@ -116,12 +118,7 @@ class LLMClient:
         chat_request = ChatRequest(
             model=model,
             messages=[
-                # ``ChatMessage`` requires a typed ``MessageRole``;
-                # callers pass dicts (system/user) so we coerce here.
-                ChatMessage(
-                    role=m["role"],  # type: ignore[arg-type]
-                    content=m["content"],
-                )
+                ChatMessage(role=m["role"], content=m["content"])  # type: ignore[arg-type]
                 for m in messages
             ],
         )
@@ -142,10 +139,11 @@ class LLMClient:
             ) from e
 
     async def aclose(self) -> None:
-        """Flush pending usage and close the underlying provider's HTTP client."""
+        """Flush pending usage. Provider-level close is handled by the
+        owning ``LLMGateway.aclose_all`` — the client no longer owns a
+        single provider reference, so it can't close one.
+        """
         await self.flush_usage()
-        if hasattr(self.default_provider, "aclose"):
-            await self.default_provider.aclose()
 
     async def flush_usage(self) -> None:
         await self.usage.flush()
@@ -158,78 +156,80 @@ class LLMClient:
     ) -> ChatResponse:
         """Send a chat request with retry.
 
-        Retries on ProviderUnavailable / OutputInvalid up to `max_retries` times
-        with exponential backoff + jitter. Does NOT retry on RateLimited /
-        InvalidRequest (those are caller's mistake or upstream throttling).
+        Retries on ProviderUnavailable / OutputInvalid up to `max_retries`
+        times with exponential backoff + jitter. Does NOT retry on
+        RateLimited / InvalidRequest / UnknownModelError / resolver error
+        (those are caller's mistake or hard 4xx-equivalent failures).
         """
+        request, route_mode = self._resolve_request(request)
         request_id = uuid.uuid4().hex
         attempt = 0
         last_exc: Exception | None = None
         while attempt <= max_retries:
             try:
-                resp = await self.default_provider.chat(request)
+                provider = self.provider_resolver(request)
+                resp = await provider.chat(request)
                 self.usage.enqueue(
                     tenant_id=self.tenant_id,
-                    provider=self.default_provider.name,
+                    provider=provider.name,
                     model=resp.model,
                     prompt_tokens=resp.prompt_tokens,
                     completion_tokens=resp.completion_tokens,
                     request_id=request_id,
                 )
-                # Stage 11.3: success metric. We only inc on the final
-                # successful attempt — earlier retries that failed and
-                # bounced are accounted by the failure-path incs below.
-                _provider = self.default_provider.name
                 LLM_CALLS_TOTAL.labels(
-                    provider=_provider, model=resp.model, outcome="success"
+                    provider=provider.name,
+                    model=resp.model,
+                    route_mode=route_mode,
+                    outcome="success",
                 ).inc()
                 LLM_TOKENS_TOTAL.labels(
-                    provider=_provider, model=resp.model, direction="input"
+                    provider=provider.name,
+                    model=resp.model,
+                    route_mode=route_mode,
+                    direction="input",
                 ).inc(resp.prompt_tokens)
                 LLM_TOKENS_TOTAL.labels(
-                    provider=_provider, model=resp.model, direction="output"
+                    provider=provider.name,
+                    model=resp.model,
+                    route_mode=route_mode,
+                    direction="output",
                 ).inc(resp.completion_tokens)
                 return resp
-            except RateLimited as e:
-                # 429: don't retry, propagate immediately. Outcome label
-                # mirrors the exception class name so dashboards can
-                # split "rate_limited" vs "invalid_request" cleanly.
+            except RateLimited:
                 LLM_CALLS_TOTAL.labels(
-                    provider=self.default_provider.name,
+                    provider=_UNKNOWN_PROVIDER_LABEL,
                     model=request.model,
+                    route_mode=route_mode,
                     outcome="rate_limited",
                 ).inc()
                 raise
-            except InvalidRequest as e:
-                # 4xx (other than 429): same as RateLimited — propagate.
+            except InvalidRequest:
                 LLM_CALLS_TOTAL.labels(
-                    provider=self.default_provider.name,
+                    provider=_UNKNOWN_PROVIDER_LABEL,
                     model=request.model,
+                    route_mode=route_mode,
                     outcome="invalid_request",
                 ).inc()
                 raise
             except ProviderUnavailable as e:
-                # 5xx / network: inc the retryable outcome and back off.
-                # We inc once per attempt that hit this branch; the
-                # final-exhaustion raise below is not a separate inc.
                 LLM_CALLS_TOTAL.labels(
-                    provider=self.default_provider.name,
+                    provider=_UNKNOWN_PROVIDER_LABEL,
                     model=request.model,
+                    route_mode=route_mode,
                     outcome="unavailable",
                 ).inc()
                 last_exc = e
                 if attempt == max_retries:
                     break
-                # Exponential backoff with jitter: 0..0.5s + 2^attempt, capped at 8s
                 backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
                 await asyncio.sleep(backoff)
                 attempt += 1
             except OutputInvalid as e:
-                # Provider returned unparseable response. Treat as a
-                # retryable failure (same code path as unavailable).
                 LLM_CALLS_TOTAL.labels(
-                    provider=self.default_provider.name,
+                    provider=_UNKNOWN_PROVIDER_LABEL,
                     model=request.model,
+                    route_mode=route_mode,
                     outcome="output_invalid",
                 ).inc()
                 last_exc = e
@@ -238,11 +238,36 @@ class LLMClient:
                 backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
                 await asyncio.sleep(backoff)
                 attempt += 1
+            except UnknownModelError:
+                # Resolver couldn't match the model to a registered
+                # provider — 4xx-equivalent. Propagate as InvalidRequest
+                # so callers see a uniform "bad request" surface and
+                # metric label is ``invalid_request`` not a new outcome.
+                LLM_CALLS_TOTAL.labels(
+                    provider=_UNKNOWN_PROVIDER_LABEL,
+                    model=request.model,
+                    route_mode=ROUTE_UNKNOWN_MODEL,
+                    outcome="invalid_request",
+                ).inc()
+                raise InvalidRequest(
+                    f"No LLM provider registered for model {request.model!r}"
+                )
+            except Exception:
+                # Resolver raised a non-UnknownModelError (config bug,
+                # runtime crash). Surface as ProviderUnavailable so the
+                # caller treats it as a transient infrastructure failure.
+                LLM_CALLS_TOTAL.labels(
+                    provider=_UNKNOWN_PROVIDER_LABEL,
+                    model=request.model,
+                    route_mode=ROUTE_RESOLVER_ERROR,
+                    outcome="unavailable",
+                ).inc()
+                raise ProviderUnavailable(
+                    "LLM provider resolver failed"
+                )
 
-        # Exhausted retries — raise the last exception
         assert last_exc is not None
         raise last_exc
-
 
     async def stream_chat(
         self, request: ChatRequest
@@ -255,37 +280,42 @@ class LLMClient:
         without retry — callers that need reliability for non-streaming turns
         should keep using :meth:`chat`.
         """
+        request, route_mode = self._resolve_request(request)
         request_id = uuid.uuid4().hex
-        provider = self.default_provider.name
-        # Track whether we ever saw a final ChatResponse — if not, the
-        # stream failed (or never produced a terminal chunk) and we
-        # need to inc the failure outcome. Stage 11.3 metric.
         saw_final_response = False
         try:
-            async for item in self.default_provider.stream(request):
+            provider = self.provider_resolver(request)
+            async for item in provider.stream(request):
                 if isinstance(item, ChatResponse):
                     saw_final_response = True
                     self.usage.enqueue(
                         tenant_id=self.tenant_id,
-                        provider=provider,
+                        provider=provider.name,
                         model=item.model,
                         prompt_tokens=item.prompt_tokens,
                         completion_tokens=item.completion_tokens,
                         request_id=request_id,
                     )
                     LLM_CALLS_TOTAL.labels(
-                        provider=provider, model=item.model, outcome="success"
+                        provider=provider.name,
+                        model=item.model,
+                        route_mode=route_mode,
+                        outcome="success",
                     ).inc()
                     LLM_TOKENS_TOTAL.labels(
-                        provider=provider, model=item.model, direction="input"
+                        provider=provider.name,
+                        model=item.model,
+                        route_mode=route_mode,
+                        direction="input",
                     ).inc(item.prompt_tokens)
                     LLM_TOKENS_TOTAL.labels(
-                        provider=provider, model=item.model, direction="output"
+                        provider=provider.name,
+                        model=item.model,
+                        route_mode=route_mode,
+                        direction="output",
                     ).inc(item.completion_tokens)
                 yield item
         except (RateLimited, InvalidRequest, ProviderUnavailable, OutputInvalid) as e:
-            # Streaming has no retry: surface the error after recording
-            # the outcome so the metric reflects the failure.
             outcome_map = {
                 RateLimited: "rate_limited",
                 InvalidRequest: "invalid_request",
@@ -293,8 +323,27 @@ class LLMClient:
                 OutputInvalid: "output_invalid",
             }
             LLM_CALLS_TOTAL.labels(
-                provider=provider,
+                provider=_UNKNOWN_PROVIDER_LABEL,
                 model=request.model,
+                route_mode=route_mode,
                 outcome=outcome_map[type(e)],
             ).inc()
             raise
+        except UnknownModelError:
+            LLM_CALLS_TOTAL.labels(
+                provider=_UNKNOWN_PROVIDER_LABEL,
+                model=request.model,
+                route_mode=ROUTE_UNKNOWN_MODEL,
+                outcome="invalid_request",
+            ).inc()
+            raise InvalidRequest(
+                f"No LLM provider registered for model {request.model!r}"
+            )
+        except Exception:
+            LLM_CALLS_TOTAL.labels(
+                provider=_UNKNOWN_PROVIDER_LABEL,
+                model=request.model,
+                route_mode=ROUTE_RESOLVER_ERROR,
+                outcome="unavailable",
+            ).inc()
+            raise ProviderUnavailable("LLM provider resolver failed")

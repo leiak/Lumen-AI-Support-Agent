@@ -1,4 +1,6 @@
 """Integration tests for LLMClient (retry + usage recording). Requires live DB."""
+from collections.abc import AsyncGenerator
+
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -8,10 +10,24 @@ from llm_client.providers.anthropic_provider import AnthropicProvider
 from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
 
+def test_llm_client_requires_provider_resolver() -> None:
+    from llm_client.client import LLMClient
+
+    with pytest.raises(TypeError, match="provider_resolver is required"):
+        LLMClient(provider_resolver=None, tenant_id="t")  # type: ignore[arg-type]
+
+
 @pytest.fixture
-def client_with_anthropic() -> LLMClient:
+async def client_with_anthropic() -> AsyncGenerator[LLMClient, None]:
+    from llm_client.gateway import LLMGateway
+
     p = AnthropicProvider(api_key="k", model="claude-3-5-sonnet-20241022")
-    return LLMClient(default_provider=p, tenant_id="t-llm-client-test")
+    g = LLMGateway(providers={"anthropic": p})
+    yield LLMClient(
+        provider_resolver=g.default_resolver,
+        tenant_id="t-llm-client-test",
+    )
+    await g.aclose_all()
 
 
 @pytest.mark.integration
