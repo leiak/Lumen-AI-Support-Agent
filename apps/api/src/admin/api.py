@@ -37,12 +37,13 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timezone
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query  # noqa: F401 (used by Tasks 4-6)
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from auth.dependencies import require_admin  # noqa: F401 (used by Tasks 4-6)
+from auth.dependencies import require_admin
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -134,16 +135,19 @@ async def _ensure_auto_mined_kb(session, *, tenant_id: str) -> KnowledgeBase:
 
 @router.get("/kb-drafts")
 async def list_kb_drafts(
-    tenant_id: str = Query(...),
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
     status: str = Query("DRAFT"),
     limit: int = Query(50, le=200),
 ):
     """List KB drafts for review.
 
-    Status filter defaults to ``DRAFT`` (the only reviewable state).
-    Cross-tenant returns the tenant's own list (no 404 on the LIST
-    endpoint — the security boundary is per-row, not per-call).
+    Tenant is derived from the verified JWT (require_admin). Status
+    filter defaults to ``DRAFT`` (the only reviewable state). Cross-
+    tenant access is impossible because the WHERE clause carries the
+    authenticated tenant — there is no per-row 404 on the LIST
+    endpoint (the security boundary is per-row, not per-call).
     """
+    tenant_id = claims["tenant_id"]
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
