@@ -98,3 +98,45 @@ async def test_gateway_aclose_all_closes_each_provider() -> None:
     await g.aclose_all()
     a.aclose.assert_awaited_once()  # type: ignore[attr-defined]
     m.aclose.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+def test_gateway_providers_property_is_read_only_view() -> None:
+    a = _stub("anthropic")
+    g = LLMGateway(providers={"anthropic": a})
+    snapshot = g.providers
+    # Mutating the returned mapping does not affect the gateway:
+    # (raises TypeError on MappingProxyType, but we catch + assert no leak)
+    try:
+        snapshot["openai"] = _stub("openai")  # type: ignore[index]
+    except TypeError:
+        pass  # expected — MappingProxyType is immutable
+    assert "openai" not in g.providers
+
+
+@pytest.mark.asyncio
+async def test_gateway_aclose_all_skips_provider_without_aclose() -> None:
+    """A provider stub without an ``aclose`` method must not raise."""
+    from unittest.mock import create_autospec
+    a = _stub("anthropic")
+    # Strip aclose from one stub to exercise the getattr(..., None) branch
+    if hasattr(a, "aclose"):
+        del a.aclose  # type: ignore[attr-defined]
+    g = LLMGateway(providers={"anthropic": a})
+    # Must not raise even though one provider has no aclose
+    await g.aclose_all()
+
+
+@pytest.mark.asyncio
+async def test_gateway_aclose_all_isolates_one_failing_provider() -> None:
+    """One provider raising in aclose() must not block the others."""
+    from unittest.mock import AsyncMock
+
+    a = _stub("anthropic")
+    m = _stub("minimax")
+    a.aclose = AsyncMock(side_effect=RuntimeError("anthropic boom"))
+    m.aclose = AsyncMock()  # succeeds
+    g = LLMGateway(providers={"anthropic": a, "minimax": m})
+    # Must not raise; both providers should have been attempted.
+    await g.aclose_all()
+    a.aclose.assert_awaited_once()  # type: ignore[attr-defined]
+    m.aclose.assert_awaited_once()  # type: ignore[attr-defined]

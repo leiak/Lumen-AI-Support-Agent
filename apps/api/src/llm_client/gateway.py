@@ -21,9 +21,14 @@ budget) all layer onto the resolver seam without touching
 """
 from __future__ import annotations
 
+import asyncio
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+from core.logging import get_logger
 from llm_client.resolvers import PinnedResolver, Resolver, _PrefixResolver
+
+log = get_logger(__name__)
 
 if TYPE_CHECKING:
     from llm_client.providers.base import BaseProvider
@@ -66,10 +71,16 @@ class LLMGateway:
             default_provider_name=self._default_provider_name,
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"<LLMGateway providers={sorted(self._providers)} "
+            f"default={self._default_provider_name!r}>"
+        )
+
     @property
-    def providers(self) -> dict[str, "BaseProvider"]:
+    def providers(self) -> MappingProxyType[str, "BaseProvider"]:
         """Read-only view of the registered providers."""
-        return dict(self._providers)
+        return MappingProxyType(self._providers)
 
     @property
     def default_provider_name(self) -> str:
@@ -114,13 +125,27 @@ class LLMGateway:
     async def aclose_all(self) -> None:
         """Close every registered provider's HTTP client.
 
-        Called on API shutdown. Provider stubs without an ``aclose``
-        method are skipped (defense for test fixtures).
+        Called on API shutdown. Provider stubs without an ``aclose`` method
+        are skipped (defense for test fixtures). A single failing provider
+        does not abort the rest — each close runs independently and any
+        exception is logged at WARNING with the provider name + error class.
+        PII discipline: only provider name + error class name in logs.
         """
-        for provider in self._providers.values():
+        closes = []
+        for provider_name, provider in self._providers.items():
             aclose = getattr(provider, "aclose", None)
             if aclose is not None:
-                await aclose()
+                closes.append((provider_name, aclose()))
+        results = await asyncio.gather(
+            *(c[1] for c in closes), return_exceptions=True
+        )
+        for (provider_name, _), result in zip(closes, results):
+            if isinstance(result, BaseException):
+                log.warning(
+                    "llm_client.aclose_failed",
+                    provider=provider_name,
+                    error_type=type(result).__name__,
+                )
 
 
 __all__ = ["LLMGateway"]
