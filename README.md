@@ -319,7 +319,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 17. ~~**Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)~~ — M3 tech-debt #17 完成 (4 endpoints `Depends(require_admin)`,`tenant_id` / `reviewer_id` 从 JWT claims 读,17 admin tests)
 18. ~~**PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)~~ — M3 tech-debt #18 完成 (PDF text chunks 入 `article_chunks` Qdrant collection,`source_type="pdf_text"` + `page_num` + `chunk_index` + `text`,`MultimodalRetriever` RRF 检索可见)
 19. ~~**Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由**~~ — M3 tech-debt #19完成 (`vision_provider` env 选择 `doubao` / `openai_clip` / `voyage`,默认 Doubao;新加 `OpenAIVisionEmbedder` (768-dim) + `VoyageVisionEmbedder` (1024-dim) + `get_vision_embedder(settings)` 工厂;每个 provider 写独立 Qdrant collection (`kb_image_vectors_doubao` / `_clip` / `_voyage`),`kb_image_vectors` 保留为 legacy alias 指向当前 provider collection;9 个 unit tests)
-20. **KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)
+20. ~~**KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)**~~ — M3 tech-debt #20完成 (`/admin/kb-drafts` route 在现有 agent SPA 内,`AdminGuard` 包装 `AuthGuard`,`useIsAdmin` hook 读 JWT `role` claim;`DraftList` cards + `DraftDetailDialog` modal + status tabs (DRAFT/APPROVED/REJECTED);sidebar "KB 草稿" 入口仅 admin/owner 可见;13 个 Vitest tests)
 
 ## 仓库信息
 
