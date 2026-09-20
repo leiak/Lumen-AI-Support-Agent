@@ -6,9 +6,11 @@ Wires the three Task 4/5 modules together:
 
 * :class:`knowledge.multimodal.storage.S3ObjectStore` — durable
   storage in MinIO (dev) or AWS S3 (prod).
-* :class:`knowledge.multimodal.embedder.DoubaoVisionEmbedder` —
-  vision embeddings (1024-dim by default). Gracefully degrades to
-  zero vectors when ``DOUBAO_VISION_API_KEY`` is unset.
+* :func:`knowledge.multimodal.embedder.get_vision_embedder` —
+  pluggable vision embeddings (Doubao 1024-dim by default; OpenAI
+  CLIP 768-dim and Voyage 1024-dim also supported via
+  ``settings.vision_provider``). Each provider gracefully degrades
+  to zero vectors when its ``*_API_KEY`` is unset.
 * :class:`knowledge.multimodal.pdf_processor.PdfProcessor` — text +
   key-page screenshots for PDFs.
 

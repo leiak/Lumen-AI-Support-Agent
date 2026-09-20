@@ -129,7 +129,8 @@ def _png_bytes() -> bytes:
 
 
 def _mock_embedder(dimension: int = 1024) -> MagicMock:
-    """Build a mock DoubaoVisionEmbedder that returns zero vectors.
+    """Build a mock VisionEmbedder (returned by get_vision_embedder factory)
+    that returns zero vectors.
 
     We patch at the class-attribute level so ``encode`` returns an
     ``EmbeddingResult``-shaped object without making an HTTP call.
