@@ -163,7 +163,7 @@ async def test_upload_image_indexes_single_chunk(
     """Upload PNG → 1 image chunk → 201."""
     fake_embedding = [0.1] * 1024
     with patch(
-        "knowledge.multimodal.api.DoubaoVisionEmbedder",
+        "knowledge.multimodal.api.get_vision_embedder",
         return_value=_mock_embedder(),
     ), patch(
         "knowledge.multimodal.api.get_object_store",
@@ -208,7 +208,7 @@ async def test_upload_pdf_stores_metadata(
         b"trailer << /Size 4 /Root 1 0 R >>\nstartxref\n164\n%%EOF"
     )
     with patch(
-        "knowledge.multimodal.api.DoubaoVisionEmbedder",
+        "knowledge.multimodal.api.get_vision_embedder",
         return_value=_mock_embedder(),
     ), patch(
         "knowledge.multimodal.api.get_object_store",
@@ -321,7 +321,7 @@ async def test_cross_tenant_isolation_db_rows_partitioned(
     from knowledge.multimodal.retriever import MultimodalRetriever
 
     with patch(
-        "knowledge.multimodal.api.DoubaoVisionEmbedder",
+        "knowledge.multimodal.api.get_vision_embedder",
         return_value=_mock_embedder(),
     ), patch(
         "knowledge.multimodal.api.get_object_store",
@@ -564,7 +564,7 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
              side_effect=fake_embed_texts,
          ), \
          patch(
-             "knowledge.multimodal.api.DoubaoVisionEmbedder",
+             "knowledge.multimodal.api.get_vision_embedder",
              return_value=_mock_embedder(),
          ), \
          patch(
@@ -691,7 +691,7 @@ async def test_pdf_text_retrievable_via_search_multimodal_kb(
              side_effect=fake_embed_texts,
          ), \
          patch(
-             "knowledge.multimodal.api.DoubaoVisionEmbedder",
+             "knowledge.multimodal.api.get_vision_embedder",
              return_value=_mock_embedder(),
          ), \
          patch(

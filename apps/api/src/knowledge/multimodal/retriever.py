@@ -51,9 +51,10 @@ from dataclasses import dataclass
 
 from qdrant_client import AsyncQdrantClient
 
+from core.config import get_settings
 from core.logging import get_logger
 from knowledge.qdrant_client import DEFAULT_COLLECTION
-from knowledge.startup import IMAGE_COLLECTION
+from knowledge.startup import get_image_collection_name
 
 log = get_logger(__name__)
 
@@ -235,7 +236,7 @@ class MultimodalRetriever:
             # accepts a bare ``list[float]`` as the nearest-neighbor
             # form.
             response = await self._qdrant.query_points(
-                collection_name=IMAGE_COLLECTION,
+                collection_name=get_image_collection_name(get_settings().vision_provider),
                 query=vector,
                 query_filter=Filter(must=must),
                 limit=limit,

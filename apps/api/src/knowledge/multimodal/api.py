@@ -53,11 +53,11 @@ from core.id_gen import new_id
 from core.logging import get_logger
 from core.qdrant import get_qdrant_client
 from knowledge.models import KbMultimodalArticle
-from knowledge.multimodal.embedder import DoubaoVisionEmbedder
+from knowledge.multimodal.embedder import get_vision_embedder
 from knowledge.multimodal.pdf_processor import PdfProcessor
 from knowledge.multimodal.storage import ObjectStoreError, get_object_store
 from knowledge.qdrant_client import DEFAULT_COLLECTION
-from knowledge.startup import ensure_image_collection
+from knowledge.startup import ensure_image_collection, get_image_collection_name
 from llm_client.embeddings import EmbeddingError, embed_texts
 from qdrant_client.models import PointStruct
 
@@ -243,11 +243,8 @@ async def upload_multimodal(
     # 3. Vision embed each screenshot. The embedder owns its own
     #    httpx client — we MUST aclose() it before returning.
     settings = get_settings()
-    embedder = DoubaoVisionEmbedder(
-        api_key=settings.doubao_vision_api_key,
-        base_url=settings.doubao_vision_base_url,
-        model=settings.doubao_vision_model,
-    )
+    embedder = get_vision_embedder(settings)
+    image_collection = get_image_collection_name(settings.vision_provider)
     try:
         image_vectors: list[tuple[int, list[float]]] = []
         for page_num, png_bytes in screenshots:
@@ -412,7 +409,7 @@ async def upload_multimodal(
         ]
         try:
             await qdrant.upsert(
-                collection_name="kb_image_vectors",
+                collection_name=image_collection,
                 points=points,
                 wait=True,
             )
