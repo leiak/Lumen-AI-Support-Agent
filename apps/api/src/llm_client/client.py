@@ -56,6 +56,61 @@ def _route_mode_for(resolver: Resolver) -> str:
     return ROUTE_AUTO
 
 
+def _record_success(
+    provider_name: str,
+    model: str,
+    route_mode: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> None:
+    """Increment LLM_CALLS_TOTAL (success) + LLM_TOKENS_TOTAL (in + out).
+
+    Centralised so the success-path label set stays consistent between
+    :meth:`LLMClient.chat` and :meth:`LLMClient.stream_chat` — adding a
+    new label later is one edit, not 5.
+    """
+    LLM_CALLS_TOTAL.labels(
+        provider=provider_name,
+        model=model,
+        route_mode=route_mode,
+        outcome="success",
+    ).inc()
+    LLM_TOKENS_TOTAL.labels(
+        provider=provider_name,
+        model=model,
+        route_mode=route_mode,
+        direction="input",
+    ).inc(prompt_tokens)
+    LLM_TOKENS_TOTAL.labels(
+        provider=provider_name,
+        model=model,
+        route_mode=route_mode,
+        direction="output",
+    ).inc(completion_tokens)
+
+
+def _record_failure(
+    provider_label: str,
+    model: str,
+    route_mode: str,
+    outcome: str,
+) -> None:
+    """Increment LLM_CALLS_TOTAL with a failure outcome.
+
+    Token counters are NOT touched — failures don't consume model
+    tokens (4xx/429/quota) or the token count is unknown (resolver /
+    transport errors). ``provider_label`` is usually
+    ``_UNKNOWN_PROVIDER_LABEL`` because the resolver raised before we
+    could attribute the call to a provider.
+    """
+    LLM_CALLS_TOTAL.labels(
+        provider=provider_label,
+        model=model,
+        route_mode=route_mode,
+        outcome=outcome,
+    ).inc()
+
+
 class LLMClient:
     """Wraps a resolver with retry + usage recording.
 
@@ -177,48 +232,28 @@ class LLMClient:
                     completion_tokens=resp.completion_tokens,
                     request_id=request_id,
                 )
-                LLM_CALLS_TOTAL.labels(
-                    provider=provider.name,
-                    model=resp.model,
-                    route_mode=route_mode,
-                    outcome="success",
-                ).inc()
-                LLM_TOKENS_TOTAL.labels(
-                    provider=provider.name,
-                    model=resp.model,
-                    route_mode=route_mode,
-                    direction="input",
-                ).inc(resp.prompt_tokens)
-                LLM_TOKENS_TOTAL.labels(
-                    provider=provider.name,
-                    model=resp.model,
-                    route_mode=route_mode,
-                    direction="output",
-                ).inc(resp.completion_tokens)
+                _record_success(
+                    provider.name,
+                    resp.model,
+                    route_mode,
+                    resp.prompt_tokens,
+                    resp.completion_tokens,
+                )
                 return resp
             except RateLimited:
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=route_mode,
-                    outcome="rate_limited",
-                ).inc()
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "rate_limited"
+                )
                 raise
             except InvalidRequest:
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=route_mode,
-                    outcome="invalid_request",
-                ).inc()
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "invalid_request"
+                )
                 raise
             except ProviderUnavailable as e:
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=route_mode,
-                    outcome="unavailable",
-                ).inc()
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "unavailable"
+                )
                 last_exc = e
                 if attempt == max_retries:
                     break
@@ -226,12 +261,9 @@ class LLMClient:
                 await asyncio.sleep(backoff)
                 attempt += 1
             except OutputInvalid as e:
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=route_mode,
-                    outcome="output_invalid",
-                ).inc()
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "output_invalid"
+                )
                 last_exc = e
                 if attempt == max_retries:
                     break
@@ -243,28 +275,29 @@ class LLMClient:
                 # provider — 4xx-equivalent. Propagate as InvalidRequest
                 # so callers see a uniform "bad request" surface and
                 # metric label is ``invalid_request`` not a new outcome.
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=ROUTE_UNKNOWN_MODEL,
-                    outcome="invalid_request",
-                ).inc()
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    ROUTE_UNKNOWN_MODEL,
+                    "invalid_request",
+                )
                 raise InvalidRequest(
                     f"No LLM provider registered for model {request.model!r}"
                 )
-            except Exception:
+            except Exception as exc:
                 # Resolver raised a non-UnknownModelError (config bug,
                 # runtime crash). Surface as ProviderUnavailable so the
                 # caller treats it as a transient infrastructure failure.
-                LLM_CALLS_TOTAL.labels(
-                    provider=_UNKNOWN_PROVIDER_LABEL,
-                    model=request.model,
-                    route_mode=ROUTE_RESOLVER_ERROR,
-                    outcome="unavailable",
-                ).inc()
-                raise ProviderUnavailable(
-                    "LLM provider resolver failed"
+                # ``from exc`` preserves the original exception class
+                # via ``__cause__`` for ops debugging (Sentry grouping,
+                # distinguishing config bugs from transient failures).
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    ROUTE_RESOLVER_ERROR,
+                    "unavailable",
                 )
+                raise ProviderUnavailable("LLM provider resolver failed") from exc
 
         assert last_exc is not None
         raise last_exc
@@ -296,24 +329,13 @@ class LLMClient:
                         completion_tokens=item.completion_tokens,
                         request_id=request_id,
                     )
-                    LLM_CALLS_TOTAL.labels(
-                        provider=provider.name,
-                        model=item.model,
-                        route_mode=route_mode,
-                        outcome="success",
-                    ).inc()
-                    LLM_TOKENS_TOTAL.labels(
-                        provider=provider.name,
-                        model=item.model,
-                        route_mode=route_mode,
-                        direction="input",
-                    ).inc(item.prompt_tokens)
-                    LLM_TOKENS_TOTAL.labels(
-                        provider=provider.name,
-                        model=item.model,
-                        route_mode=route_mode,
-                        direction="output",
-                    ).inc(item.completion_tokens)
+                    _record_success(
+                        provider.name,
+                        item.model,
+                        route_mode,
+                        item.prompt_tokens,
+                        item.completion_tokens,
+                    )
                 yield item
         except (RateLimited, InvalidRequest, ProviderUnavailable, OutputInvalid) as e:
             outcome_map = {
@@ -322,28 +344,28 @@ class LLMClient:
                 ProviderUnavailable: "unavailable",
                 OutputInvalid: "output_invalid",
             }
-            LLM_CALLS_TOTAL.labels(
-                provider=_UNKNOWN_PROVIDER_LABEL,
-                model=request.model,
-                route_mode=route_mode,
-                outcome=outcome_map[type(e)],
-            ).inc()
+            _record_failure(
+                _UNKNOWN_PROVIDER_LABEL,
+                request.model,
+                route_mode,
+                outcome_map[type(e)],
+            )
             raise
         except UnknownModelError:
-            LLM_CALLS_TOTAL.labels(
-                provider=_UNKNOWN_PROVIDER_LABEL,
-                model=request.model,
-                route_mode=ROUTE_UNKNOWN_MODEL,
-                outcome="invalid_request",
-            ).inc()
+            _record_failure(
+                _UNKNOWN_PROVIDER_LABEL,
+                request.model,
+                ROUTE_UNKNOWN_MODEL,
+                "invalid_request",
+            )
             raise InvalidRequest(
                 f"No LLM provider registered for model {request.model!r}"
             )
-        except Exception:
-            LLM_CALLS_TOTAL.labels(
-                provider=_UNKNOWN_PROVIDER_LABEL,
-                model=request.model,
-                route_mode=ROUTE_RESOLVER_ERROR,
-                outcome="unavailable",
-            ).inc()
-            raise ProviderUnavailable("LLM provider resolver failed")
+        except Exception as exc:
+            _record_failure(
+                _UNKNOWN_PROVIDER_LABEL,
+                request.model,
+                ROUTE_RESOLVER_ERROR,
+                "unavailable",
+            )
+            raise ProviderUnavailable("LLM provider resolver failed") from exc

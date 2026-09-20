@@ -7,6 +7,7 @@ directly — they're process-global by design, so no DI gymnastics.
 """
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -22,6 +23,7 @@ from conversation.repository import ConversationRepository, MessageRepository
 from conversation.service import ConversationService
 from llm_client.client import LLMClient
 from llm_client.exceptions import ProviderUnavailable, RateLimited
+from llm_client.gateway import LLMGateway
 from llm_client.providers.base import BaseProvider
 from llm_client.types import (
     ChatMessage,
@@ -43,6 +45,40 @@ def _counter_value(metric: Any, **labels: str) -> float:
         # Unlabelled metric (none in this module, but symmetric).
         child = metric
     return child._value.get()  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+# ---- Shared fixture: factory that wraps a fake provider in a gateway
+#      and yields an LLMClient, cleaning up the gateway on teardown.
+#
+# Mirrors the pattern in ``tests/llm_client/test_client.py``'s
+# ``client_with_anthropic`` fixture, but parameterised over the
+# provider so each test can pass its own FakeProvider / RateLimited /
+# Flaky implementation inline.
+
+
+@pytest.fixture
+async def make_llm_client() -> AsyncGenerator[Callable[..., LLMClient], None]:
+    """Return a function: ``(provider, tenant_id) -> LLMClient``.
+
+    Tracks every gateway created so ``aclose_all`` runs on teardown,
+    even when fake providers don't expose ``aclose`` (defensive: keeps
+    the pattern consistent with production gateways).
+    """
+    gateways: list[LLMGateway] = []
+
+    def _factory(
+        provider: BaseProvider, tenant_id: str = "t1"
+    ) -> LLMClient:
+        g = LLMGateway(providers={provider.name: provider})
+        gateways.append(g)
+        return LLMClient(
+            provider_resolver=g.default_resolver,
+            tenant_id=tenant_id,
+        )
+
+    yield _factory
+    for g in gateways:
+        await g.aclose_all()
 
 
 # ---- MESSAGES_TOTAL via ConversationService ----
@@ -87,7 +123,9 @@ async def test_messages_total_increments_per_role() -> None:
 
 
 @pytest.mark.asyncio
-async def test_llm_calls_success_increments_calls_and_tokens() -> None:
+async def test_llm_calls_success_increments_calls_and_tokens(
+    make_llm_client: Callable[..., LLMClient],
+) -> None:
 
     class FakeProvider(BaseProvider):
         name = "fake-provider"
@@ -110,16 +148,28 @@ async def test_llm_calls_success_increments_calls_and_tokens() -> None:
                 finish_reason="stop",
             )
 
-    client = LLMClient(default_provider=FakeProvider(), tenant_id="t1")
+    client = make_llm_client(FakeProvider())
 
     before_calls = _counter_value(
-        LLM_CALLS_TOTAL, provider="fake-provider", model="fake-model-1", outcome="success"
+        LLM_CALLS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        outcome="success",
     )
     before_in = _counter_value(
-        LLM_TOKENS_TOTAL, provider="fake-provider", model="fake-model-1", direction="input"
+        LLM_TOKENS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        direction="input",
     )
     before_out = _counter_value(
-        LLM_TOKENS_TOTAL, provider="fake-provider", model="fake-model-1", direction="output"
+        LLM_TOKENS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        direction="output",
     )
 
     resp = await client.chat(
@@ -131,18 +181,32 @@ async def test_llm_calls_success_increments_calls_and_tokens() -> None:
     assert resp.content == "hi"
 
     assert _counter_value(
-        LLM_CALLS_TOTAL, provider="fake-provider", model="fake-model-1", outcome="success"
+        LLM_CALLS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        outcome="success",
     ) == before_calls + 1
     assert _counter_value(
-        LLM_TOKENS_TOTAL, provider="fake-provider", model="fake-model-1", direction="input"
+        LLM_TOKENS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        direction="input",
     ) == before_in + 10
     assert _counter_value(
-        LLM_TOKENS_TOTAL, provider="fake-provider", model="fake-model-1", direction="output"
+        LLM_TOKENS_TOTAL,
+        provider="fake-provider",
+        model="fake-model-1",
+        route_mode="auto",
+        direction="output",
     ) == before_out + 20
 
 
 @pytest.mark.asyncio
-async def test_llm_calls_rate_limited_outcome() -> None:
+async def test_llm_calls_rate_limited_outcome(
+    make_llm_client: Callable[..., LLMClient],
+) -> None:
 
     class RateLimitedProvider(BaseProvider):
         name = "rl-provider"
@@ -155,9 +219,13 @@ async def test_llm_calls_rate_limited_outcome() -> None:
                 yield None
             raise RateLimited("nope")
 
-    client = LLMClient(default_provider=RateLimitedProvider(), tenant_id="t1")
+    client = make_llm_client(RateLimitedProvider())
     before = _counter_value(
-        LLM_CALLS_TOTAL, provider="rl-provider", model="rl-model", outcome="rate_limited"
+        LLM_CALLS_TOTAL,
+        provider="<unknown>",
+        model="rl-model",
+        route_mode="auto",
+        outcome="rate_limited",
     )
 
     with pytest.raises(RateLimited):
@@ -169,12 +237,18 @@ async def test_llm_calls_rate_limited_outcome() -> None:
         )
 
     assert _counter_value(
-        LLM_CALLS_TOTAL, provider="rl-provider", model="rl-model", outcome="rate_limited"
+        LLM_CALLS_TOTAL,
+        provider="<unknown>",
+        model="rl-model",
+        route_mode="auto",
+        outcome="rate_limited",
     ) == before + 1
 
 
 @pytest.mark.asyncio
-async def test_llm_calls_unavailable_retried_then_succeeds() -> None:
+async def test_llm_calls_unavailable_retried_then_succeeds(
+    make_llm_client: Callable[..., LLMClient],
+) -> None:
 
     class FlakyProvider(BaseProvider):
         name = "flaky"
@@ -202,13 +276,24 @@ async def test_llm_calls_unavailable_retried_then_succeeds() -> None:
             )
 
     provider = FlakyProvider()
-    client = LLMClient(default_provider=provider, tenant_id="t1")
+    client = make_llm_client(provider)
 
+    # Task 3 design: failure paths attribute to ``<unknown>`` because the
+    # resolver could have raised before we picked a provider. Success path
+    # uses the resolved provider name.
     before_unavail = _counter_value(
-        LLM_CALLS_TOTAL, provider="flaky", model="flaky-model", outcome="unavailable"
+        LLM_CALLS_TOTAL,
+        provider="<unknown>",
+        model="flaky-model",
+        route_mode="auto",
+        outcome="unavailable",
     )
     before_success = _counter_value(
-        LLM_CALLS_TOTAL, provider="flaky", model="flaky-model", outcome="success"
+        LLM_CALLS_TOTAL,
+        provider="flaky",
+        model="flaky-model",
+        route_mode="auto",
+        outcome="success",
     )
 
     resp = await client.chat(
@@ -222,8 +307,16 @@ async def test_llm_calls_unavailable_retried_then_succeeds() -> None:
 
     # One unavailable (first attempt failed), one success (second worked).
     assert _counter_value(
-        LLM_CALLS_TOTAL, provider="flaky", model="flaky-model", outcome="unavailable"
+        LLM_CALLS_TOTAL,
+        provider="<unknown>",
+        model="flaky-model",
+        route_mode="auto",
+        outcome="unavailable",
     ) == before_unavail + 1
     assert _counter_value(
-        LLM_CALLS_TOTAL, provider="flaky", model="flaky-model", outcome="success"
+        LLM_CALLS_TOTAL,
+        provider="flaky",
+        model="flaky-model",
+        route_mode="auto",
+        outcome="success",
     ) == before_success + 1

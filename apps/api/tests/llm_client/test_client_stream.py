@@ -5,7 +5,9 @@ async-generator protocol with a lightweight in-memory provider and verify both
 the delta forwarding and the usage-accounting behaviour on the final
 ChatResponse.
 """
-from collections.abc import AsyncIterator, AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
+
+import pytest
 
 from llm_client.client import LLMClient
 from llm_client.gateway import LLMGateway
@@ -42,7 +44,16 @@ def _make_request() -> ChatRequest:
     )
 
 
-async def _make_client() -> AsyncGenerator[LLMClient, None]:
+@pytest.fixture
+async def client_with_fake() -> AsyncGenerator[LLMClient, None]:
+    """LLMClient wired to the fake streaming provider; gateway cleaned up.
+
+    Replaces the previous ``_make_client()`` async generator, which only
+    ran its ``aclose_all()`` teardown if the consumer fully awaited the
+    generator (i.e. called ``aclose()`` after ``__anext__()``). Using a
+    pytest fixture guarantees the teardown runs even when tests raise.
+    Mirrors the pattern in ``test_client.py::client_with_anthropic``.
+    """
     g = LLMGateway(providers={"fake": _FakeStreamProvider()})
     yield LLMClient(
         provider_resolver=g.default_resolver,
@@ -51,9 +62,10 @@ async def _make_client() -> AsyncGenerator[LLMClient, None]:
     await g.aclose_all()
 
 
-async def test_stream_chat_forwards_deltas_then_final_response() -> None:
-    client = await _make_client().__anext__()
-    items = [item async for item in client.stream_chat(_make_request())]
+async def test_stream_chat_forwards_deltas_then_final_response(
+    client_with_fake: LLMClient,
+) -> None:
+    items = [item async for item in client_with_fake.stream_chat(_make_request())]
 
     assert [i for i in items if isinstance(i, str)] == ["one", "two"]
     assert isinstance(items[-1], ChatResponse)
@@ -61,14 +73,15 @@ async def test_stream_chat_forwards_deltas_then_final_response() -> None:
     assert items[-1].finish_reason == "stop"
 
 
-async def test_stream_chat_records_usage_on_final_response() -> None:
-    client = await _make_client().__anext__()
-    items = [item async for item in client.stream_chat(_make_request())]
+async def test_stream_chat_records_usage_on_final_response(
+    client_with_fake: LLMClient,
+) -> None:
+    items = [item async for item in client_with_fake.stream_chat(_make_request())]
     # Collect to completion ensures the final sentinel was consumed.
     assert isinstance(items[-1], ChatResponse)
 
-    assert len(client.usage._pending) == 1
-    row = client.usage._pending[0]
+    assert len(client_with_fake.usage._pending) == 1
+    row = client_with_fake.usage._pending[0]
     assert row["tenant_id"] == "t-1"
     assert row["provider"] == "fake"
     assert row["prompt_tokens"] == 3
