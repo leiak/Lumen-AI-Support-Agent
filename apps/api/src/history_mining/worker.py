@@ -72,6 +72,18 @@ from knowledge.models import KbArticleDraft
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Cron schedule constants
+# ---------------------------------------------------------------------------
+
+# arq cron convention: weekday=0 is Monday, weekday=6 is Sunday.
+# We run Sunday 03:00 UTC to spread load away from the QA worker
+# (which already uses minute=0 on its schedule).
+WEEKDAY_SUNDAY_UTC = 6  # 0 = Monday ... 6 = Sunday
+MIN_HOUR_UTC = 3
+MIN_MINUTE_UTC = 0
+
+
 async def history_mining_worker(ctx: dict[str, Any]) -> dict[str, int]:
     """Runs weekly (Sunday 03:00 UTC).
 
@@ -216,16 +228,20 @@ async def _process_tenant(
 
     # 3. Per-cluster representative-question selection + draft generation.
     # ``LLMClient.with_config`` returns an LLMClient wired to the
-    # configured (provider, model) pair. For mining we use the
-    # same default the rest of the system uses (small model — the
-    # title/body generation is light). ``tenant_id`` is passed so
-    # usage rows are tenant-scoped.
+    # configured (provider, model) pair. Operators can override the
+    # mining LLM via ``HISTORY_MINING_PROVIDER`` / ``HISTORY_MINING_MODEL``
+    # without touching the QA judge config (the previous behaviour
+    # reused ``qa_judge_*`` settings by accident — operators tuning
+    # QA judge would side-effect the mining pipeline). Empty override
+    # values fall back to ``qa_judge_*`` for backward compatibility.
     settings = get_settings()
+    mining_provider = settings.history_mining_provider or settings.qa_judge_provider
+    mining_model = settings.history_mining_model or settings.qa_judge_model
 
     def _llm_factory() -> LLMClient:
         return LLMClient.with_config(
-            provider=settings.qa_judge_provider,  # reuse QA judge wiring
-            model=settings.qa_judge_model,
+            provider=mining_provider,
+            model=mining_model,
             tenant_id=tenant_id,
         )
 
@@ -305,9 +321,9 @@ class WorkerSettings:
     cron_jobs = [
         cron(
             history_mining_worker,
-            hour=3,
-            minute=0,
-            weekday=6,  # Sunday 03:00 UTC
+            hour=MIN_HOUR_UTC,
+            minute=MIN_MINUTE_UTC,
+            weekday=WEEKDAY_SUNDAY_UTC,
         ),
     ]
 

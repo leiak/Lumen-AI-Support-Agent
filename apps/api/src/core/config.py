@@ -207,6 +207,17 @@ class Settings(BaseSettings):
     history_mining_max_cluster_size: int = Field(
         default=1000, alias="HISTORY_MINING_MAX_CLUSTER_SIZE"
     )
+    # Dedicated LLM wiring for the mining worker. Defaults to empty
+    # (= fall back to ``qa_judge_*``) so an operator who tunes the QA
+    # judge config doesn't accidentally side-effect the mining
+    # pipeline. Override per deployment via ``HISTORY_MINING_PROVIDER``
+    # / ``HISTORY_MINING_MODEL`` if mining needs its own model choice.
+    history_mining_provider: str = Field(
+        default="", alias="HISTORY_MINING_PROVIDER"
+    )
+    history_mining_model: str = Field(
+        default="", alias="HISTORY_MINING_MODEL"
+    )
 
     @property
     def widget_allowed_origins_global(self) -> list[str]:

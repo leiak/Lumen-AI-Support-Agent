@@ -38,11 +38,13 @@ server side if it needs to display the underlying questions.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from core.database import get_sessionmaker
 from core.id_gen import new_id
@@ -57,6 +59,10 @@ from knowledge.models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+
+# TODO tech-debt #17: replace Query() with JWT-derived tenant_id
+# (Depends(get_current_user) returns claims dict; tenant_id from claims).
+# CommonTenantQuery dependency extracted at that time.
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +117,7 @@ async def _ensure_auto_mined_kb(session, *, tenant_id: str) -> KnowledgeBase:
     session.add(kb)
     try:
         await session.flush()
-    except Exception:  # pragma: no cover — race between two approves
+    except IntegrityError:  # pragma: no cover — race between two approves
         # A concurrent admin approved first → refetch the now-existing row.
         await session.rollback()
         existing = (
@@ -174,17 +180,51 @@ async def list_kb_drafts(
         }
 
 
+@router.get("/kb-drafts/{draft_id}")
+async def get_kb_draft(
+    draft_id: str,
+    tenant_id: str = Query(...),
+):
+    """Return full draft details (incl. full ``suggested_body``).
+
+    Without this endpoint, admins can only see the first 200 chars of
+    the suggested body — they literally cannot decide approve/reject
+    end-to-end. Cross-tenant access returns 404 (anti-enumeration,
+    matching the other per-row endpoints).
+    """
+    sm = get_sessionmaker()
+    async with sm() as session:
+        result = await session.execute(
+            select(KbArticleDraft).where(
+                KbArticleDraft.id == draft_id,
+                KbArticleDraft.tenant_id == tenant_id,
+            )
+        )
+        draft = result.scalar_one_or_none()
+        if draft is None:
+            raise HTTPException(status_code=404, detail="draft not found")
+        return {
+            "id": draft.id,
+            "title": draft.suggested_title,
+            "body": draft.suggested_body,
+            "tags": draft.suggested_tags or [],
+            "status": draft.status,
+            "created_at": draft.created_at.isoformat(),
+            "reviewed_at": draft.reviewed_at.isoformat() if draft.reviewed_at else None,
+            "reviewed_by": draft.reviewed_by,
+        }
+
+
 @router.post("/kb-drafts/{draft_id}/approve")
 async def approve_kb_draft(
     draft_id: str,
     tenant_id: str = Query(...),
     reviewer_id: str = Query(...),
 ):
-    """Approve a DRAFT → create an ``Article`` + v1 ``ArticleVersion``.
+    """Approve → create Article + mark draft APPROVED.
 
-    Transitions ``KbArticleDraft.status`` DRAFT → APPROVED and stores
-    the new article ID on ``published_article_id`` so the admin UI
-    can link back.
+    Pessimistic lock on KbArticleDraft row prevents two admins from
+    double-approving the same draft (race producing 2 Article rows + lost audit).
 
     Lifecycle::
 
@@ -200,10 +240,12 @@ async def approve_kb_draft(
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
-            select(KbArticleDraft).where(
+            select(KbArticleDraft)
+            .where(
                 KbArticleDraft.id == draft_id,
                 KbArticleDraft.tenant_id == tenant_id,
             )
+            .with_for_update()  # Pessimistic lock for the duration of this transaction
         )
         draft = result.scalar_one_or_none()
         if draft is None:
@@ -219,10 +261,8 @@ async def approve_kb_draft(
         # Deterministic content hash — the draft body becomes the
         # ArticleVersion.raw_text, and the hash drives dedup on future
         # reindex attempts against the same bytes.
-        import hashlib
-
         content_hash = hashlib.sha256(
-            (draft.suggested_body or "").encode("utf-8")
+            draft.suggested_body.encode("utf-8")
         ).hexdigest()
 
         article_id = new_id()
@@ -291,10 +331,12 @@ async def reject_kb_draft(
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
-            select(KbArticleDraft).where(
+            select(KbArticleDraft)
+            .where(
                 KbArticleDraft.id == draft_id,
                 KbArticleDraft.tenant_id == tenant_id,
             )
+            .with_for_update()  # Pessimistic lock — same rationale as approve
         )
         draft = result.scalar_one_or_none()
         if draft is None:

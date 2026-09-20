@@ -20,6 +20,7 @@ from core.database import get_sessionmaker
 from core.id_gen import new_id
 from httpx import AsyncClient
 from knowledge.models import Article, KbArticleDraft
+from sqlalchemy import select
 from tenant.models import Tenant
 
 
@@ -93,6 +94,76 @@ async def test_list_drafts_filters_by_status(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_get_draft_returns_full_body(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    """GET detail endpoint returns full body (not just 200-char preview).
+
+    Without this endpoint, admins literally cannot review a draft
+    end-to-end (list returns only body_preview[:200]).
+    """
+    sm = get_sessionmaker()
+    draft_id = new_id()
+    long_body = "x" * 500
+    async with sm() as session:
+        session.add(
+            KbArticleDraft(
+                id=draft_id,
+                tenant_id=sample_tenant.id,
+                cluster_id=0,
+                source_questions=["q1"],
+                suggested_title="T",
+                suggested_body=long_body,
+                suggested_tags=[],
+                status="DRAFT",
+            )
+        )
+        await session.commit()
+
+    resp = await async_client.get(
+        f"/api/v1/admin/kb-drafts/{draft_id}",
+        params={"tenant_id": sample_tenant.id},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["body"] == long_body  # Full body returned, not truncated
+    assert body["title"] == "T"
+    assert body["status"] == "DRAFT"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_draft_cross_tenant_returns_404(
+    async_client: AsyncClient, sample_tenant: Tenant
+) -> None:
+    """GET detail cross-tenant returns 404 (anti-enumeration)."""
+    sm = get_sessionmaker()
+    draft_id = new_id()
+    other_tenant_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    async with sm() as session:
+        session.add(
+            KbArticleDraft(
+                id=draft_id,
+                tenant_id=other_tenant_id,
+                cluster_id=0,
+                source_questions=["q"],
+                suggested_title="Foreign",
+                suggested_body="b",
+                suggested_tags=[],
+                status="DRAFT",
+            )
+        )
+        await session.commit()
+
+    resp = await async_client.get(
+        f"/api/v1/admin/kb-drafts/{draft_id}",
+        params={"tenant_id": sample_tenant.id},
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_approve_draft_creates_article_and_marks_approved(
     async_client: AsyncClient, sample_tenant: Tenant
 ) -> None:
@@ -129,10 +200,6 @@ async def test_approve_draft_creates_article_and_marks_approved(
         assert article is not None
         assert article.tenant_id == sample_tenant.id
         assert article.title == "Reset Password"
-
-        from sqlalchemy import select
-
-        from knowledge.models import KbArticleDraft
 
         draft_row = (
             await session.execute(
@@ -178,10 +245,6 @@ async def test_reject_draft_does_not_create_article(
 
     # Verify NO Article was created.
     async with sm() as session:
-        from sqlalchemy import select
-
-        from knowledge.models import Article, KbArticleDraft
-
         draft_row = (
             await session.execute(
                 select(KbArticleDraft).where(KbArticleDraft.id == draft_id)
