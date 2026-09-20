@@ -27,6 +27,7 @@ from llm_client.exceptions import (
     ProviderUnavailable,
     RateLimited,
 )
+from llm_client.providers.base import BaseProvider
 from llm_client.resolvers import PinnedResolver, Resolver, UnknownModelError
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse
 from llm_client.usage import UsageRecorder
@@ -57,7 +58,7 @@ def _route_mode_for(resolver: Resolver) -> str:
 
 
 def _record_success(
-    provider_name: str,
+    provider_label: str,
     model: str,
     route_mode: str,
     prompt_tokens: int,
@@ -70,19 +71,19 @@ def _record_success(
     new label later is one edit, not 5.
     """
     LLM_CALLS_TOTAL.labels(
-        provider=provider_name,
+        provider=provider_label,
         model=model,
         route_mode=route_mode,
         outcome="success",
     ).inc()
     LLM_TOKENS_TOTAL.labels(
-        provider=provider_name,
+        provider=provider_label,
         model=model,
         route_mode=route_mode,
         direction="input",
     ).inc(prompt_tokens)
     LLM_TOKENS_TOTAL.labels(
-        provider=provider_name,
+        provider=provider_label,
         model=model,
         route_mode=route_mode,
         direction="output",
@@ -220,7 +221,9 @@ class LLMClient:
         request_id = uuid.uuid4().hex
         attempt = 0
         last_exc: Exception | None = None
+        provider: BaseProvider | None = None  # hoist; reset per iteration
         while attempt <= max_retries:
+            provider = None  # avoid stale binding from a prior iteration
             try:
                 provider = self.provider_resolver(request)
                 resp = await provider.chat(request)
@@ -242,17 +245,26 @@ class LLMClient:
                 return resp
             except RateLimited:
                 _record_failure(
-                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "rate_limited"
+                    provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    route_mode,
+                    "rate_limited",
                 )
                 raise
             except InvalidRequest:
                 _record_failure(
-                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "invalid_request"
+                    provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    route_mode,
+                    "invalid_request",
                 )
                 raise
             except ProviderUnavailable as e:
                 _record_failure(
-                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "unavailable"
+                    provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    route_mode,
+                    "unavailable",
                 )
                 last_exc = e
                 if attempt == max_retries:
@@ -262,7 +274,10 @@ class LLMClient:
                 attempt += 1
             except OutputInvalid as e:
                 _record_failure(
-                    _UNKNOWN_PROVIDER_LABEL, request.model, route_mode, "output_invalid"
+                    provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    route_mode,
+                    "output_invalid",
                 )
                 last_exc = e
                 if attempt == max_retries:
@@ -275,6 +290,8 @@ class LLMClient:
                 # provider — 4xx-equivalent. Propagate as InvalidRequest
                 # so callers see a uniform "bad request" surface and
                 # metric label is ``invalid_request`` not a new outcome.
+                # ``provider`` is ``None`` here because the resolver raised
+                # before we picked, so we keep ``<unknown>`` as the label.
                 _record_failure(
                     _UNKNOWN_PROVIDER_LABEL,
                     request.model,
@@ -291,6 +308,8 @@ class LLMClient:
                 # ``from exc`` preserves the original exception class
                 # via ``__cause__`` for ops debugging (Sentry grouping,
                 # distinguishing config bugs from transient failures).
+                # ``provider`` is ``None`` here because the resolver raised
+                # before we picked, so we keep ``<unknown>`` as the label.
                 _record_failure(
                     _UNKNOWN_PROVIDER_LABEL,
                     request.model,
@@ -315,12 +334,11 @@ class LLMClient:
         """
         request, route_mode = self._resolve_request(request)
         request_id = uuid.uuid4().hex
-        saw_final_response = False
+        provider: BaseProvider | None = None
         try:
             provider = self.provider_resolver(request)
             async for item in provider.stream(request):
                 if isinstance(item, ChatResponse):
-                    saw_final_response = True
                     self.usage.enqueue(
                         tenant_id=self.tenant_id,
                         provider=provider.name,
@@ -345,7 +363,7 @@ class LLMClient:
                 OutputInvalid: "output_invalid",
             }
             _record_failure(
-                _UNKNOWN_PROVIDER_LABEL,
+                provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
                 request.model,
                 route_mode,
                 outcome_map[type(e)],

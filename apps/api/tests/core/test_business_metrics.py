@@ -222,7 +222,7 @@ async def test_llm_calls_rate_limited_outcome(
     client = make_llm_client(RateLimitedProvider())
     before = _counter_value(
         LLM_CALLS_TOTAL,
-        provider="<unknown>",
+        provider="rl-provider",
         model="rl-model",
         route_mode="auto",
         outcome="rate_limited",
@@ -238,7 +238,7 @@ async def test_llm_calls_rate_limited_outcome(
 
     assert _counter_value(
         LLM_CALLS_TOTAL,
-        provider="<unknown>",
+        provider="rl-provider",
         model="rl-model",
         route_mode="auto",
         outcome="rate_limited",
@@ -278,12 +278,14 @@ async def test_llm_calls_unavailable_retried_then_succeeds(
     provider = FlakyProvider()
     client = make_llm_client(provider)
 
-    # Task 3 design: failure paths attribute to ``<unknown>`` because the
-    # resolver could have raised before we picked a provider. Success path
-    # uses the resolved provider name.
+    # Task 3 design: post-resolve failure paths attribute to the actual
+    # provider name (the resolver already returned a provider before the
+    # 4xx/5xx/OutputInvalid fired). Resolver-error paths (UnknownModelError,
+    # bare Exception) keep ``<unknown>`` because the resolver raised before
+    # we picked a provider.
     before_unavail = _counter_value(
         LLM_CALLS_TOTAL,
-        provider="<unknown>",
+        provider="flaky",
         model="flaky-model",
         route_mode="auto",
         outcome="unavailable",
@@ -308,7 +310,7 @@ async def test_llm_calls_unavailable_retried_then_succeeds(
     # One unavailable (first attempt failed), one success (second worked).
     assert _counter_value(
         LLM_CALLS_TOTAL,
-        provider="<unknown>",
+        provider="flaky",
         model="flaky-model",
         route_mode="auto",
         outcome="unavailable",
