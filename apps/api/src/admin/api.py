@@ -38,11 +38,11 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query  # noqa: F401 (used by Tasks 4-6)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from auth.dependencies import require_admin
+from auth.dependencies import require_admin  # noqa: F401 (used by Tasks 4-6)
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
