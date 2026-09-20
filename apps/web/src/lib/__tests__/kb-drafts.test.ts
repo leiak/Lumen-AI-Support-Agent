@@ -5,7 +5,6 @@ import {
   fetchDraft,
   fetchDrafts,
   KbDraftDetailSchema,
-  KbDraftListSchema,
   rejectDraft,
 } from '@/lib/kb-drafts';
 import { apiClient } from '@/lib/api-client';
@@ -49,7 +48,7 @@ describe('fetchDrafts', () => {
     });
     const result = await fetchDrafts();
     expect(result.drafts).toHaveLength(1);
-    expect(result.drafts[0].title).toBe('How to reset password');
+    expect(result.drafts[0]?.title).toBe('How to reset password');
     expect(mockedGet).toHaveBeenCalledWith('/api/v1/admin/kb-drafts', {
       params: { status: 'DRAFT', limit: 50 },
     });
