@@ -1,13 +1,25 @@
-"""Vision embedding abstraction + Doubao implementation.
+"""Vision embedding abstraction + provider adapters.
 
-Doubao embedding-vision API accepts image bytes (or base64-from-bytes)
-via the OpenAI-compatible multimodal embeddings endpoint.
+Three providers ship behind a common :class:`VisionEmbedder` base:
 
-Ref: https://www.volcengine.com/docs/82379/1366569
+- ``DoubaoVisionEmbedder`` — Doubao embedding-vision via the
+  OpenAI-compatible multimodal embeddings endpoint. Default.
+- ``OpenAIVisionEmbedder`` — OpenAI CLIP ViT-L/14 (768-dim) via the
+  OpenAI ``/v1/embeddings`` endpoint with a data-URI image payload.
+- ``VoyageVisionEmbedder`` — Voyage Multimodal 3 (1024-dim) via
+  ``/v1/multimodalembeddings`` with a nested ``inputs[].content[]``
+  shape and explicit ``media_type``.
 
-Graceful degradation: if api_key is empty (dev without Doubao creds),
-returns a zero vector and logs a warning. This lets the rest of the
-pipeline (storage, retrieval) work without vision enabled.
+The configured provider is selected at runtime via
+:func:`get_vision_embedder` from ``settings.vision_provider``.
+
+Refs:
+- Doubao: https://www.volcengine.com/docs/82379/1366569
+- Voyage: https://docs.voyageai.com/docs/multimodal-embeddings
+
+Graceful degradation: if api_key is empty (dev without provider
+creds), returns a zero vector and logs a warning. This lets the rest
+of the pipeline (storage, retrieval) work without vision enabled.
 
 PII contract: log lines MUST NOT include raw image bytes. Allowed
 fields: ``model``, ``reason``, ``error_type``, ``mime_type``.
@@ -21,6 +33,8 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import httpx
+
+from core.config import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +313,7 @@ class VoyageVisionEmbedder(VisionEmbedder):
         return EmbeddingResult(vector=[0.0] * self.dimension, model=self._model)
 
 
-def get_vision_embedder(settings) -> VisionEmbedder:
+def get_vision_embedder(settings: Settings) -> VisionEmbedder:
     """Factory: return the configured vision embedder instance.
 
     Raises ``ValueError`` for an unknown ``vision_provider`` so a
