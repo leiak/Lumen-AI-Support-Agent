@@ -30,6 +30,7 @@
 | 17 | M2.B — 多模态 KB (PNG/PDF + Qdrant vision collection + RRF 检索 + 上传 API) | ✅ | ~20 multimodal unit + integration |
 | 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration |
 | 19 | M2.B — 收尾 (README + demo-act5 + 已知技术债 #18-20 + memory) | ✅ | 0 new tests, 3 demo stub PNGs |
+| 20 | M3 — 5 个生产级技术债 (#17 admin JWT auth / #18 PDF text indexing / #16 SES tenant reverse-lookup / #19 multi-vision adapter / #20 admin SPA UI) | ✅ | 17 admin + 9 vision_embedder + 13 web vitest + 4 PDF retrieve |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
