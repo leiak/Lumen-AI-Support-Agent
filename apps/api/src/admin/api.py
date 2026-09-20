@@ -17,14 +17,10 @@ Every query carries ``tenant_id`` — cross-tenant access returns
 draft IDs across tenants cannot distinguish "exists but yours"
 from "doesn't exist".
 
-KNOWN DEBT (M2.B / Task 8): admin auth
---------------------------------------
-
-The current implementation accepts ``tenant_id`` and ``reviewer_id``
-as query parameters — they are NOT verified. Production must wire
-``Depends(get_current_user)`` (same shape as :mod:`knowledge.api`)
-and read tenant + reviewer from the JWT claims. Tracked as README
-tech-debt for Stage 19 M2.B close-out.
+Tech debt #17 — JWT auth on all 4 admin endpoints (in progress):
+``tenant_id`` is derived from ``claims["tenant_id"]`` (via
+``Depends(require_admin)``); ``reviewer_id`` from ``claims["sub"]``.
+Cross-tenant access returns 404 (anti-enumeration parity with M1).
 
 PII discipline
 --------------
@@ -42,10 +38,11 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from auth.dependencies import require_admin
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -59,10 +56,6 @@ from knowledge.models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
-
-# TODO tech-debt #17: replace Query() with JWT-derived tenant_id
-# (Depends(get_current_user) returns claims dict; tenant_id from claims).
-# CommonTenantQuery dependency extracted at that time.
 
 
 # ---------------------------------------------------------------------------
