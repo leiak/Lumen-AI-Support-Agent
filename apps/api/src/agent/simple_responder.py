@@ -48,6 +48,7 @@ from conversation.enums import MessageRole
 from conversation.models import Message
 from conversation.service import ConversationService
 from core.logging import get_logger
+from core.qdrant import get_qdrant_client
 from knowledge.rag_service import RAGService
 from knowledge.repository import KnowledgeBaseRepository
 from llm_client.client import LLMClient
@@ -158,6 +159,13 @@ class SimpleResponder:
                 # ``rag_service`` and ``kb_repository`` are the
                 # seams the tool requires.
                 kb_repository=self._kb_repository,
+                # Stage 17 / M2.B Task 6 — also wire the
+                # multimodal sibling tool so the LLM can pick
+                # image-aware RRF-fused RAG when the customer
+                # references screenshots / diagrams. The tool
+                # needs a raw Qdrant client for the
+                # ``kb_image_vectors`` collection reads.
+                qdrant_client=get_qdrant_client(),
             )
         return self._graph
 

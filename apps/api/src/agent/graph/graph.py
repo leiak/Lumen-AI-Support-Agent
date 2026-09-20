@@ -43,12 +43,17 @@ from agent.graph.nodes import (
     make_retrieve_node,
 )
 from agent.graph.state import AgentState
-from agent.graph.tools import make_escalate_tool, make_search_internal_kb_tool
+from agent.graph.tools import (
+    make_escalate_tool,
+    make_search_internal_kb_tool,
+    make_search_multimodal_kb_tool,
+)
 from conversation.service import ConversationService
 from core.logging import get_logger
 from knowledge.rag_service import RAGService
 from knowledge.repository import KnowledgeBaseRepository
 from llm_client.client import LLMClient
+from qdrant_client import AsyncQdrantClient
 
 log = get_logger(__name__)
 
@@ -100,6 +105,7 @@ def build_agent_graph(
     model: str,
     conv_service: ConversationService | None = None,
     kb_repository: KnowledgeBaseRepository | None = None,
+    qdrant_client: AsyncQdrantClient | None = None,
 ) -> Any:
     """Build and compile the M1 agent graph.
 
@@ -133,6 +139,16 @@ def build_agent_graph(
         real :class:`KnowledgeBaseRepository` so production code
         never has to pass it explicitly; tests can pass a mock
         (or omit to bypass the search tool entirely).
+    qdrant_client:
+        Stage 17 / M2.B Task 6 — Qdrant client. When supplied
+        together with ``kb_repository`` (production), the graph
+        also hoists the ``search_multimodal_kb`` tool so the LLM
+        can advertise and invoke it for image-aware RAG. The
+        multimodal tool needs a raw ``AsyncQdrantClient`` because
+        its retriever uses ``query_points`` against the
+        ``kb_image_vectors`` collection directly. Tests that
+        don't exercise multimodal search can omit this parameter
+        — the multimodal tool simply isn't registered.
 
     Returns
     -------
@@ -174,6 +190,22 @@ def build_agent_graph(
             make_search_internal_kb_tool(
                 rag_service=rag_service,
                 kb_repository=kb_repository,
+            )
+        )
+    if kb_repository is not None and qdrant_client is not None:
+        # Stage 17 / M2.B Task 6 — wire the multimodal sibling tool
+        # alongside ``search_internal_kb`` so the LLM can choose
+        # between text-only RAG and image-aware RRF-fused RAG. The
+        # two tools are SIBLINGS, not replacements — see
+        # :func:`make_search_multimodal_kb_tool` for why we keep
+        # both. Both depend on ``kb_repository`` for slug
+        # resolution; the multimodal tool additionally needs the
+        # Qdrant client for the ``kb_image_vectors`` collection.
+        hoisted_tools.append(
+            make_search_multimodal_kb_tool(
+                rag_service=rag_service,
+                kb_repository=kb_repository,
+                qdrant_client=qdrant_client,
             )
         )
 

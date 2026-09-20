@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -79,6 +80,14 @@ _ALLOWED_MIME_TYPES = frozenset(
         "application/pdf",
     }
 )
+
+# Title length cap for the Qdrant payload. The DB column is
+# unlimited ``Text`` (see ``KbMultimodalArticle.title``), but the
+# Qdrant payload is materialized on every retrieval and the LLM
+# only ever reads the title prefix for relevance matching. 200
+# chars is plenty for any real title and keeps the payload size
+# bounded across millions of points.
+QDRANT_TITLE_MAX = 200
 
 
 async def _read_upload_capped(file: UploadFile, *, cap: int) -> bytes:
@@ -177,7 +186,14 @@ async def upload_multimodal(
     # 1. Upload to object store. The key is tenant-prefixed
     #    (defense-in-depth: a misconfigured IAM policy can't make
     #    the app exfiltrate cross-tenant data).
-    storage_key = f"{tenant_id}/{kb_slug}/{article_id}/{file.filename or 'upload'}"
+    # ``os.path.basename`` strips any directory components the
+    # client may have smuggled into the filename — without it an
+    # attacker could craft a multipart filename like
+    # ``../../../etc/passwd`` and have it become a path segment
+    # in the S3 key. ``or "upload"`` handles the empty-string
+    # case where the client doesn't supply a filename at all.
+    safe_filename = os.path.basename(file.filename or "upload") or "upload"
+    storage_key = f"{tenant_id}/{kb_slug}/{article_id}/{safe_filename}"
     try:
         # S3ObjectStore.put is sync; offload to a thread so the event
         # loop isn't blocked on the network round-trip.
@@ -232,9 +248,22 @@ async def upload_multimodal(
     try:
         image_vectors: list[tuple[int, list[float]]] = []
         for page_num, png_bytes in screenshots:
+            # Mime type matters: the data URI we send to Doubao
+            # is ``data:{mime_type};base64,...`` and the model
+            # uses it to dispatch the right decoder. For PDF
+            # key-page screenshots the bytes are real PNG, so
+            # ``image/png`` is correct. For direct image uploads
+            # (JPEG / WebP / PNG) we use the client-supplied
+            # ``file.content_type`` — previously this was
+            # hardcoded to ``image/png`` which produced a
+            # type-mismatched data URI for non-PNG uploads.
+            if mime_type == "application/pdf":
+                emb_mime = "image/png"
+            else:
+                emb_mime = file.content_type or "application/octet-stream"
             emb = await embedder.encode(
                 png_bytes,
-                mime_type="image/png",
+                mime_type=emb_mime,
             )
             image_vectors.append((page_num, emb.vector))
     finally:
@@ -285,7 +314,10 @@ async def upload_multimodal(
                     # — a join on every retrieval — would dominate
                     # the latency budget. The Qdrant MUST-filter
                     # still prevents cross-tenant reads.
-                    "title": title[:200],
+                    # Truncated to :data:`QDRANT_TITLE_MAX` to
+                    # keep the payload size bounded — see the
+                    # constant's docstring for rationale.
+                    "title": title[:QDRANT_TITLE_MAX],
                 },
             )
             for page_num, vec in image_vectors
@@ -338,8 +370,20 @@ async def upload_multimodal(
 
     return {
         "article_id": article_id,
-        "text_chunks": text_chunks_n,
-        "image_chunks": len(screenshots),
+        # ``text_chunks`` is the count of text chunks the PDF
+        # processor EXTRACTED from the document. These are
+        # persisted in the DB row + ``text_chunks_count`` column
+        # for future use, but they are NOT yet indexed into the
+        # M1 ``article_chunks`` Qdrant collection — Task 6
+        # deliberately defers that to a later task that will
+        # extend the chunker for page-aware text. ``image_chunks``
+        # is the count of vectors that WERE indexed into the
+        # ``kb_image_vectors`` Qdrant collection (one per PDF
+        # key-page screenshot, or one for direct image uploads).
+        # Names reflect "extracted" vs "indexed" so the operator
+        # can tell which step succeeded from the response alone.
+        "text_chunks": text_chunks_n,  # extracted (not yet indexed)
+        "image_chunks": len(screenshots),  # indexed in kb_image_vectors
     }
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -343,6 +343,94 @@ def test_build_agent_graph_returns_compiled() -> None:
     )
     assert hasattr(graph, "ainvoke")
     assert callable(graph.ainvoke)
+
+
+def test_build_agent_graph_registers_multimodal_tool_with_qdrant_client() -> None:
+    """Stage 17 / M2.B Task 6 — when ``qdrant_client`` is supplied,
+    the graph registers BOTH ``search_internal_kb`` and
+    ``search_multimodal_kb`` tools with the LLM node. The LLM
+    sees both names advertised and can pick between text-only
+    RAG and multimodal RRF-fused RAG.
+
+    Reviewer finding (Task 6 code review): the multimodal tool
+    was defined in ``tools.py`` but never registered with the
+    graph, so the LLM couldn't actually call it. This test pins
+    the wiring so the regression can't return silently.
+    """
+    from agent.graph.graph import build_agent_graph
+    from agent.graph.nodes import make_llm_node
+
+    rag_service = _capturing_rag_service()
+    client = _capturing_llm_client()
+    kb_repo = MagicMock()
+    qdrant = MagicMock()
+
+    # Spy on ``make_llm_node`` so we can read the ``tools=``
+    # argument without introspecting a compiled graph's internals
+    # (langgraph doesn't expose the bound tool list post-compile).
+    original_make_llm_node = make_llm_node
+    captured: dict[str, list[Any]] = {}
+
+    def _spy_make_llm_node(*args: Any, **kwargs: Any) -> Any:
+        captured["tools"] = list(kwargs.get("tools") or [])
+        return original_make_llm_node(*args, **kwargs)
+
+    with patch(
+        "agent.graph.graph.make_llm_node",
+        side_effect=_spy_make_llm_node,
+    ):
+        build_agent_graph(
+            rag_service=rag_service,
+            llm_client_factory=_make_factory(client),
+            model=DEFAULT_MODEL,
+            kb_repository=kb_repo,
+            qdrant_client=qdrant,
+        )
+
+    # The LLM node received BOTH tools. Names are what the LLM
+    # sees in its tool-advertisement JSON.
+    tool_names = sorted(t.name for t in captured.get("tools", []))
+    assert tool_names == ["search_internal_kb", "search_multimodal_kb"], (
+        f"expected both KB tools to be registered; got {tool_names!r}"
+    )
+
+
+def test_build_agent_graph_omits_multimodal_tool_without_qdrant_client() -> None:
+    """Without ``qdrant_client``, the multimodal tool is not
+    registered (the graph still mounts ``search_internal_kb`` and
+    ``escalate_to_human``). This pins the conditional registration
+    contract — ``qdrant_client`` is the signal that the new image
+    collection is available."""
+    from agent.graph.graph import build_agent_graph
+
+    rag_service = _capturing_rag_service()
+    client = _capturing_llm_client()
+    kb_repo = MagicMock()
+
+    captured: dict[str, list[Any]] = {}
+    original_make_llm_node = make_llm_node
+
+    def _spy_make_llm_node(*args: Any, **kwargs: Any) -> Any:
+        captured["tools"] = list(kwargs.get("tools") or [])
+        return original_make_llm_node(*args, **kwargs)
+
+    with patch(
+        "agent.graph.graph.make_llm_node",
+        side_effect=_spy_make_llm_node,
+    ):
+        build_agent_graph(
+            rag_service=rag_service,
+            llm_client_factory=_make_factory(client),
+            model=DEFAULT_MODEL,
+            kb_repository=kb_repo,
+            # qdrant_client deliberately omitted
+        )
+
+    tool_names = sorted(t.name for t in captured.get("tools", []))
+    assert "search_internal_kb" in tool_names
+    assert "search_multimodal_kb" not in tool_names, (
+        "multimodal tool must NOT register without qdrant_client"
+    )
 
 
 @pytest.mark.asyncio

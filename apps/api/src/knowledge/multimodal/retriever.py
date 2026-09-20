@@ -52,6 +52,8 @@ from dataclasses import dataclass
 from qdrant_client import AsyncQdrantClient
 
 from core.logging import get_logger
+from knowledge.qdrant_client import DEFAULT_COLLECTION
+from knowledge.startup import IMAGE_COLLECTION
 
 log = get_logger(__name__)
 
@@ -174,9 +176,18 @@ class MultimodalRetriever:
             )
 
         try:
-            result = await self._qdrant.search(
-                collection_name="article_chunks",
-                query_vector=vector,
+            # qdrant-client >= 1.14 unified ``search`` /
+            # ``search_batch`` / ``recommend`` / ``discover`` /
+            # ``scroll`` into a single ``query_points`` entry
+            # point. The old ``search`` method was removed in
+            # 1.19; we use ``query_points`` here for forward
+            # compatibility and to match the existing pattern in
+            # ``knowledge.qdrant_client.search_chunks``. The
+            # ``points`` attribute on the response holds the
+            # highest-scored results as a NameList[ScoredPoint].
+            response = await self._qdrant.query_points(
+                collection_name=DEFAULT_COLLECTION,
+                query=vector,
                 query_filter=Filter(must=must),
                 limit=limit,
             )
@@ -191,6 +202,7 @@ class MultimodalRetriever:
             )
             return []
 
+        scored = list(response.points) if response.points else []
         return [
             RetrievalHit(
                 chunk_id=str(h.id),
@@ -199,7 +211,7 @@ class MultimodalRetriever:
                 article_id=str(h.payload.get("article_id", "")) if h.payload else "",
                 metadata=dict(h.payload) if h.payload else {},
             )
-            for h in result
+            for h in scored
         ]
 
     async def _search_images(
@@ -218,9 +230,13 @@ class MultimodalRetriever:
         ]
 
         try:
-            result = await self._qdrant.search(
-                collection_name="kb_image_vectors",
-                query_vector=vector,
+            # See ``_search_text`` for the ``query_points``
+            # rationale. Same unified API; the ``query`` param
+            # accepts a bare ``list[float]`` as the nearest-neighbor
+            # form.
+            response = await self._qdrant.query_points(
+                collection_name=IMAGE_COLLECTION,
+                query=vector,
                 query_filter=Filter(must=must),
                 limit=limit,
             )
@@ -233,6 +249,7 @@ class MultimodalRetriever:
             )
             return []
 
+        scored = list(response.points) if response.points else []
         return [
             RetrievalHit(
                 chunk_id=str(h.id),
@@ -241,7 +258,7 @@ class MultimodalRetriever:
                 article_id=str(h.payload.get("article_id", "")) if h.payload else "",
                 metadata=dict(h.payload) if h.payload else {},
             )
-            for h in result
+            for h in scored
         ]
 
     @staticmethod

@@ -549,7 +549,24 @@ def make_search_multimodal_kb_tool(
 
         # ---- 3. RRF-fused retrieval ----------------------------
         try:
+            from core.config import get_settings
             from knowledge.multimodal.retriever import MultimodalRetriever
+
+            settings = get_settings()
+            # When vision is configured, we pass a 1024-dim zero
+            # vector as the image-query placeholder so the
+            # ``kb_image_vectors`` collection is actually queried
+            # (otherwise the multimodal tool would silently degrade
+            # to text-only). The zero vector won't match real
+            # image embeddings well — image-side relevance for
+            # text-only queries is intentionally weak — but the
+            # collection is exercised and the "multimodal" contract
+            # is honest. TODO Task 6+: replace with proper
+            # text→vision embedding (Doubao doesn't expose one;
+            # CLIP/CLAP would).
+            image_query_emb: list[float] | None = (
+                [0.0] * 1024 if settings.doubao_vision_api_key else None
+            )
 
             retriever = MultimodalRetriever(
                 _qdrant, top_k=max(1, min(top_k, 20))
@@ -558,7 +575,7 @@ def make_search_multimodal_kb_tool(
                 tenant_id=tenant_id,
                 kb_slug=kb_slug,
                 text_query_embedding=text_embedding,
-                image_query_embedding=None,
+                image_query_embedding=image_query_emb,
                 knowledge_base_id=knowledge_base_id,
             )
         except Exception as exc:

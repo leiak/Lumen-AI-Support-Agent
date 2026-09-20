@@ -39,6 +39,11 @@ IMAGE_COLLECTION = "kb_image_vectors"
 # 1024 (see ``knowledge/multimodal/embedder.py``); we keep this
 # constant here too so the startup hook doesn't have to construct a
 # throwaway embedder instance just to read its dimension.
+#
+# MUST match ``VisionEmbedder.dimension``. Update both if the
+# model ever changes — the Qdrant collection is sized off this
+# number at create time, and a mismatch silently corrupts search
+# results.
 DEFAULT_VISION_DIMENSION = 1024
 
 

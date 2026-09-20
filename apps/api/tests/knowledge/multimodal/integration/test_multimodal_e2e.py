@@ -288,6 +288,100 @@ async def test_upload_rejects_missing_auth(
     assert resp.status_code == 401
 
 
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cross_tenant_isolation_db_rows_partitioned(
+    app_client: AsyncClient,
+    tenant_factory: Tenant,
+    second_tenant_factory: Tenant,
+):
+    """Tenant A's upload MUST NOT be retrievable / visible to Tenant B.
+
+    Stage 17 / M2.B Task 6 — the cross-tenant isolation contract
+    is enforced at TWO layers (defense in depth):
+
+    1. The DB row carries ``tenant_id=A``; tenant B's reads (via
+       any future GET / list endpoint) MUST filter on
+       ``tenant_id=B`` so tenant A's rows are invisible.
+    2. The Qdrant ``kb_image_vectors`` MUST-filter carries
+       ``tenant_id=B`` so the vector search never returns tenant
+       A's vectors.
+
+    This test pins the partition by exercising the
+    :class:`MultimodalRetriever` directly with tenant B's
+    ``tenant_id`` after tenant A uploaded an article to the
+    ``shared-kb`` slug. Tenant B's RRF-fused retrieval must
+    return ZERO hits — the MUST-filter excludes tenant A's
+    points.
+
+    We don't yet have a GET endpoint to assert on directly (it's
+    deferred to Stage 17+), so the retriever-level check is the
+    tightest assertion available today.
+    """
+    from knowledge.multimodal.retriever import MultimodalRetriever
+
+    with patch(
+        "knowledge.multimodal.api.DoubaoVisionEmbedder",
+        return_value=_mock_embedder(),
+    ), patch(
+        "knowledge.multimodal.api.get_object_store",
+        return_value=_mock_object_store(),
+    ):
+        # ---- Tenant A uploads ------------------------------------
+        files_a = {"file": ("secret.png", _png_bytes(), "image/png")}
+        data_a = {"kb_slug": "shared-kb", "title": "Tenant A Secret"}
+        resp_a = await app_client.post(
+            "/api/v1/kb-articles/multimodal",
+            files=files_a,
+            data=data_a,
+            headers={
+                "Authorization": (
+                    "Bearer " + create_access_token(
+                        user_id=new_id(),
+                        tenant_id=tenant_factory.id,
+                        role="owner",
+                    )
+                )
+            },
+        )
+    assert resp_a.status_code == 201, resp_a.text
+    article_a_id = resp_a.json()["article_id"]
+
+    # ---- Tenant B retrieves via the retriever -----------------
+    # The retriever uses the Qdrant MUST-filter on
+    # ``tenant_id``. A search from tenant B MUST NOT see
+    # tenant A's article even when using the same ``kb_slug``
+    # and the same text query.
+    qdrant = get_qdrant_client()
+    retriever = MultimodalRetriever(qdrant, top_k=5)
+    hits = await retriever.retrieve(
+        tenant_id=second_tenant_factory.id,
+        kb_slug="shared-kb",
+        text_query_embedding=[0.1] * 1024,
+        image_query_embedding=None,
+    )
+
+    # Tenant B sees zero hits — the cross-tenant filter excludes
+    # tenant A's points. The ``article_a_id`` MUST NOT appear in
+    # any hit's metadata (defense-in-depth assertion: even if a
+    # future regression leaks a payload field, the article_id
+    # check catches it).
+    article_ids = {h.article_id for h in hits}
+    assert article_a_id not in article_ids, (
+        f"cross-tenant leak: tenant B's retrieval returned "
+        f"tenant A's article_id={article_a_id!r}; hits={hits!r}"
+    )
+    assert hits == [], (
+        f"cross-tenant leak: tenant B got {len(hits)} hits from "
+        f"tenant A's KB slug 'shared-kb'; expected zero"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure-logic RRF tests (no Qdrant, no DB)
+# ---------------------------------------------------------------------------
+
+
 # ---------------------------------------------------------------------------
 # Pure-logic RRF tests (no Qdrant, no DB)
 # ---------------------------------------------------------------------------
