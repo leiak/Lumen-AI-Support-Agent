@@ -317,7 +317,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
 16. **Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式
 17. ~~**Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)~~ — M3 tech-debt #17 完成 (4 endpoints `Depends(require_admin)`,`tenant_id` / `reviewer_id` 从 JWT claims 读,17 admin tests)
-18. **PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)
+18. ~~**PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)~~ — M3 tech-debt #18 完成 (PDF text chunks 入 `article_chunks` Qdrant collection,`source_type="pdf_text"` + `page_num` + `chunk_index` + `text`,`MultimodalRetriever` RRF 检索可见)
 19. **Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由
 20. **KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)
 
