@@ -216,8 +216,7 @@ async def get_kb_draft(
 @router.post("/kb-drafts/{draft_id}/approve")
 async def approve_kb_draft(
     draft_id: str,
-    tenant_id: str = Query(...),
-    reviewer_id: str = Query(...),
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
 ):
     """Approve → create Article + mark draft APPROVED.
 
@@ -231,10 +230,14 @@ async def approve_kb_draft(
     Status codes
     ----------
     * 200 — approved (returns ``{draft_id, article_id, status}``)
+    * 401 — missing / invalid bearer token (raised by require_admin)
+    * 403 — token is not admin / owner role (raised by require_admin)
     * 404 — draft not found OR belongs to a different tenant (no
       distinction — anti-enumeration)
     * 409 — draft is already APPROVED or REJECTED
     """
+    tenant_id = claims["tenant_id"]
+    reviewer_id = claims["sub"]
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
@@ -315,17 +318,19 @@ async def approve_kb_draft(
 @router.post("/kb-drafts/{draft_id}/reject")
 async def reject_kb_draft(
     draft_id: str,
-    tenant_id: str = Query(...),
-    reviewer_id: str = Query(...),
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
 ):
     """Reject a DRAFT → mark ``REJECTED``. No ``Article`` is created.
 
     Status codes
     ----------
     * 200 — rejected
+    * 401 / 403 — auth gate (raised by require_admin)
     * 404 — not found / cross-tenant
     * 409 — already APPROVED / REJECTED
     """
+    tenant_id = claims["tenant_id"]
+    reviewer_id = claims["sub"]
     sm = get_sessionmaker()
     async with sm() as session:
         result = await session.execute(
