@@ -28,7 +28,7 @@ from tests.admin.conftest import auth_headers
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_list_drafts_returns_only_tenant_drafts(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """List endpoint returns only the requesting tenant's drafts."""
     sm = get_sessionmaker()
@@ -48,9 +48,10 @@ async def test_list_drafts_returns_only_tenant_drafts(
             )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.get(
         "/api/v1/admin/kb-drafts",
-        params={"tenant_id": sample_tenant.id},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -64,7 +65,7 @@ async def test_list_drafts_returns_only_tenant_drafts(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_list_drafts_filters_by_status(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Status filter narrows the result set."""
     sm = get_sessionmaker()
@@ -84,9 +85,11 @@ async def test_list_drafts_filters_by_status(
             )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.get(
         "/api/v1/admin/kb-drafts",
-        params={"tenant_id": sample_tenant.id, "status": "DRAFT"},
+        params={"status": "DRAFT"},
+        headers=auth_headers(token),
     )
     body = resp.json()
     assert len(body["drafts"]) == 1
@@ -96,7 +99,7 @@ async def test_list_drafts_filters_by_status(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_get_draft_returns_full_body(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """GET detail endpoint returns full body (not just 200-char preview).
 
@@ -121,9 +124,10 @@ async def test_get_draft_returns_full_body(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.get(
         f"/api/v1/admin/kb-drafts/{draft_id}",
-        params={"tenant_id": sample_tenant.id},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -135,7 +139,7 @@ async def test_get_draft_returns_full_body(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_get_draft_cross_tenant_returns_404(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """GET detail cross-tenant returns 404 (anti-enumeration)."""
     sm = get_sessionmaker()
@@ -156,9 +160,10 @@ async def test_get_draft_cross_tenant_returns_404(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.get(
         f"/api/v1/admin/kb-drafts/{draft_id}",
-        params={"tenant_id": sample_tenant.id},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 404
 
@@ -166,7 +171,7 @@ async def test_get_draft_cross_tenant_returns_404(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_approve_draft_creates_article_and_marks_approved(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Approve → Article created in auto-mined KB + draft status=APPROVED."""
     sm = get_sessionmaker()
@@ -186,9 +191,10 @@ async def test_approve_draft_creates_article_and_marks_approved(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.post(
         f"/api/v1/admin/kb-drafts/{draft_id}/approve",
-        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -209,14 +215,14 @@ async def test_approve_draft_creates_article_and_marks_approved(
         ).scalar_one()
         assert draft_row.status == "APPROVED"
         assert draft_row.published_article_id == body["article_id"]
-        assert draft_row.reviewed_by == "admin1"
+        assert draft_row.reviewed_by == "admin-1"
         assert draft_row.reviewed_at is not None
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_reject_draft_does_not_create_article(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Reject → draft.status='REJECTED', no Article row."""
     sm = get_sessionmaker()
@@ -236,9 +242,10 @@ async def test_reject_draft_does_not_create_article(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.post(
         f"/api/v1/admin/kb-drafts/{draft_id}/reject",
-        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -266,7 +273,7 @@ async def test_reject_draft_does_not_create_article(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_cross_tenant_approve_returns_404(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Cross-tenant approve → 404 (anti-enumeration)."""
     sm = get_sessionmaker()
@@ -288,9 +295,10 @@ async def test_cross_tenant_approve_returns_404(
         await session.commit()
 
     # sample_tenant tries to approve other_tenant's draft → 404
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.post(
         f"/api/v1/admin/kb-drafts/{draft_id}/approve",
-        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 404
 
@@ -298,7 +306,7 @@ async def test_cross_tenant_approve_returns_404(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_list_for_foreign_tenant_returns_empty(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """A tenant listing its own drafts sees only its own (foreign = empty).
 
@@ -323,9 +331,10 @@ async def test_list_for_foreign_tenant_returns_empty(
         await session.commit()
 
     # Sample tenant lists — sees only its own (zero) drafts.
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.get(
         "/api/v1/admin/kb-drafts",
-        params={"tenant_id": sample_tenant.id},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 200
     assert resp.json()["drafts"] == []
@@ -334,7 +343,7 @@ async def test_list_for_foreign_tenant_returns_empty(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_approve_already_approved_returns_409(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Approve an already-APPROVED draft → 409 Conflict."""
     sm = get_sessionmaker()
@@ -354,9 +363,10 @@ async def test_approve_already_approved_returns_409(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.post(
         f"/api/v1/admin/kb-drafts/{draft_id}/approve",
-        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 409
 
@@ -364,7 +374,7 @@ async def test_approve_already_approved_returns_409(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_reject_already_rejected_returns_409(
-    async_client: AsyncClient, sample_tenant: Tenant
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
 ) -> None:
     """Reject an already-REJECTED draft → 409 Conflict."""
     sm = get_sessionmaker()
@@ -384,9 +394,10 @@ async def test_reject_already_rejected_returns_409(
         )
         await session.commit()
 
+    token = admin_token_for(tenant_id=sample_tenant.id)
     resp = await async_client.post(
         f"/api/v1/admin/kb-drafts/{draft_id}/reject",
-        params={"tenant_id": sample_tenant.id, "reviewer_id": "admin1"},
+        headers=auth_headers(token),
     )
     assert resp.status_code == 409
 
