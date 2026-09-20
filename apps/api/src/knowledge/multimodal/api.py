@@ -273,7 +273,7 @@ async def upload_multimodal(
         await embedder.aclose()
 
     # 3.5. Resolve the Qdrant client once. Both the text-chunk
-    #      upsert (3.5 below) and the image-vector upsert
+    #      upsert (3.6 below) and the image-vector upsert
     #      (section 4) need it; resolving it here avoids a second
     #      singleton lookup in section 4.
     qdrant = get_qdrant_client()
@@ -293,38 +293,21 @@ async def upload_multimodal(
         list(extracted.text_chunk_pages) if mime_type == "application/pdf" else []
     )
     if text_chunks:
+        # Invariant from pdf_processor: text_chunks and text_chunk_pages are
+        # appended in lockstep, but we runtime-check defensively so a future
+        # edit to the processor doesn't silently truncate or shift.
+        if len(text_chunks) != len(text_chunk_pages):
+            raise RuntimeError(
+                "pdf_processor invariant violated: "
+                f"text_chunks and text_chunk_pages lengths differ "
+                f"({len(text_chunks)} vs {len(text_chunk_pages)})"
+            )
+
+        # Embed the text chunks (may raise EmbeddingError or downstream API errors).
         try:
             embed_result = await embed_texts(
                 texts=text_chunks,
                 tenant_id=tenant_id,
-            )
-            text_points = [
-                PointStruct(
-                    id=new_id(),
-                    vector=vec,
-                    payload={
-                        "tenant_id": tenant_id,
-                        "kb_slug": kb_slug,
-                        "article_id": article_id,
-                        "source_type": "pdf_text",
-                        "page_num": page_num,
-                        "chunk_index": idx,
-                        "text": text,
-                    },
-                )
-                for idx, (page_num, text, vec)
-                in enumerate(
-                    zip(
-                        text_chunk_pages,
-                        text_chunks,
-                        embed_result.vectors,
-                    )
-                )
-            ]
-            await qdrant.upsert(
-                collection_name=DEFAULT_COLLECTION,
-                points=text_points,
-                wait=True,
             )
         except EmbeddingError as exc:
             log.warning(
@@ -337,9 +320,35 @@ async def upload_multimodal(
             raise HTTPException(
                 status_code=503, detail="embedding service unavailable"
             ) from exc
+
+        text_points = [
+            PointStruct(
+                id=new_id(),
+                vector=vec,
+                payload={
+                    "tenant_id": tenant_id,
+                    "kb_slug": kb_slug,
+                    "article_id": article_id,
+                    "source_type": "pdf_text",
+                    "page_num": page_num,
+                    "chunk_index": idx,
+                    "text": text,
+                },
+            )
+            for idx, (page_num, text, vec) in enumerate(
+                zip(text_chunk_pages, text_chunks, embed_result.vectors)
+            )
+        ]
+
+        # Upsert to Qdrant (separate try block so non-EmbeddingError upstream
+        # errors are not mislabelled as vector-store failures).
+        try:
+            await qdrant.upsert(
+                collection_name=DEFAULT_COLLECTION,
+                points=text_points,
+                wait=True,
+            )
         except Exception as exc:
-            # Defense in depth: a Qdrant outage must not crash the
-            # upload.
             log.warning(
                 "kb.multimodal.text_upsert_failed",
                 tenant_id=tenant_id,
