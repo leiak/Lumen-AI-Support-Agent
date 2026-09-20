@@ -148,6 +148,46 @@ class Settings(BaseSettings):
         alias="WIDGET_ALLOWED_ORIGINS_GLOBAL",
     )
 
+    # Stage 17 / M2.B — multimodal KB (PNG/JPG/WebP/PDF) foundation.
+    #
+    # ``doubao_vision_*`` drives :class:`knowledge.multimodal.embedder.DoubaoVisionEmbedder`.
+    # Empty ``doubao_vision_api_key`` triggers graceful degradation: the
+    # embedder returns a zero vector + warning so the rest of the
+    # pipeline (storage, retrieval) still works without vision credentials.
+    #
+    # ``object_store_*`` drives :class:`knowledge.multimodal.storage.S3ObjectStore`.
+    # Default endpoint points at the local MinIO service added to
+    # ``deploy/docker-compose.yml``; production overrides with the real
+    # AWS S3 endpoint (no code change required — boto3 uses ``endpoint_url``).
+    # Storage keys MUST be tenant-prefixed at the call site; these
+    # settings only configure the connection, not the layout.
+    doubao_vision_api_key: str = Field(default="", alias="DOUBAO_VISION_API_KEY")
+    doubao_vision_base_url: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/v3",
+        alias="DOUBAO_VISION_BASE_URL",
+    )
+    doubao_vision_model: str = Field(
+        default="doubao-embedding-vision",
+        alias="DOUBAO_VISION_MODEL",
+    )
+
+    object_store_endpoint: str = Field(
+        default="http://localhost:9000",
+        alias="OBJECT_STORE_ENDPOINT",
+    )
+    object_store_bucket: str = Field(
+        default="lumen-kb",
+        alias="OBJECT_STORE_BUCKET",
+    )
+    object_store_access_key: str = Field(
+        default="minioadmin",
+        alias="OBJECT_STORE_ACCESS_KEY",
+    )
+    object_store_secret_key: str = Field(
+        default="minioadmin",
+        alias="OBJECT_STORE_SECRET_KEY",
+    )
+
     @property
     def widget_allowed_origins_global(self) -> list[str]:
         """Split the raw env value into a clean list of origins."""

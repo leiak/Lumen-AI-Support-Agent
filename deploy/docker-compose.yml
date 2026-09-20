@@ -62,6 +62,17 @@ services:
       DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-text-embedding-3-small}
       DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
       DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+      # Multimodal KB (Stage 17): S3-compatible object store (MinIO in
+      # dev, real AWS S3 in prod) + Doubao vision embedder credentials.
+      # The api service depends on the ``minio`` container below; the
+      # endpoint resolves to the compose-network hostname.
+      OBJECT_STORE_ENDPOINT: ${OBJECT_STORE_ENDPOINT:-http://minio:9000}
+      OBJECT_STORE_BUCKET: ${OBJECT_STORE_BUCKET:-lumen-kb}
+      OBJECT_STORE_ACCESS_KEY: ${OBJECT_STORE_ACCESS_KEY:-minioadmin}
+      OBJECT_STORE_SECRET_KEY: ${OBJECT_STORE_SECRET_KEY:-minioadmin}
+      DOUBAO_VISION_API_KEY: ${DOUBAO_VISION_API_KEY:-}
+      DOUBAO_VISION_BASE_URL: ${DOUBAO_VISION_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+      DOUBAO_VISION_MODEL: ${DOUBAO_VISION_MODEL:-doubao-embedding-vision}
       PYTHONPATH: /app/src
     ports:
       - "8000:8000"
@@ -75,6 +86,8 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+      minio:
+        condition: service_healthy
     restart: unless-stopped
 
   web:
@@ -89,6 +102,29 @@ services:
       - api
     restart: unless-stopped
 
+  # MinIO: S3-compatible local object store for dev / demo.
+  # The api container reads OBJECT_STORE_ENDPOINT pointing at
+  # http://minio:9000 and uses MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+  # as the access/secret keys. Production swaps this for real AWS S3
+  # by overriding OBJECT_STORE_* env vars — no code change required.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   pgdata:
   qdrantdata:
+  minio-data:
