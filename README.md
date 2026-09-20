@@ -26,6 +26,8 @@
 | 13 | M2.A — Ticket 领域 (独立 3 表 + 7 态状态机 + SLA 策略 + auto-create) | ✅ | 33 ticket tests |
 | 14 | M2.A — 实时质检 (Arq `qa_judge_worker` + 独立小 Judge LLM + `lumen_qa_*` 指标) | ✅ | 36 qa tests |
 | 15 | M2.A — 收尾 (README + demo-act4 + 已知技术债 + memory) | ✅ | 0 new tests, 3 demo screenshots |
+| 17 | M2.B — 多模态 KB (PNG/PDF + Qdrant vision collection + 4 multimodal tests) | ✅ | — |
+| 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -311,6 +313,8 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 13. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(M2.A 之前用 `/inbox/{id}` 旁边 panel 占位,`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
 14. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批用真实 AI 回复跑 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
 15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
+16. **Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式
+17. **Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)
 
 ## 仓库信息
 

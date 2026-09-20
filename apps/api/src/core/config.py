@@ -188,6 +188,26 @@ class Settings(BaseSettings):
         alias="OBJECT_STORE_SECRET_KEY",
     )
 
+    # Stage 18 / M2.B — history mining worker (Task 8).
+    #
+    # ``history_mining_lookback_days`` — sliding window scanned by the
+    # Sunday cron. 30 days balances "enough signal" against
+    # "embedding API cost per run". Override per deployment via env.
+    #
+    # ``min_cluster_size`` / ``max_cluster_size`` — HDBSCAN bounds
+    # (see :class:`history_mining.clusterer.HdbscanClusterer`).
+    # ``min_cluster_size=10`` matches the unit-test baseline; raising
+    # it reduces noise drafts but loses single-digit topic clusters.
+    history_mining_lookback_days: int = Field(
+        default=30, alias="HISTORY_MINING_LOOKBACK_DAYS"
+    )
+    history_mining_min_cluster_size: int = Field(
+        default=10, alias="HISTORY_MINING_MIN_CLUSTER_SIZE"
+    )
+    history_mining_max_cluster_size: int = Field(
+        default=1000, alias="HISTORY_MINING_MAX_CLUSTER_SIZE"
+    )
+
     @property
     def widget_allowed_origins_global(self) -> list[str]:
         """Split the raw env value into a clean list of origins."""

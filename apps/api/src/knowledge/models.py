@@ -34,6 +34,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     DateTime,
     ForeignKey,
@@ -43,6 +44,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -299,3 +301,60 @@ class KbMultimodalArticle(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class KbArticleDraft(Base):
+    """Stage 18 / M2.B Task 8 — KB article draft generated from history mining.
+
+    The ``history_mining_worker`` (Sunday cron) groups past customer
+    questions via HDBSCAN, calls ``KBDraftGenerator`` to produce a
+    title / body / tags, and persists one row per cluster here.
+
+    Lifecycle::
+
+        DRAFT  --approve-->  APPROVED  (with published_article_id set)
+        DRAFT  --reject --->  REJECTED
+
+    ``source_questions`` is a JSON list of message ULIDs — the raw
+    question text is NOT stored here (it lives on the original
+    ``messages`` rows). The admin GET endpoint returns a count only,
+    never the IDs themselves (defense in depth: an attacker who
+    compromises a tenant's admin token could otherwise pivot to the
+    message table via these IDs).
+
+    Multi-tenant: every query MUST include ``tenant_id``; cross-tenant
+    access is mapped to 404 (anti-enumeration).
+    """
+
+    __tablename__ = "kb_article_drafts"
+    __table_args__ = (
+        Index(
+            "idx_kb_drafts_tenant_status",
+            "tenant_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(String(26), nullable=False, index=True)
+    cluster_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_questions: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    suggested_title: Mapped[str] = mapped_column(Text, nullable=False)
+    suggested_body: Mapped[str] = mapped_column(Text, nullable=False)
+    suggested_tags: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, server_default=text("'[]'")
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'DRAFT'")
+    )
+    published_article_id: Mapped[str | None] = mapped_column(
+        String(26), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    reviewed_by: Mapped[str | None] = mapped_column(String(26), nullable=True)
