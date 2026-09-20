@@ -35,6 +35,7 @@ dependencies = [
     "pdf2image>=1.17",
     "Pillow>=10.0",
     "hdbscan>=0.8",  # also Stage 18
+    "numpy>=1.26",  # Stage 18 (clusterer input embeddings)
 ]
 
 [project.optional-dependencies]
