@@ -124,8 +124,6 @@ async def ensure_image_collection(
     Returns ``True`` on success / already-exists, ``False`` on any
     failure. Never raises.
     """
-    from core.config import get_settings
-
     if provider is None:
         provider = get_settings().vision_provider
     collection_name = get_image_collection_name(provider)
