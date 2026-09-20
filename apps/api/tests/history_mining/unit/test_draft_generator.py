@@ -81,6 +81,27 @@ async def test_generate_truncates_to_max_questions(generator: KBDraftGenerator) 
     assert prompt_content.count("- q") == 3
 
 
+@pytest.mark.asyncio
+async def test_generate_uses_factory_when_no_client_provided():
+    """When llm_client is omitted, factory is called and its return value is used."""
+    factory_calls = []
+    factory_client = MagicMock()
+    factory_client.chat_with_structured_output = AsyncMock(
+        return_value=KBDraft(title="t", body="b", suggested_tags=[])
+    )
+
+    def my_factory():
+        factory_calls.append("called")
+        return factory_client
+
+    generator = KBDraftGenerator(llm_client_factory=my_factory, max_questions=5)
+    draft = await generator.generate(["q1", "q2"])
+
+    assert factory_calls == ["called"]
+    factory_client.chat_with_structured_output.assert_awaited_once()
+    assert draft.title == "t"
+
+
 def test_kbdraft_model_validates_lengths() -> None:
     """Pydantic model rejects over-length title/body."""
     with pytest.raises(Exception):  # PydanticValidationError or ValueError

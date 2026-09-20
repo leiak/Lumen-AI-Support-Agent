@@ -37,7 +37,8 @@ def test_cluster_marks_small_groups_as_noise() -> None:
     c_small = rng.normal(0, 0.1, (3, 2)) + np.array([10, 0])  # too small
     embeddings = np.vstack([c1, c2, c_small])
 
-    # min_samples=4 ensures the 3-point group is filtered as noise
+    # min_samples is HDBSCAN's core-point parameter; the 3-point group is
+    # actually excluded by the post-fit size filter (len < min_cluster_size).
     clusterer = HdbscanClusterer(min_cluster_size=10, min_samples=4)
     clusters = clusterer.cluster(embeddings)
 

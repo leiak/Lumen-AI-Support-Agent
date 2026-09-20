@@ -17,7 +17,7 @@ import numpy as np
 class Cluster:
     id: int
     centroid_idx: int  # Index in original embeddings array closest to mean
-    indices: list[int]  # All indices in this cluster
+    indices: tuple[int, ...]  # All indices in this cluster (immutable)
 
     @property
     def size(self) -> int:
@@ -32,6 +32,13 @@ class HdbscanClusterer:
         min_samples: int = 5,
         max_cluster_size: int = 1000,
     ) -> None:
+        """HDBSCAN config.
+
+        min_cluster_size: smallest valid cluster (post-filter threshold).
+        min_samples: HDBSCAN core-point parameter; conservative → fewer core points.
+        max_cluster_size: largest valid cluster (caps mega-clusters like "general
+            question" that would dominate the KB).
+        """
         self._min_size = min_cluster_size
         self._min_samples = min_samples
         self._max_size = max_cluster_size
@@ -67,7 +74,7 @@ class HdbscanClusterer:
                 Cluster(
                     id=int(label),
                     centroid_idx=global_centroid_idx,
-                    indices=indices,
+                    indices=tuple(indices),
                 )
             )
         return clusters
