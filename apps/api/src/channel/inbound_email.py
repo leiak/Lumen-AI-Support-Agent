@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from channel.outbound_email import EmailOutbound, EmailSendError
@@ -17,6 +19,7 @@ from conversation.models import Conversation
 from conversation.service import ConversationService
 from core.database import get_sessionmaker
 from core.email_parser import ParsedEmail
+from core.id_gen import new_id
 
 logger = logging.getLogger(__name__)
 
@@ -75,79 +78,121 @@ async def handle_email_inbound(
 ) -> EmailInboundResult | None:
     """Process an inbound email end-to-end.
 
-    Returns None if the message is a duplicate (idempotent) or if
-    tenant_id is missing (cross-tenant probe blocked).
+    Returns None if the message is a duplicate (idempotent), if a
+    concurrent webhook beat us to INSERT (race), or if any DB step
+    fails — the webhook must always return 200 to SES.
+
+    NOTEs on tenant auto-create divergence vs widget path:
+    The widget path auto-creates a Ticket via ticket_service_factory on
+    the first customer message (M2.A / Stage 13). The email path
+    intentionally does NOT — emails are typically operational in nature
+    and skip the Ticket workflow. Add ticket_service_factory wiring
+    here if/when that policy changes.
     """
     sm = get_sessionmaker()
-    async with sm() as session:
-        # 1. Idempotency check — SES retries on 5xx
-        if await _check_existing_message(
-            session, message_id_header=parsed.message_id
-        ):
-            logger.info(
-                "email.inbound.duplicate",
-                extra={"tenant_id": tenant_id, "message_id": parsed.message_id},
-            )
-            return None
+    try:
+        async with sm() as session:
+            # 1. Idempotency check — SES retries on 5xx
+            if await _check_existing_message(
+                session, message_id_header=parsed.message_id
+            ):
+                logger.info(
+                    "email.inbound.duplicate",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "message_id": parsed.message_id,
+                    },
+                )
+                return None
 
-        # 2. Find or create conversation by email thread
-        conversation = await _find_conversation_by_thread(
-            session,
-            tenant_id=tenant_id,
-            thread_id=parsed.thread_id,
-        )
-        if conversation is None:
-            # First email in thread — create conversation
-            from ulid import ULID
-
-            conversation = Conversation(
-                id=str(ULID()),
+            # 2. Find or create conversation by email thread
+            conversation = await _find_conversation_by_thread(
+                session,
                 tenant_id=tenant_id,
-                channel_id=channel_id,
-                customer_external_id=parsed.from_address,
-                status=ConversationStatus.OPEN,
-                ai_handling=True,
-                email_thread_id=parsed.thread_id,
-                email_message_id_header=parsed.message_id,
+                thread_id=parsed.thread_id,
             )
-            session.add(conversation)
-            await session.flush()
-        else:
-            # Update last seen message id (audit trail)
-            conversation.email_message_id_header = parsed.message_id
+            if conversation is None:
+                # First email in thread — create conversation. opened_at
+                # and last_activity_at are NOT NULL on the model (mirror
+                # service.py:179-190 pattern).
+                now = datetime.now(timezone.utc)
+                conversation = Conversation(
+                    id=new_id(),
+                    tenant_id=tenant_id,
+                    channel_id=channel_id,
+                    customer_external_id=parsed.from_address,
+                    status=ConversationStatus.OPEN,
+                    ai_handling=True,
+                    email_thread_id=parsed.thread_id,
+                    email_message_id_header=parsed.message_id,
+                    opened_at=now,
+                    last_activity_at=now,
+                )
+                session.add(conversation)
+                try:
+                    await session.flush()
+                except IntegrityError:
+                    # Race: a concurrent webhook beat us to the INSERT
+                    # (UNIQUE on email_message_id_header). Treat as duplicate.
+                    logger.info(
+                        "email.inbound.duplicate_race",
+                        extra={
+                            "tenant_id": tenant_id,
+                            "message_id": parsed.message_id,
+                        },
+                    )
+                    await session.rollback()
+                    return None
+            else:
+                # Bump dedup key so a future retry with this same
+                # message_id is caught by _check_existing_message above.
+                conversation.email_message_id_header = parsed.message_id
 
-        # 3. Record customer message
-        conv_service = ConversationService()
-        customer_message = await conv_service.record_message(
-            tenant_id=tenant_id,
-            conversation_id=conversation.id,
-            role=MessageRole.CUSTOMER,
-            content_text=parsed.body_text,
-        )
-
-        # 4. Trigger AI auto-response (mirrors widget path)
-        ai_message_id: str | None = None
-        ai_content: str | None = None
-        if (
-            conversation.ai_handling
-            and conversation.status == ConversationStatus.OPEN
-        ):
-            responder = responder_factory()
-            ai_response = await responder.respond(
+            # 3. Record customer message
+            conv_service = ConversationService()
+            customer_message = await conv_service.record_message(
                 tenant_id=tenant_id,
                 conversation_id=conversation.id,
+                role=MessageRole.CUSTOMER,
+                content_text=parsed.body_text,
             )
-            if ai_response is not None:
-                ai_msg = await conv_service.record_message(
+
+            # 4. Trigger AI auto-response (mirrors widget path)
+            ai_message_id: str | None = None
+            ai_content: str | None = None
+            if (
+                conversation.ai_handling
+                and conversation.status == ConversationStatus.OPEN
+            ):
+                responder = responder_factory()
+                ai_response = await responder.respond(
                     tenant_id=tenant_id,
                     conversation_id=conversation.id,
-                    role=ai_response.role,
-                    content_text=ai_response.content_text,
                 )
-                ai_message_id = ai_msg.id
-                ai_content = ai_response.content_text
+                if ai_response is not None:
+                    ai_msg = await conv_service.record_message(
+                        tenant_id=tenant_id,
+                        conversation_id=conversation.id,
+                        role=ai_response.role,
+                        content_text=ai_response.content_text,
+                    )
+                    ai_message_id = ai_msg.id
+                    ai_content = ai_response.content_text
 
-        await session.commit()
+            await session.commit()
+    except Exception as e:
+        # Defense in depth: any uncaught error from the DB block must
+        # not propagate as a 5xx (SES would retry-storm). Mirror the
+        # widget path's outer try/except in channel/inbound.py:308-316.
+        logger.error(
+            "email.inbound.unhandled_error",
+            extra={
+                "tenant_id": tenant_id,
+                "message_id": parsed.message_id,
+                "error_type": type(e).__name__,
+            },
+        )
+        return None
 
     # 5. Send AI auto-reply email (best-effort, outside the DB transaction)
     if ai_content and outbound:
@@ -163,7 +208,7 @@ async def handle_email_inbound(
                 in_reply_to=parsed.message_id,
                 references=parsed.references + [parsed.message_id],
             )
-        except EmailSendError:
+        except EmailSendError as send_err:
             # SES down — message is durably persisted; outbound retry
             # is a future task (M3). Log and return success.
             logger.warning(
@@ -171,7 +216,7 @@ async def handle_email_inbound(
                 extra={
                     "tenant_id": tenant_id,
                     "message_id": parsed.message_id,
-                    "error_type": "EmailSendError",
+                    "error_type": send_err.error_type or "EmailSendError",
                 },
             )
 

@@ -140,9 +140,9 @@ async def _make_email_channel(
 async def sample_tenant() -> AsyncIterator[Tenant]:
     """Yield a tenant + matching ACTIVE EMAIL channel.
 
-    Yields the ``Tenant`` row; the channel is reachable via the
-    ``sample_email_channel`` fixture (added below) for tests that
-    need the channel id directly.
+    Yields the ``Tenant`` row; the channel is set up via
+    ``_make_email_channel`` so the inbound webhook can route by
+    ``to_address``.
     """
     tenant = await TenantRepository().create(
         name="Email Inbound Tenant", plan=TenantPlan.FREE
@@ -154,33 +154,8 @@ async def sample_tenant() -> AsyncIterator[Tenant]:
         await _delete_tenant(tenant.id)
 
 
-@pytest.fixture
-async def sample_email_channel(sample_tenant: Tenant) -> Channel:
-    """Yield the EMAIL channel for ``sample_tenant``.
-
-    Convenience accessor for tests that need the channel id. Created
-    lazily against the freshly-minted tenant.
-    """
-    from core.database import get_session
-
-    async with get_session() as session:
-        from sqlalchemy import select
-
-        result = await session.execute(
-            select(Channel)
-            .where(
-                Channel.tenant_id == sample_tenant.id,
-                Channel.type == ChannelType.EMAIL,
-            )
-            .limit(1)
-        )
-        channel = result.scalar_one()
-    return channel
-
-
 __all__ = [
     "async_client",
     "db_session",
     "sample_tenant",
-    "sample_email_channel",
 ]

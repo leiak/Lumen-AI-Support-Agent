@@ -5,9 +5,11 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 from starlette.requests import Request
 from starlette.responses import Response
 
+from channel.enums import ChannelType
 from core.config import get_settings
 from core.health import aggregate_health, liveness, readiness
 from core.logging import configure_logging, get_logger
@@ -195,6 +197,16 @@ _email_outbound = EmailOutbound(
 )
 
 
+# KNOWN DEBT (M2.B / Task 2 code review):
+# tenant_id is currently sourced from the X-Tenant-ID request header, which
+# is trivially spoofable. Production must verify tenant identity via either:
+#   (a) SNS subscription confirmation (SES inbound sends to an SNS topic;
+#       verify the SigningCertURL against the SNS pinned CA),
+#   (b) AWS SigV4 signature verification on the raw request body, or
+#   (c) a reverse-lookup from the recipient address (Channel.config_json.tenant_id).
+# Tracked as README tech-debt #16 (Stage 19 M2.B close-out).
+
+
 @app.post("/api/v1/email/inbound")
 async def email_inbound_webhook(request: Request):
     """SES inbound webhook. Always returns 200.
@@ -226,15 +238,9 @@ async def email_inbound_webhook(request: Request):
 
     # Look up EmailChannel by ``to_address`` for this tenant. The
     # ``address`` lives inside ``Channel.config_json`` JSONB — we
-    # compare via ``astext`` so the index can be used (the GIN index
-    # is on the column, not on the expression; the lookup is cheap
-    # enough at demo volumes without one).
+    # compare via ``astext`` so the index can be used.
     sm = get_sessionmaker()
     async with sm() as session:
-        from sqlalchemy import select
-
-        from channel.enums import ChannelType
-
         channel = (
             await session.execute(
                 select(Channel)
