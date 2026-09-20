@@ -1,21 +1,25 @@
-"""Generate sample_text.pdf and sample_with_image.pdf fixtures.
+"""Generate sample PDF fixtures for the PDF processor tests.
 
 Run once: ``python tests/fixtures/_generate_pdfs.py``. The fixtures are
 committed alongside the test that uses them.
+
+Local poppler note: image-PDF screenshot tests require poppler on PATH
+(Dockerfile installs poppler-utils for production; local Windows dev
+needs to extract poppler-24.x.x binaries and add bin/ to PATH).
 """
+import os
+
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 from reportlab.platypus import (
     Image,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
-    Spacer,
     Table,
     TableStyle,
 )
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib.units import inch
 
 
 def make_text_pdf(path: str) -> None:
@@ -48,7 +52,29 @@ def make_text_pdf(path: str) -> None:
 
 
 def make_image_pdf(path: str) -> None:
-    """2-page PDF; page 2 has a table (key-page heuristic trigger)."""
+    """2-page PDF; page 2 has an embedded image (covers image branch)."""
+    doc = SimpleDocTemplate(path, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+    story.append(Paragraph("Image Demo", styles["Heading1"]))
+    story.append(Paragraph("Page 1 is text-only.", styles["BodyText"]))
+    story.append(PageBreak())
+    story.append(Paragraph("Page 2 — embedded image:", styles["Heading2"]))
+    # Generate a tiny PNG inline for the image
+    img_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "_sample_image.png"
+    )
+    if not os.path.exists(img_path):
+        from PIL import Image as PILImage
+
+        img = PILImage.new("RGB", (100, 100), color="red")
+        img.save(img_path, "PNG")
+    story.append(Image(img_path, width=2 * inch, height=2 * inch))
+    doc.build(story)
+
+
+def make_table_pdf(path: str) -> None:
+    """2-page PDF; page 2 has a table (covers table branch)."""
     doc = SimpleDocTemplate(path, pagesize=letter)
     styles = getSampleStyleSheet()
     story = []
@@ -71,8 +97,8 @@ def make_image_pdf(path: str) -> None:
 
 
 if __name__ == "__main__":
-    import os
     base = os.path.dirname(os.path.abspath(__file__))
     make_text_pdf(os.path.join(base, "sample_text.pdf"))
+    make_table_pdf(os.path.join(base, "sample_with_table.pdf"))
     make_image_pdf(os.path.join(base, "sample_with_image.pdf"))
     print(f"Generated fixtures in {base}")

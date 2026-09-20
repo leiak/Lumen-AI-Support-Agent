@@ -19,7 +19,13 @@ def sample_text_pdf():
 
 @pytest.fixture
 def sample_pdf_with_table():
-    """PDF with a table on page 2 (key-page heuristic trigger)."""
+    """PDF with a table on page 2 (key-page heuristic, table branch)."""
+    return Path(__file__).parents[3] / "fixtures" / "sample_with_table.pdf"
+
+
+@pytest.fixture
+def sample_pdf_with_image():
+    """PDF with an embedded image on page 2 (key-page heuristic, image branch)."""
     return Path(__file__).parents[3] / "fixtures" / "sample_with_image.pdf"
 
 
@@ -49,6 +55,18 @@ def test_extract_detects_table_pages(sample_pdf_with_table):
     assert png_bytes.startswith(b"\x89PNG")  # PNG magic bytes
 
 
+def test_extract_detects_image_pages(sample_pdf_with_image):
+    """Page with embedded image → included in screenshot_pages."""
+    processor = PdfProcessor()
+    result = processor.extract(sample_pdf_with_image.read_bytes())
+
+    assert len(result.screenshot_pages) >= 1
+    page_num, png_bytes = result.screenshot_pages[0]
+    assert isinstance(page_num, int)
+    assert isinstance(png_bytes, bytes)
+    assert png_bytes.startswith(b"\x89PNG")  # PNG magic bytes
+
+
 def test_extract_handles_blank_pdf():
     """Empty / blank PDF doesn't crash."""
     blank_pdf = (
@@ -67,8 +85,8 @@ def test_extract_handles_blank_pdf():
 
 
 def test_extract_chunks_text_by_page(sample_text_pdf):
-    """Text chunks are split per page (each page produces 1+ chunks)."""
+    """3-page PDF → at least 3 chunks (one per page when text fits chunk_size)."""
     processor = PdfProcessor(chunk_size=500)  # small for testing
     result = processor.extract(sample_text_pdf.read_bytes())
-    # 3-page PDF → at least 1 chunk; could be more depending on chunk_size
-    assert len(result.text_chunks) >= 1
+    # 3-page PDF with ~200 chars per page → ≥ 3 chunks (one per page)
+    assert len(result.text_chunks) >= 3

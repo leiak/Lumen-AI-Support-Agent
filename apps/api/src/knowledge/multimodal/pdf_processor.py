@@ -31,9 +31,14 @@ class ExtractedPdf:
 
 
 class PdfProcessor:
+    """Extract text chunks + key-page screenshots from PDF bytes.
+
+    Never raises on processing errors — partial results returned.
+    """
+
     def __init__(self, chunk_size: int = 500, key_page_dpi: int = 150) -> None:
         self._chunk_size = chunk_size
-        self._dpi = key_page_dpi
+        self._key_page_dpi = key_page_dpi
 
     def extract(self, pdf_bytes: bytes) -> ExtractedPdf:
         """Extract text chunks + key-page screenshots.
@@ -106,7 +111,7 @@ class PdfProcessor:
                 pdf_bytes,
                 first_page=page_num_1_indexed,
                 last_page=page_num_1_indexed,
-                dpi=self._dpi,
+                dpi=self._key_page_dpi,
             )
             if not images:
                 return None
