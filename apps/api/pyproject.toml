@@ -50,6 +50,7 @@ dev = [
     "freezegun>=1.4",
     "types-passlib>=1.7.7.20260211",
     "types-python-jose>=3.5.0.20260408",
+    "reportlab>=4.0",  # for generating PDF test fixtures only
 ]
 
 [build-system]
