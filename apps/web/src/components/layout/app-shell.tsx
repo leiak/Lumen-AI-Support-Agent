@@ -1,9 +1,10 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { Inbox, BookOpen, Settings, LogOut } from 'lucide-react';
+import { Inbox, BookOpen, Settings, LogOut, FileSearch } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/api-client';
 import { useCurrentUser } from '@/lib/use-current-user';
+import { useIsAdmin } from '@/lib/use-is-admin';
 import { cn } from '@/lib/utils';
 
 interface NavItem {
@@ -18,9 +19,14 @@ const navItems: NavItem[] = [
   { to: '/settings', label: '设置', icon: Settings },
 ];
 
+const adminNavItems: NavItem[] = [
+  { to: '/admin/kb-drafts', label: 'KB 草稿', icon: FileSearch },
+];
+
 export function AppShell(): JSX.Element {
   const navigate = useNavigate();
   const { user, isLoading } = useCurrentUser();
+  const { isAdmin } = useIsAdmin();
 
   const handleLogout = (): void => {
     clearAuthToken();
@@ -71,6 +77,25 @@ export function AppShell(): JSX.Element {
                 <span>{item.label}</span>
               </NavLink>
             ))}
+            {isAdmin
+              ? adminNavItems.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    className={({ isActive }) =>
+                      cn(
+                        'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors',
+                        isActive
+                          ? 'bg-primary text-primary-foreground'
+                          : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+                      )
+                    }
+                  >
+                    <item.icon />
+                    <span>{item.label}</span>
+                  </NavLink>
+                ))
+              : null}
           </nav>
           <div className="border-t px-4 py-3 text-xs text-muted-foreground">
             Stage 9.3 脚手架就绪

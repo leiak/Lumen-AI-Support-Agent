@@ -1,7 +1,9 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 
 import { AppShell } from '@/components/layout/app-shell';
+import { AdminGuard } from '@/components/auth/admin-guard';
 import { AuthGuard } from '@/components/auth/auth-guard';
+import { AdminKbDraftsPage } from '@/pages/admin-kb-drafts';
 import { LoginPage } from '@/pages/login';
 import { InboxPage } from '@/pages/inbox';
 import { InboxDetailPage } from '@/pages/inbox-detail';
@@ -27,6 +29,14 @@ export function App(): JSX.Element {
         <Route path="/kb/:kbId" element={<KbDetailPage />} />
         <Route path="/kb/:kbId/articles/:articleId" element={<ArticleDetailPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route
+          path="/admin/kb-drafts"
+          element={
+            <AdminGuard>
+              <AdminKbDraftsPage />
+            </AdminGuard>
+          }
+        />
       </Route>
       <Route path="/" element={<Navigate to="/inbox" replace />} />
       <Route path="*" element={<Navigate to="/inbox" replace />} />
