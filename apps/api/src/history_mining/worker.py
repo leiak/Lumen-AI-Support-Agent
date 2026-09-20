@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from arq import cron
@@ -68,6 +68,9 @@ from core.id_gen import new_id
 from history_mining.clusterer import HdbscanClusterer
 from history_mining.draft_generator import KBDraftGenerator
 from knowledge.models import KbArticleDraft
+
+if TYPE_CHECKING:
+    from llm_client.gateway import LLMGateway
 
 logger = logging.getLogger(__name__)
 
@@ -92,84 +95,106 @@ async def history_mining_worker(ctx: dict[str, Any]) -> dict[str, int]:
 
     Stages:
 
-    1. Single session query: gather all (tenant_id, msg_id, text)
+    1. Build an :class:`LLMGateway` from settings — the registry
+       is built ONCE per cron invocation and reused across tenants
+       (provider-pool setup is non-trivial, see :mod:`llm_client`).
+       The gateway is closed in ``finally`` so a mid-run crash
+       doesn't leak HTTP pools.
+
+    2. Single session query: gather all (tenant_id, msg_id, text)
        tuples for customer messages from CLOSED conversations in
        the lookback window. ONE query — not per-tenant — because the
        WHERE clause already filters by status + role + created_at
        and Postgres handles the tenant grouping via the in-memory
        Python pass below.
 
-    2. Group rows by tenant_id in Python (cheap; this is a small
+    3. Group rows by tenant_id in Python (cheap; this is a small
        batch, not streaming).
 
-    3. Per-tenant processing with try/except isolation.
+    4. Per-tenant processing with try/except isolation; the gateway
+       is passed down so each tenant's ``_llm_factory`` closure
+       shares the same provider registry.
     """
+    # Imported lazily: ``llm_client`` is a heavy dep — keep it out of
+    # the module-import path so unit tests can spin up the worker
+    # without a real provider API key.
+    from llm_client.gateway import LLMGateway
+    from llm_client.provider_registry import build_provider_registry
+
     settings = get_settings()
-    lookback_days = settings.history_mining_lookback_days
-    min_cluster_size = settings.history_mining_min_cluster_size
-    max_cluster_size = settings.history_mining_max_cluster_size
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    gateway = LLMGateway(providers=build_provider_registry(settings))
+    try:
+        lookback_days = settings.history_mining_lookback_days
+        min_cluster_size = settings.history_mining_min_cluster_size
+        max_cluster_size = settings.history_mining_max_cluster_size
+        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
-    sm = get_sessionmaker()
-    async with sm() as session:
-        result = await session.execute(
-            select(
-                Conversation.tenant_id,
-                Message.id,
-                Message.content_text,
+        sm = get_sessionmaker()
+        async with sm() as session:
+            result = await session.execute(
+                select(
+                    Conversation.tenant_id,
+                    Message.id,
+                    Message.content_text,
+                )
+                .join(Message, Message.conversation_id == Conversation.id)
+                .where(
+                    Conversation.status == ConversationStatus.CLOSED,
+                    Message.role == MessageRole.CUSTOMER,
+                    Message.created_at >= cutoff,
+                )
             )
-            .join(Message, Message.conversation_id == Conversation.id)
-            .where(
-                Conversation.status == ConversationStatus.CLOSED,
-                Message.role == MessageRole.CUSTOMER,
-                Message.created_at >= cutoff,
-            )
+            rows = result.fetchall()
+            if not rows:
+                logger.info(
+                    "history_mining.no_data",
+                    extra={"lookback_days": lookback_days},
+                )
+                return {"processed": 0, "drafts_created": 0}
+
+        # Group by tenant in Python.
+        by_tenant: dict[str, list[tuple[str, str]]] = {}
+        for tenant_id, msg_id, content_text in rows:
+            by_tenant.setdefault(tenant_id, []).append((msg_id, content_text))
+
+        drafts_total = 0
+        processed_total = len(rows)
+
+        for tenant_id, tenant_messages in by_tenant.items():
+            try:
+                drafts_n = await _process_tenant(
+                    tenant_id=tenant_id,
+                    messages=tenant_messages,
+                    min_cluster_size=min_cluster_size,
+                    max_cluster_size=max_cluster_size,
+                    gateway=gateway,
+                )
+                drafts_total += drafts_n
+            except Exception as exc:  # noqa: BLE001 — per-tenant isolation
+                # Per-tenant failure MUST NOT kill the rest of the run.
+                logger.warning(
+                    "history_mining.tenant_failed",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                continue
+
+        logger.info(
+            "history_mining.run_complete",
+            extra={
+                "processed": processed_total,
+                "drafts_created": drafts_total,
+                "tenants_seen": len(by_tenant),
+            },
         )
-        rows = result.fetchall()
-        if not rows:
-            logger.info(
-                "history_mining.no_data",
-                extra={"lookback_days": lookback_days},
-            )
-            return {"processed": 0, "drafts_created": 0}
-
-    # Group by tenant in Python.
-    by_tenant: dict[str, list[tuple[str, str]]] = {}
-    for tenant_id, msg_id, content_text in rows:
-        by_tenant.setdefault(tenant_id, []).append((msg_id, content_text))
-
-    drafts_total = 0
-    processed_total = len(rows)
-
-    for tenant_id, tenant_messages in by_tenant.items():
-        try:
-            drafts_n = await _process_tenant(
-                tenant_id=tenant_id,
-                messages=tenant_messages,
-                min_cluster_size=min_cluster_size,
-                max_cluster_size=max_cluster_size,
-            )
-            drafts_total += drafts_n
-        except Exception as exc:  # noqa: BLE001 — per-tenant isolation
-            # Per-tenant failure MUST NOT kill the rest of the run.
-            logger.warning(
-                "history_mining.tenant_failed",
-                extra={
-                    "tenant_id": tenant_id,
-                    "error_type": type(exc).__name__,
-                },
-            )
-            continue
-
-    logger.info(
-        "history_mining.run_complete",
-        extra={
-            "processed": processed_total,
-            "drafts_created": drafts_total,
-            "tenants_seen": len(by_tenant),
-        },
-    )
-    return {"processed": processed_total, "drafts_created": drafts_total}
+        return {"processed": processed_total, "drafts_created": drafts_total}
+    finally:
+        # Close provider pools regardless of success / failure.
+        # ``aclose_all`` swallows per-provider exceptions and logs
+        # them at WARNING with the provider name + error class.
+        await gateway.aclose_all()
 
 
 async def _process_tenant(
@@ -178,12 +203,20 @@ async def _process_tenant(
     messages: list[tuple[str, str]],  # (msg_id, content_text)
     min_cluster_size: int,
     max_cluster_size: int,
+    gateway: "LLMGateway",
 ) -> int:
     """Cluster tenant's questions + generate drafts. Returns drafts created.
 
     Imported lazily: ``llm_client`` is a heavy dep (provider plugins,
     async client singletons) — keep it out of the module-import path
     so unit tests can spin up the worker without a real OpenAI key.
+
+    The ``gateway`` is built once per cron invocation by
+    :func:`history_mining_worker` and reused across tenants — we
+    pay provider-pool setup once per run, not once per cluster.
+    The ``_llm_factory`` closure captures a single
+    :class:`PinnedResolver` (computed here, not inside the factory)
+    so every cluster's ``LLMClient`` shares the same pinned model.
     """
     from llm_client.client import LLMClient
     from llm_client.embeddings import embed_texts
@@ -227,22 +260,23 @@ async def _process_tenant(
         return 0
 
     # 3. Per-cluster representative-question selection + draft generation.
-    # ``LLMClient.with_config`` returns an LLMClient wired to the
-    # configured (provider, model) pair. Operators can override the
-    # mining LLM via ``HISTORY_MINING_PROVIDER`` / ``HISTORY_MINING_MODEL``
-    # without touching the QA judge config (the previous behaviour
-    # reused ``qa_judge_*`` settings by accident — operators tuning
-    # QA judge would side-effect the mining pipeline). Empty override
-    # values fall back to ``qa_judge_*`` for backward compatibility.
+    # Pin the (provider, model) pair via the worker gateway. Operators
+    # can override the mining LLM via ``HISTORY_MINING_PROVIDER`` /
+    # ``HISTORY_MINING_MODEL`` without touching the QA judge config
+    # (the previous behaviour reused ``qa_judge_*`` settings by
+    # accident — operators tuning QA judge would side-effect the
+    # mining pipeline). Empty override values fall back to
+    # ``qa_judge_*`` for backward compatibility.
     settings = get_settings()
     mining_provider = settings.history_mining_provider or settings.qa_judge_provider
     mining_model = settings.history_mining_model or settings.qa_judge_model
+    pinned = gateway.with_config(
+        provider=mining_provider, model=mining_model
+    )
 
     def _llm_factory() -> LLMClient:
-        return LLMClient.with_config(
-            provider=mining_provider,
-            model=mining_model,
-            tenant_id=tenant_id,
+        return LLMClient(
+            provider_resolver=pinned, tenant_id="history-mining"
         )
 
     generator = KBDraftGenerator(llm_client_factory=_llm_factory)

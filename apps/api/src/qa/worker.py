@@ -398,12 +398,18 @@ async def startup(ctx: dict[str, Any]) -> None:
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
-    """Close the Judge's HTTP client on worker shutdown.
+    """Close the Judge's gateway on worker shutdown.
 
-    The ``JudgeClient`` holds an ``LLMClient`` which holds a
-    provider-specific HTTPX pool (OpenAI/Anthropic). Without this
-    hook, arq's process exit would leak the pool. ``aclose`` is a
-    no-op for providers that don't expose an HTTPX client.
+    M4.A: the ``JudgeClient`` owns an ``LLMGateway`` (built in
+    ``from_settings``) that in turn owns the provider-specific HTTPX
+    pools (OpenAI / Anthropic). ``LLMClient.aclose()`` only flushes
+    pending usage rows — it no longer closes the provider, because
+    the client is unaware of which provider the resolver picked.
+    Provider pools are closed via ``LLMGateway.aclose_all``.
+
+    Without this hook, arq's process exit would leak the pools.
+    Both calls are best-effort (each guarded independently) so a
+    failure flushing usage doesn't skip the HTTP pool close.
     """
     judge: JudgeClient | None = ctx.get("judge_client")
     if judge is not None:
@@ -411,9 +417,17 @@ async def shutdown(ctx: dict[str, Any]) -> None:
             await judge.llm.aclose()
         except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
             log.warning(
-                "qa.worker.shutdown_aclose_failed",
+                "qa.worker.shutdown_flush_failed",
                 error_type=type(exc).__name__,
             )
+        if judge.gateway is not None:
+            try:
+                await judge.gateway.aclose_all()
+            except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+                log.warning(
+                    "qa.worker.shutdown_aclose_failed",
+                    error_type=type(exc).__name__,
+                )
     log.info("qa.worker.shutdown")
 
 

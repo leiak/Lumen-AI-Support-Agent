@@ -11,6 +11,9 @@ real provider calls (those wire in Task 8). The Judge's contract is:
   verify the framing defense.
 * User content is truncated to 1000 / 2000 / 10-list before interpolation
   (defense against prompt-stuffing).
+* ``from_settings()`` builds an ``LLMGateway`` and pins the configured
+  ``(qa_judge_provider, qa_judge_model)`` pair via
+  ``gateway.with_config`` — verified by ``test_judge_from_settings_*``.
 """
 from __future__ import annotations
 
@@ -197,3 +200,76 @@ async def test_judge_xml_escapes_and_truncates_long_inputs() -> None:
     # escape happens AFTER truncation so we measure the unescaped
     # source length).
     assert long_with_xml[:1000].count("<script>") == 125
+
+
+# ---- M4.A Task 4: JudgeClient.from_settings wires a PinnedResolver -----
+#
+# The Judge bypasses the gateway's prefix-based auto-router and pins
+# its (provider, model) pair so the ``route_mode="pinned"`` metric
+# label is correct regardless of the request's model field. The
+# previous implementation used ``LLMClient.with_config(provider=,
+# model=)`` which M4.A Task 3 deleted — see :class:`qa.judge.JudgeClient`.
+
+
+def test_judge_from_settings_uses_pinned_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``JudgeClient.from_settings`` must return a client whose
+    ``provider_resolver`` is a :class:`PinnedResolver` bound to the
+    configured (qa_judge_provider, qa_judge_model) pair.
+
+    M4.A replacement for the deleted ``LLMClient.with_config`` stub.
+    """
+    import core.config as core_config
+    from llm_client.resolvers import PinnedResolver
+
+    # Pin env to the values under test (no .env leakage).
+    monkeypatch.setenv("MINIMAX_API_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("QA_JUDGE_PROVIDER", "minimax")
+    monkeypatch.setenv("QA_JUDGE_MODEL", "MiniMax-judge-1")
+    core_config.reset_settings()
+
+    try:
+        client = JudgeClient.from_settings()
+    finally:
+        core_config.reset_settings()
+
+    assert isinstance(client.llm.provider_resolver, PinnedResolver)
+    assert client.llm.provider_resolver.model == "MiniMax-judge-1"
+    assert client.model == "MiniMax-judge-1"
+    # Gateway is exposed on the dataclass so the worker's shutdown
+    # hook can call ``aclose_all``.
+    assert client.gateway is not None
+    assert client.llm.tenant_id == "qa-judge"
+
+
+def test_judge_from_settings_passes_settings_to_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: the QA judge env vars drive both the gateway
+    registry (which providers get wired) and the pinned
+    (provider, model) pair.
+    """
+    import core.config as core_config
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anth-k")
+    monkeypatch.setenv("MINIMAX_API_KEY", "")
+    monkeypatch.setenv("QA_JUDGE_PROVIDER", "anthropic")
+    monkeypatch.setenv("QA_JUDGE_MODEL", "claude-haiku-4-5")
+    core_config.reset_settings()
+
+    try:
+        client = JudgeClient.from_settings()
+    finally:
+        core_config.reset_settings()
+
+    from llm_client.resolvers import PinnedResolver
+
+    assert isinstance(client.llm.provider_resolver, PinnedResolver)
+    # Pinned to the configured Anthropic provider + Claude Haiku.
+    assert client.llm.provider_resolver.model == "claude-haiku-4-5"
+    # Gateway holds the providers from build_provider_registry —
+    # only "anthropic" is registered because MINIMAX_API_KEY is empty.
+    assert "anthropic" in client.gateway.providers
+    assert "minimax" not in client.gateway.providers

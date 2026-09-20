@@ -33,15 +33,14 @@ record the failure against ``lumen_qa_judge_failures_total``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 from core.config import get_settings
 from core.logging import get_logger
-
-if TYPE_CHECKING:
-    from llm_client.client import LLMClient
+from llm_client.client import LLMClient
+from llm_client.gateway import LLMGateway
+from llm_client.provider_registry import build_provider_registry
 
 log = get_logger(__name__)
 
@@ -137,9 +136,16 @@ class JudgeClient:
     Construction is explicit (dataclass, not BaseModel) so tests can
     pass in a :class:`MagicMock` ``LLMClient`` without fighting
     Pydantic. ``from_settings`` is the production entry point and
-    delegates to ``LLMClient.with_config`` (see
-    :mod:`llm_client.client` — currently a stub, Task 8 wires the
-    real provider routing).
+    builds its own ``LLMGateway`` via :func:`build_provider_registry`,
+    then pins the configured ``(qa_judge_provider, qa_judge_model)``
+    pair via :meth:`LLMGateway.with_config` so Judge calls bypass
+    the default prefix-based auto-router.
+
+    ``gateway`` is exposed so the worker's shutdown hook can call
+    :meth:`LLMGateway.aclose_all` and release the underlying provider
+    HTTP pools. ``aclose_all`` lives on the gateway (not on
+    ``LLMClient``) because the gateway owns the provider registry
+    — ``LLMClient.aclose`` only flushes usage rows.
     """
 
     llm: "LLMClient"
@@ -147,15 +153,21 @@ class JudgeClient:
     threshold: float = 0.3
     max_retries: int = 1
     timeout_seconds: float = 10.0
+    # Optional so tests that construct JudgeClient(llm=MagicMock(), ...)
+    # don't have to wire a gateway; production builds it via
+    # ``from_settings``.
+    gateway: "LLMGateway | None" = None
 
     @classmethod
     def from_settings(cls) -> "JudgeClient":
         s = get_settings()
-        llm = LLMClient.with_config(
+        gateway = LLMGateway(providers=build_provider_registry(s))
+        pinned = gateway.with_config(
             provider=s.qa_judge_provider, model=s.qa_judge_model
         )
         return cls(
-            llm=llm,
+            gateway=gateway,
+            llm=LLMClient(provider_resolver=pinned, tenant_id="qa-judge"),
             model=s.qa_judge_model,
             threshold=s.qa_score_threshold_alert,
             max_retries=s.qa_judge_max_retries,
