@@ -497,7 +497,9 @@ def test_retriever_rrf_fusion_empty():
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_pdf_text_chunks_indexed_to_article_chunks(
+    app_client: AsyncClient,
     tenant_factory: Tenant,
+    auth_headers,
     tmp_path,
 ) -> None:
     """Uploading a PDF writes text chunks into the article_chunks Qdrant
@@ -509,17 +511,11 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
     - Each point carries source_type="pdf_text" + page_num + chunk_index
     - Point count matches len(text_chunks)
     """
-    from unittest.mock import AsyncMock, MagicMock, patch
-
-    from qdrant_client import AsyncQdrantClient
-
     from tests.fixtures._generate_pdfs import make_table_pdf
 
     # 1. Mock Qdrant client to capture upsert calls.
-    #    We avoid ``spec=AsyncQdrantClient`` because the real spec
-    #    includes async-context-manager dunders that don't survive
-    #    ``MagicMock`` cleanly. A plain MagicMock with the methods
-    #    we touch explicitly is enough for this test.
+    # Use a plain MagicMock — we only touch upsert / get_collections / collection_exists,
+    # and don't need the full AsyncQdrantClient protocol (e.g. async-context-manager methods).
     qdrant_mock = MagicMock()
     qdrant_mock.upsert = AsyncMock()
     qdrant_mock.get_collections = AsyncMock(
@@ -559,15 +555,7 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
     make_table_pdf(str(pdf_path))
     pdf_bytes = pdf_path.read_bytes()
 
-    # 5. Build app + client
-    from fastapi import FastAPI
-
-    app = FastAPI()
-    app.include_router(kb_multimodal_router)
-    token = create_access_token(
-        tenant_id=tenant_factory.id, user_id="admin-1", role="admin"
-    )
-
+    # 5. Build app + client (using shared ``app_client`` + ``auth_headers`` fixtures).
     with patch(
         "knowledge.multimodal.api.get_qdrant_client", return_value=qdrant_mock
     ), \
@@ -580,15 +568,12 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
              "knowledge.multimodal.api.get_object_store",
              return_value=_mock_object_store(),
          ):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            resp = await client.post(
-                "/api/v1/kb-articles/multimodal",
-                data={"kb_slug": "test-kb", "title": "Test"},
-                headers={"Authorization": f"Bearer {token}"},
-                files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
-            )
+        resp = await app_client.post(
+            "/api/v1/kb-articles/multimodal",
+            data={"kb_slug": "test-kb", "title": "Test"},
+            headers=auth_headers,
+            files={"file": ("test.pdf", pdf_bytes, "application/pdf")},
+        )
 
     assert resp.status_code in (200, 201), resp.text
 
