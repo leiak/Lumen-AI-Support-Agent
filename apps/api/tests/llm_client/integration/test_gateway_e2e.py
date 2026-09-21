@@ -21,6 +21,7 @@ Marked ``@pytest.mark.integration`` so the default selector
 (``pytest -m "not integration"``) skips them, matching the existing
 ``test_client.py`` convention.
 """
+import json
 from collections.abc import AsyncGenerator
 
 import pytest
@@ -208,12 +209,11 @@ async def test_qa_judge_pinned_path_routes_to_minimax(
     recorded = httpx_mock.get_requests()
     assert len(recorded) == 1, f"expected 1 HTTP call, got {len(recorded)}"
     assert recorded[0].url.host == "api.minimaxi.com"
+    assert recorded[0].url.path == "/v1/chat/completions"
 
     # The provider's outbound request body MUST carry the pinned model,
     # not the caller-supplied "claude-haiku-4-5". This is the whole point
     # of the PinnedResolver — override the model name on the wire.
-    import json
-
     body = json.loads(recorded[0].content)
     assert body["model"] == "MiniMax-M3", (
         f"PinnedResolver should have rewritten model to MiniMax-M3; "
@@ -223,7 +223,7 @@ async def test_qa_judge_pinned_path_routes_to_minimax(
 
 @pytest.mark.integration
 async def test_default_routing_unknown_model_returns_invalid_request(
-    anthropic_only_gateway: LLMGateway, httpx_mock: HTTPXMock
+    httpx_mock: HTTPXMock,
 ) -> None:
     """When the prefix resolver cannot match the model's family AND the
     default provider is unavailable, ``LLMClient`` catches the
