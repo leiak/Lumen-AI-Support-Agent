@@ -31,6 +31,7 @@
 | 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration |
 | 19 | M2.B — 收尾 (README + demo-act5 + 已知技术债 #18-20 + memory) | ✅ | 0 new tests, 3 demo stub PNGs |
 | 20 | M3 — 5 个生产级技术债 (#17 admin JWT auth / #18 PDF text indexing / #16 SES tenant reverse-lookup / #19 multi-vision adapter / #20 admin SPA UI) | ✅ | 17 admin + 9 vision_embedder + 13 web vitest + 4 PDF retrieve |
+| 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -321,6 +322,14 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 18. ~~**PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)~~ — M3 tech-debt #18 完成 (PDF text chunks 入 `article_chunks` Qdrant collection,`source_type="pdf_text"` + `page_num` + `chunk_index` + `text`,`MultimodalRetriever` RRF 检索可见)
 19. ~~**Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由**~~ — M3 tech-debt #19完成 (`vision_provider` env 选择 `doubao` / `openai_clip` / `voyage`,默认 Doubao;新加 `OpenAIVisionEmbedder` (768-dim) + `VoyageVisionEmbedder` (1024-dim) + `get_vision_embedder(settings)` 工厂;每个 provider 写独立 Qdrant collection (`kb_image_vectors_doubao` / `_clip` / `_voyage`),`kb_image_vectors` 保留为 legacy alias 指向当前 provider collection;9 个 unit tests)
 20. ~~**KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)**~~ — M3 tech-debt #20完成 (`/admin/kb-drafts` route 在现有 agent SPA 内,`AdminGuard` 包装 `AuthGuard`,`useIsAdmin` hook 读 JWT `role` claim;`DraftList` cards + `DraftDetailDialog` modal + status tabs (DRAFT/APPROVED/REJECTED);sidebar "KB 草稿" 入口仅 admin/owner 可见;13 个 Vitest tests)
+
+### M4.A — LLM Gateway Core (deferred to M4.B+)
+
+21. **`qa/worker.py` shutdown() 缺 `aclose_all()` 直接测试覆盖** — Task 4 review Minor M2;`test_worker_llm_wiring` 覆盖了 `finally` 路径,但 `shutdown()` 路径未直接断言 `aclose_all()` 调用次数。M4.B+ 接 multi-worker shutdown 时补 integration test。
+22. **`qa/worker.py` 与 `history_mining/worker.py` `aclose_all()` 错误处理非对称** — Task 4 review Minor M1;`qa/worker.py` 在 `finally` 块中 `_log_warn` 后继续,`history_mining/worker.py` 捕获 `Exception` 后 `_log_warn`;两条路径行为略不同,统一到单点 (e.g. `_safe_aclose_all(gateway)` 助手) 留 M4.B+。
+23. **`history_mining/worker.py` 缺 gateway lifecycle 非对称注释** — Task 4 review Minor M3;`qa/worker.py` 在 `process_tenant` 内 per-tenant 构建 + 关闭,`history_mining/worker.py` 是 outer scope 构建 + outer finally 关闭;两者生命周期不同,需要在 `history_mining/worker.py` 头部补一段说明为什么不需要 per-tenant 重建 (单进程 Sunday worker,低并发,缓存无收益)。
+24. **`_default_llm_client_factory` per-call `httpx.AsyncClient` 构造** — Task 5 文档化 M4.C 延后;`agent/llm_factory.py` 每次 graph turn 都新建 `httpx.AsyncClient`,连接池不跨 turn 复用。M4.C 接 provider HTTP pool caching (按 provider 缓存 client,acquire/release 模式)。
+
 
 ## 仓库信息
 
