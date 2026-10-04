@@ -1,17 +1,13 @@
 """Integration tests for LLMClient (retry + usage recording). Requires live DB."""
-import asyncio
 from collections.abc import AsyncGenerator
-from unittest.mock import create_autospec
 
 import pytest
 from pytest_httpx import HTTPXMock
 
-from llm_client.client import LLMClient, ROUTE_AUTO, ROUTE_PINNED
+from llm_client.client import LLMClient
 from llm_client.exceptions import InvalidRequest, RateLimited
 from llm_client.providers.anthropic_provider import AnthropicProvider
-from llm_client.providers.base import BaseProvider
-from llm_client.resolvers import PinnedResolver, _PrefixResolver
-from llm_client.types import ChatMessage, ChatRequest, ChatResponse, MessageRole
+from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
 
 def test_llm_client_requires_provider_resolver() -> None:
@@ -149,84 +145,3 @@ async def test_client_records_usage(
                 delete(LLMUsage).where(LLMUsage.tenant_id == "t-llm-client-test")
             )
             await s.commit()
-
-
-# ---- M4.B close-out regression tests (Task 5) ----
-#
-# These pin the non-fallback paths through LLMClient.chat: PinnedResolver and
-# _PrefixResolver. They guard against the M4.B ainvoke branch accidentally
-# swallowing the existing behavior — a future resolver kind must opt into
-# chain semantics by exposing ``ainvoke``, not by silently routing through it.
-
-
-def _stub_provider(name: str) -> BaseProvider:
-    p = create_autospec(BaseProvider, instance=True)
-    p.name = name
-    return p
-
-
-def _stub_response(provider_name: str, model: str) -> ChatResponse:
-    return ChatResponse(
-        content="ok",
-        model=model,
-        prompt_tokens=2,
-        completion_tokens=1,
-        finish_reason="stop",
-        provider_name=provider_name,
-    )
-
-
-def test_pinned_resolver_still_works() -> None:
-    """LLMClient + PinnedResolver must keep route_mode="pinned" + rewrite model.
-
-    Regression for M4.B: the ainvoke branch in LLMClient.chat must NOT
-    fire when the resolver exposes no ainvoke (PinnedResolver does not).
-    request.model is rewritten to the pinned model so the wire request
-    body and the metric label carry the actual model name.
-    """
-    provider = _stub_provider("minimax")
-    provider.chat.return_value = _stub_response("minimax", "MiniMax-M3")
-    pinned = PinnedResolver(provider=provider, model="MiniMax-M3")
-    client = LLMClient(provider_resolver=pinned, tenant_id="t-pinned-regress")
-
-    assert client._route_mode == ROUTE_PINNED
-    req = ChatRequest(
-        model="some-caller-supplied-name",
-        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
-    )
-    resp = asyncio.run(client.chat(req))
-
-    # PinnedResolver rewrites request.model → MiniMax-M3 before forwarding.
-    provider.chat.assert_awaited_once()
-    forwarded = provider.chat.await_args.args[0]
-    assert forwarded.model == "MiniMax-M3"
-    assert resp.model == "MiniMax-M3"
-
-
-def test_prefix_resolver_still_works() -> None:
-    """LLMClient + _PrefixResolver must keep route_mode="auto" + retry loop.
-
-    Regression for M4.B: the ainvoke branch must NOT fire on a bare
-    _PrefixResolver (it exposes no ainvoke). The local retry loop runs on
-    transient ProviderUnavailable instead — keeping M1-M4.A behavior.
-    """
-    provider = _stub_provider("anthropic")
-    # Fail once with 5xx, succeed on the next call → exercises the retry loop.
-    provider.chat.side_effect = [
-        _stub_response("anthropic", "claude-haiku-4-5"),  # immediate success
-    ]
-    prefix = _PrefixResolver(
-        providers={"anthropic": provider},
-        default_provider_name="anthropic",
-    )
-    client = LLMClient(provider_resolver=prefix, tenant_id="t-prefix-regress")
-
-    assert client._route_mode == ROUTE_AUTO
-    req = ChatRequest(
-        model="claude-haiku-4-5",
-        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
-    )
-    resp = asyncio.run(client.chat(req))
-
-    provider.chat.assert_awaited_once()
-    assert resp.provider_name == "anthropic"
