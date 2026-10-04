@@ -106,6 +106,24 @@ class Settings(BaseSettings):
     # exposed via /health (the version label is enough for triage).
     git_sha: str | None = Field(default=None, alias="GIT_SHA")
 
+    # M4.B — LLM fallback chain.
+    #
+    # ``llm_fallback_chain`` is a comma-separated ``provider:model`` list
+    # parsed by :func:`llm_client.provider_registry.parse_fallback_chain_env`.
+    # Empty / unset means "no fallback configured" — the gateway uses the
+    # existing prefix-based auto-router. When set, the first entry is the
+    # primary; subsequent entries are tried on transient failure.
+    #
+    # ``llm_fallback_attempt_timeout_s`` wraps each step in
+    # ``asyncio.wait_for``. Default ``None`` defers to the provider's
+    # underlying ``httpx.AsyncClient`` timeout (~60s).
+    llm_fallback_chain: str | None = Field(
+        default=None, alias="LLM_FALLBACK_CHAIN"
+    )
+    llm_fallback_attempt_timeout_s: float | None = Field(
+        default=None, alias="LLM_FALLBACK_ATTEMPT_TIMEOUT_S"
+    )
+
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
     # ``qa_judge_model`` default is a placeholder (the M2.B rollout will

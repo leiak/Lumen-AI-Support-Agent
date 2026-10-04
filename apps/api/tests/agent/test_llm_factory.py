@@ -27,6 +27,7 @@ The tests assert surface behaviour only:
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec, patch
 
@@ -49,6 +50,21 @@ def _stub_provider(name: str) -> BaseProvider:
     return p
 
 
+def _fake_settings(**overrides: Any) -> SimpleNamespace:
+    """Return a Settings-like proxy carrying the M4.B fallback fields.
+
+    The factory reads ``llm_fallback_chain`` and ``llm_fallback_attempt_timeout_s``
+    in addition to whatever ``build_provider_registry`` reads (which we
+    patch anyway). Pass overrides to exercise the chain path.
+    """
+    base: dict[str, Any] = {
+        "llm_fallback_chain": None,
+        "llm_fallback_attempt_timeout_s": None,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 def test_default_factory_returns_llm_client_with_resolver() -> None:
     """Factory returns ``LLMClient`` wired to a non-pinned resolver.
 
@@ -58,7 +74,7 @@ def test_default_factory_returns_llm_client_with_resolver() -> None:
     the registry's prefix router pick the provider per request.
     """
     anthropic_stub = _stub_provider("anthropic")
-    fake_settings: Any = object()  # any truthy Settings-like proxy
+    fake_settings = _fake_settings()
     with patch("core.config.get_settings", return_value=fake_settings), \
          patch(
              "agent.llm_factory.build_provider_registry",
@@ -84,7 +100,7 @@ def test_default_factory_uses_minimax_when_minimax_key_set() -> None:
     the factory would build when the operator has only a MiniMax key.
     """
     minimax_stub = _stub_provider("minimax")
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              return_value={"minimax": minimax_stub},
@@ -110,7 +126,7 @@ def test_default_factory_uses_anthropic_when_only_anthropic_key_set() -> None:
     routes to the Anthropic provider for claude-prefixed model names.
     """
     anthropic_stub = _stub_provider("anthropic")
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              return_value={"anthropic": anthropic_stub},
@@ -131,7 +147,7 @@ def test_default_factory_uses_anthropic_when_only_anthropic_key_set() -> None:
     # registry with both providers is caught.
     # The function under test only exposes the resolved provider, but
     # we re-invoke the factory path to introspect the registry contents.
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              return_value={"anthropic": anthropic_stub},
@@ -146,7 +162,7 @@ def test_default_factory_raises_when_no_keys() -> None:
     ``RuntimeError`` and the factory propagates that surface to the
     caller. A no-keys misconfiguration MUST fail fast at first use
     rather than silently producing an unusable ``LLMClient``."""
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              side_effect=RuntimeError(
@@ -166,7 +182,7 @@ def test_default_factory_preserves_tenant_id() -> None:
     attribute every call. This test pins the contract.
     """
     anthropic_stub = _stub_provider("anthropic")
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              return_value={"anthropic": anthropic_stub},
@@ -177,7 +193,7 @@ def test_default_factory_preserves_tenant_id() -> None:
     # And again with a different tenant — the factory is a pure
     # function of its argument; no module-global tenant state leaks
     # between calls.
-    with patch("core.config.get_settings", return_value="s"), \
+    with patch("core.config.get_settings", return_value=_fake_settings()), \
          patch(
              "agent.llm_factory.build_provider_registry",
              return_value={"anthropic": anthropic_stub},
@@ -185,3 +201,61 @@ def test_default_factory_preserves_tenant_id() -> None:
         client_b = _default_llm_client_factory("tenant-xyz")
     assert client_b.tenant_id == "tenant-xyz"
     assert client_b.tenant_id != client.tenant_id
+
+
+def test_default_factory_builds_fallback_resolver_when_chain_env_set() -> None:
+    """M4.B — when ``LLM_FALLBACK_CHAIN`` is set, the factory builds a
+    :class:`FallbackResolver` instead of the prefix-based auto-router.
+
+    The gateway's ``default_resolver`` then exposes ``ainvoke`` so
+    ``LLMClient.chat`` engages the chain path; the primary step's
+    ``__call__`` still returns the primary provider so streaming
+    works on the first step.
+    """
+    minimax_stub = _stub_provider("minimax")
+    anthropic_stub = _stub_provider("anthropic")
+    fake_settings = _fake_settings(
+        llm_fallback_chain="minimax:MiniMax-M3,anthropic:claude-haiku-4-5"
+    )
+    with patch("core.config.get_settings", return_value=fake_settings), \
+         patch(
+             "agent.llm_factory.build_provider_registry",
+             return_value={"minimax": minimax_stub, "anthropic": anthropic_stub},
+         ):
+        client = _default_llm_client_factory("t-fallback")
+
+    from llm_client.resolvers import FallbackResolver
+    from llm_client.types import ChatMessage, ChatRequest, MessageRole
+
+    assert isinstance(client.provider_resolver, FallbackResolver)
+    # And the chain path is engaged — LLMClient routes to ainvoke.
+    assert hasattr(client.provider_resolver, "ainvoke")
+    # Streaming still works on the primary step.
+    req = ChatRequest(
+        model="MiniMax-M3",
+        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
+    )
+    assert client.provider_resolver(req) is minimax_stub
+
+
+def test_default_factory_no_chain_uses_prefix_resolver() -> None:
+    """M4.B — when ``LLM_FALLBACK_CHAIN`` is unset, the factory uses the
+    existing prefix-based auto-router (NOT a ``FallbackResolver``).
+
+    This pins the regression contract for ``LLM_FALLBACK_CHAIN=None``
+    so an operator who hasn't opted into fallback doesn't accidentally
+    get the chain semantics.
+    """
+    anthropic_stub = _stub_provider("anthropic")
+    fake_settings = _fake_settings()  # llm_fallback_chain=None default
+    with patch("core.config.get_settings", return_value=fake_settings), \
+         patch(
+             "agent.llm_factory.build_provider_registry",
+             return_value={"anthropic": anthropic_stub},
+         ):
+        client = _default_llm_client_factory("t-no-chain")
+
+    from llm_client.resolvers import FallbackResolver, _PrefixResolver
+
+    assert not isinstance(client.provider_resolver, FallbackResolver)
+    assert isinstance(client.provider_resolver, _PrefixResolver)

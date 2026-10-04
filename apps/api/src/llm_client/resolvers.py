@@ -34,6 +34,7 @@ from llm_client.exceptions import (
     ProviderUnavailable,
     RateLimited,
 )
+from core.business_metrics import LLM_FALLBACK_ATTEMPTS_TOTAL
 
 if TYPE_CHECKING:
     from llm_client.providers.base import BaseProvider
@@ -201,7 +202,7 @@ class FallbackResolver:
         """
         attempts: list[AttemptRecord] = []
         last_exc: BaseException | None = None
-        for step in self.steps:
+        for step_idx, step in enumerate(self.steps):
             rewritten = request.model_copy(update={"model": step.model})
             try:
                 if self._timeout is not None:
@@ -211,13 +212,36 @@ class FallbackResolver:
                     )
                 else:
                     resp = await step.provider.chat(rewritten)
+                LLM_FALLBACK_ATTEMPTS_TOTAL.labels(
+                    provider=step.provider.name,
+                    model=step.model,
+                    step=str(step_idx),
+                    outcome="success",
+                ).inc()
                 return resp
             except _FALLBACK_TRIGGERS as exc:
+                exc_name = type(exc).__name__
+                # Map to metric outcome vocabulary. The Counter labels
+                # are bounded strings, not arbitrary class names —
+                # anything outside the known set collapses to
+                # ``other`` to keep cardinality bounded.
+                outcome_label = {
+                    "ProviderUnavailable": "provider_unavailable",
+                    "OutputInvalid": "output_invalid",
+                    "RateLimited": "rate_limited",
+                    "TimeoutError": "timeout",
+                }.get(exc_name, "other")
+                LLM_FALLBACK_ATTEMPTS_TOTAL.labels(
+                    provider=step.provider.name,
+                    model=step.model,
+                    step=str(step_idx),
+                    outcome=outcome_label,
+                ).inc()
                 attempts.append(
                     AttemptRecord(
                         provider_name=step.provider.name,
                         model=step.model,
-                        exc_type=type(exc).__name__,
+                        exc_type=exc_name,
                     )
                 )
                 last_exc = exc

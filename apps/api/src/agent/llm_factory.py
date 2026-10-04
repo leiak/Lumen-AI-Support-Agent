@@ -23,12 +23,19 @@ from __future__ import annotations
 
 from llm_client.client import LLMClient
 from llm_client.gateway import LLMGateway
-from llm_client.provider_registry import build_provider_registry
+from llm_client.provider_registry import (
+    build_provider_registry,
+    parse_fallback_chain_env,
+)
 from llm_client.usage import UsageRecorder
 
 
 def _default_llm_client_factory(tenant_id: str) -> LLMClient:
     """Build a per-tenant ``LLMClient`` wrapping the gateway's default resolver.
+
+    When ``settings.llm_fallback_chain`` is set the gateway builds a
+    :class:`FallbackResolver` from it; otherwise the existing
+    prefix-based auto-router is used. See M4.B spec §5.1.
 
     Args:
         tenant_id: opaque tenant identifier threaded into ``LLMClient`` so
@@ -44,7 +51,12 @@ def _default_llm_client_factory(tenant_id: str) -> LLMClient:
     from core.config import get_settings
 
     settings = get_settings()
-    gateway = LLMGateway(providers=build_provider_registry(settings))
+    chain = parse_fallback_chain_env(settings.llm_fallback_chain)
+    gateway = LLMGateway(
+        providers=build_provider_registry(settings),
+        default_fallback_chain=chain or None,
+        attempt_timeout_s=settings.llm_fallback_attempt_timeout_s,
+    )
     return LLMClient(
         provider_resolver=gateway.default_resolver,
         tenant_id=tenant_id,
