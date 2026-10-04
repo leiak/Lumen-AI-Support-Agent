@@ -28,13 +28,19 @@ from llm_client.exceptions import (
     RateLimited,
 )
 from llm_client.providers.base import BaseProvider
-from llm_client.resolvers import PinnedResolver, Resolver, UnknownModelError
+from llm_client.resolvers import (
+    FallbackResolver,
+    PinnedResolver,
+    Resolver,
+    UnknownModelError,
+)
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse
 from llm_client.usage import UsageRecorder
 
 # Route-mode label values — keep them as constants so dashboards and
 # alerts reference the same string we increment with.
 ROUTE_AUTO = "auto"
+ROUTE_FALLBACK = "fallback"  # NEW — M4.B FallbackResolver chain
 ROUTE_PINNED = "pinned"
 ROUTE_UNKNOWN_MODEL = "unknown_model"
 ROUTE_RESOLVER_ERROR = "resolver_error"
@@ -47,11 +53,13 @@ _UNKNOWN_PROVIDER_LABEL = "<unknown>"
 def _route_mode_for(resolver: Resolver) -> str:
     """Pick the ``route_mode`` metric label value for a given resolver.
 
-    ``PinnedResolver`` instances carry ``route_mode="pinned"``. Any
-    other callable is treated as ``"auto"`` — the prefix router
-    and any future resolver kind (fallback chain in M4.B, per-tenant
-    BYOK resolver in M4.C) fall under this umbrella.
+    Order matters: ``FallbackResolver`` check must precede the
+    ``PinnedResolver`` check because a FallbackResolver's outer
+    ``__call__`` returns the primary step's provider (a PinnedResolver
+    in spirit) but its ``route_mode`` semantically means "a chain ran".
     """
+    if isinstance(resolver, FallbackResolver):
+        return ROUTE_FALLBACK
     if isinstance(resolver, PinnedResolver):
         return ROUTE_PINNED
     return ROUTE_AUTO
@@ -208,7 +216,7 @@ class LLMClient:
         self,
         request: ChatRequest,
         *,
-        max_retries: int = 3,
+        max_retries: int = 1,
     ) -> ChatResponse:
         """Send a chat request with retry.
 
@@ -216,7 +224,20 @@ class LLMClient:
         times with exponential backoff + jitter. Does NOT retry on
         RateLimited / InvalidRequest / UnknownModelError / resolver error
         (those are caller's mistake or hard 4xx-equivalent failures).
+
+        When ``provider_resolver`` exposes an ``ainvoke`` method
+        (FallbackResolver from M4.B), the chain IS the retry mechanism —
+        we delegate and skip the local retry loop to avoid
+        ``max_retries × chain_length`` attempt explosion.
         """
+        # M4.B: FallbackResolver.ainvoke runs the whole chain (primary +
+        # backup, ...) and either returns success or raises
+        # FallbackChainExhausted. We deliberately do NOT wrap it in this
+        # method's retry loop — the chain already handles per-step retry
+        # semantics, and re-running it on exhaustion would compound.
+        if hasattr(self.provider_resolver, "ainvoke"):
+            return await self.provider_resolver.ainvoke(request)
+
         request, route_mode = self._resolve_request(request)
         request_id = uuid.uuid4().hex
         attempt = 0
