@@ -26,7 +26,12 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from core.logging import get_logger
-from llm_client.resolvers import PinnedResolver, Resolver, _PrefixResolver
+from llm_client.resolvers import (
+    FallbackResolver,
+    PinnedResolver,
+    Resolver,
+    _PrefixResolver,
+)
 
 log = get_logger(__name__)
 
@@ -51,6 +56,8 @@ class LLMGateway:
         *,
         providers: dict[str, "BaseProvider"],
         default_provider_name: str | None = None,
+        default_fallback_chain: list[tuple[str, str]] | None = None,
+        attempt_timeout_s: float | None = None,
     ) -> None:
         if not providers:
             raise RuntimeError("LLMGateway needs at least one provider")
@@ -66,10 +73,43 @@ class LLMGateway:
         # but unavailable. Validating strictly would make that error
         # unreachable from ``resolve()`` — which the spec requires.
         self._default_provider_name = default_provider_name
-        self._resolver: Resolver = _PrefixResolver(
-            providers=self._providers,
-            default_provider_name=self._default_provider_name,
-        )
+        self._attempt_timeout_s = attempt_timeout_s
+
+        if default_fallback_chain:
+            # Build the chain; skip entries whose provider is not registered
+            # (operator might enable the env in a deployment with only one
+            # provider configured). Log at WARNING for visibility.
+            steps: list[PinnedResolver] = []
+            for provider_name, model in default_fallback_chain:
+                if provider_name not in self._providers:
+                    log.warning(
+                        "llm_client.fallback_step_skipped",
+                        provider=provider_name,
+                        model=model,
+                        reason="provider not registered",
+                    )
+                    continue
+                steps.append(
+                    PinnedResolver(
+                        provider=self._providers[provider_name],
+                        model=model,
+                    )
+                )
+            # Always replace the resolver with FallbackResolver when the
+            # chain kwarg is non-empty — even if all steps were skipped
+            # downstream, we still want the constructor to fail loudly so
+            # operators notice the misconfiguration rather than silently
+            # falling back to single-provider mode.
+            self._resolver: Resolver = FallbackResolver(
+                steps=steps,
+                attempt_timeout_s=attempt_timeout_s,
+            )
+        else:
+            # Existing behaviour: prefix-based auto-routing.
+            self._resolver = _PrefixResolver(
+                providers=self._providers,
+                default_provider_name=self._default_provider_name,
+            )
 
     def __repr__(self) -> str:
         return (

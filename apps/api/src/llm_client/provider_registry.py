@@ -53,4 +53,37 @@ def build_provider_registry(settings: Settings) -> dict[str, BaseProvider]:
     return providers
 
 
-__all__ = ["build_provider_registry"]
+def parse_fallback_chain_env(value: str | None) -> list[tuple[str, str]]:
+    """Parse ``LLM_FALLBACK_CHAIN`` env into ``[(provider_name, model), ...]``.
+
+    Format: ``"provider:model,provider:model[,...]"``. Whitespace is
+    stripped around each entry. Empty string and ``None`` return an
+    empty list (signals "no fallback configured").
+
+    Raises:
+        ValueError: an entry is missing the colon, has an empty
+            provider name, or has an empty model name.
+    """
+    if value is None:
+        return []
+    result: list[tuple[str, str]] = []
+    for raw_entry in value.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(
+                f"fallback chain entry {entry!r}: expected 'provider:model'"
+            )
+        provider_name, _, model = entry.partition(":")
+        provider_name = provider_name.strip()
+        model = model.strip()
+        if not provider_name:
+            raise ValueError(f"fallback chain entry {entry!r}: empty provider")
+        if not model:
+            raise ValueError(f"fallback chain entry {entry!r}: empty model")
+        result.append((provider_name, model))
+    return result
+
+
+__all__ = ["build_provider_registry", "parse_fallback_chain_env"]
