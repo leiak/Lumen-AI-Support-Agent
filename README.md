@@ -32,6 +32,7 @@
 | 19 | M2.B — 收尾 (README + demo-act5 + 已知技术债 #18-20 + memory) | ✅ | 0 new tests, 3 demo stub PNGs |
 | 20 | M3 — 5 个生产级技术债 (#17 admin JWT auth / #18 PDF text indexing / #16 SES tenant reverse-lookup / #19 multi-vision adapter / #20 admin SPA UI) | ✅ | 17 admin + 9 vision_embedder + 13 web vitest + 4 PDF retrieve |
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
+| 22 (M4.B) | LLM Gateway Fallback Resolver — chain-based failover on M4.A resolver seam (`FallbackResolver.ainvoke` + `FallbackChainExhausted(attempts)` + per-step `lumen_llm_fallback_attempts_total{provider,model,step,outcome}` + env-driven `LLM_FALLBACK_CHAIN`) | ✅ | 10 resolver + 5 client branch + 12 gateway/env + 6 factory + e2e + 3 regression |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -329,6 +330,18 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 22. **`qa/worker.py` 与 `history_mining/worker.py` `aclose_all()` 错误处理非对称** — Task 4 review Minor M1;`qa/worker.py` 在 `finally` 块中 `_log_warn` 后继续,`history_mining/worker.py` 捕获 `Exception` 后 `_log_warn`;两条路径行为略不同,统一到单点 (e.g. `_safe_aclose_all(gateway)` 助手) 留 M4.B+。
 23. **`history_mining/worker.py` 缺 gateway lifecycle 非对称注释** — Task 4 review Minor M3;`qa/worker.py` 在 `process_tenant` 内 per-tenant 构建 + 关闭,`history_mining/worker.py` 是 outer scope 构建 + outer finally 关闭;两者生命周期不同,需要在 `history_mining/worker.py` 头部补一段说明为什么不需要 per-tenant 重建 (单进程 Sunday worker,低并发,缓存无收益)。
 24. **`_default_llm_client_factory` per-call `httpx.AsyncClient` 构造** — Task 5 文档化 M4.C 延后;`agent/llm_factory.py` 每次 graph turn 都新建 `httpx.AsyncClient`,连接池不跨 turn 复用。M4.C 接 provider HTTP pool caching (按 provider 缓存 client,acquire/release 模式)。
+
+### M4.B — LLM Gateway Fallback Resolver
+
+See [[m4-b-progress]] for full scope.
+
+25. **`stream_chat()` skips fallback** — 设计选择 (mid-stream switch 不可靠);当客户端需要可靠 streaming 时,当前答案是"那一轮改调 `chat()`"。M4.B+ 可能引入 Redis-backed stream continuation(如出现具体客户用例)。
+26. **No per-step budget** — `attempt_timeout_s` 单一值应用到所有 step;某些团队想要按 step 不同的超时 (如 primary 长 / backup 短)。Deferred。
+27. **No chain-warm metrics** — 只统计每个 step 的 success/failure 计数,没有滚动延迟 / 错误率。M4.D (budget) 很可能需要这些。
+28. **Chain length hardcoded at 2** — env 格式支持 N (comma-separated),但 resolver 没有在 N>2 下用测试验证。N=2 是 brainstorming Q2 显式设计目标;N≥3 需额外 integration tests。
+
+29. **Spec §6.3 outcome vocabulary drift** — spec 列了 5 个 outcome (`success/provider_unavailable/output_invalid/rate_limited/timeout`);实现加了第 6 个 `other` 作为未映射异常类的 catch-all (defensive cardinality bound)。Spec 表需要更新;没有行为变更。(From Task 4 code quality Minor M2。)
+30. **Plan-level metric verification gap** — spec §7.2 #1 要求验证 `step=1` counter + `route_mode="fallback"`;spec §7.2 #3 要求验证 `lumen_llm_fallback_attempts_total{outcome="provider_unavailable"} ×2`。Plan Step 4.4 测试代码未包含;实现正确,如需显式 metric assertion 是 follow-up。(From Task 4 spec reviewer。)
 
 
 ## 仓库信息

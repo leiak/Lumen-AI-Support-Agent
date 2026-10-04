@@ -5,7 +5,12 @@ import pytest
 
 from llm_client.gateway import LLMGateway
 from llm_client.providers.base import BaseProvider
-from llm_client.resolvers import PinnedResolver, UnknownModelError
+from llm_client.resolvers import (
+    FallbackResolver,
+    PinnedResolver,
+    UnknownModelError,
+    _PrefixResolver,
+)
 from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
 
@@ -140,3 +145,31 @@ async def test_gateway_aclose_all_isolates_one_failing_provider() -> None:
     await g.aclose_all()
     a.aclose.assert_awaited_once()  # type: ignore[attr-defined]
     m.aclose.assert_awaited_once()  # type: ignore[attr-defined]
+
+
+# ---- M4.B close-out regression test (Task 5) ----
+
+
+def test_no_fallback_chain_env_uses_prefix_resolver() -> None:
+    """LLMGateway(default_fallback_chain=None) must yield _PrefixResolver.
+
+    Regression for M4.B: the chain branch in LLMGateway.__init__ must
+    default to the existing prefix-based auto-routing when the env var
+    is unset (None or empty). Future env-driven wiring must NOT
+    accidentally promote a single-provider deployment to a (single-step)
+    FallbackResolver — that would change the route_mode label from
+    "auto" to "fallback" and inflate per-step metrics unnecessarily.
+    """
+    a = _stub("anthropic")
+    m = _stub("minimax")
+    # Explicit None + the default value both must produce the prefix resolver.
+    g_none = LLMGateway(
+        providers={"anthropic": a, "minimax": m},
+        default_fallback_chain=None,
+    )
+    assert isinstance(g_none.default_resolver, _PrefixResolver)
+    assert not isinstance(g_none.default_resolver, FallbackResolver)
+
+    # And the resolver still routes by prefix (regression contract).
+    req = _stub_request("claude-haiku-4-5")
+    assert g_none.default_resolver(req) is a
