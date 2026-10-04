@@ -53,6 +53,10 @@ class ChatResponse(BaseModel):
     finish_reason: str
     tool_calls: list[dict[str, Any]] | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
+    # M4.B — populated by call sites that want the response self-describing
+    # the provider it came from. Optional (default ``None``) to keep older
+    # constructions backward compatible.
+    provider_name: str | None = None
 
     @property
     def total_tokens(self) -> int:

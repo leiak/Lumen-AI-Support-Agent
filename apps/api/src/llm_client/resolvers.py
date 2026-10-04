@@ -22,12 +22,22 @@ detail of :class:`LLMGateway`. Call sites only see the gateway's
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from llm_client.exceptions import (
+    AttemptRecord,
+    FallbackChainExhausted,
+    InvalidRequest,
+    OutputInvalid,
+    ProviderUnavailable,
+    RateLimited,
+)
+
 if TYPE_CHECKING:
     from llm_client.providers.base import BaseProvider
-    from llm_client.types import ChatRequest
+    from llm_client.types import ChatRequest, ChatResponse
 
 
 class UnknownModelError(Exception):
@@ -111,4 +121,110 @@ class _PrefixResolver:
         )
 
 
-__all__ = ["PinnedResolver", "Resolver", "UnknownModelError"]
+# Exception types that trigger fallback to the next step in the chain.
+# ``InvalidRequest`` is intentionally absent: 4xx-equivalent errors are
+# caller mistakes, not transient. Fallback would mask the bug and waste
+# tokens on the secondary provider.
+_FALLBACK_TRIGGERS: tuple[type[BaseException], ...] = (
+    ProviderUnavailable,
+    OutputInvalid,
+    RateLimited,
+    asyncio.TimeoutError,
+)
+
+
+class FallbackResolver:
+    """Chain-based fallback resolver: try each step in order, return first success.
+
+    Each step is a :class:`PinnedResolver` carrying a ``(provider, model)``
+    pair. The chain is iterated on transient failures (see
+    :data:`_FALLBACK_TRIGGERS`); on the first successful step a
+    :class:`ChatResponse` is returned and on exhaustion
+    :class:`FallbackChainExhausted` is raised.
+
+    The :meth:`__call__` shim returns the **primary step's provider** so
+    the class satisfies ``Resolver = Callable[[ChatRequest], BaseProvider]``
+    (M4.A contract unchanged). Real chain execution goes through
+    :meth:`ainvoke`; ``LLMClient.chat`` detects the resolver via
+    ``hasattr(resolver, "ainvoke")`` and routes there.
+    """
+
+    def __init__(
+        self,
+        *,
+        steps: list["PinnedResolver"],
+        attempt_timeout_s: float | None = None,
+    ) -> None:
+        if not steps:
+            raise ValueError("FallbackResolver needs at least one step")
+        # Reject duplicate (provider.name, model) pairs to keep metric
+        # labels unambiguous and prevent operator typos from silently
+        # shadowing each other.
+        seen: set[tuple[str, str]] = set()
+        for step in steps:
+            key = (step.provider.name, step.model)
+            if key in seen:
+                raise ValueError(
+                    f"duplicate step {key!r} in fallback chain"
+                )
+            seen.add(key)
+        self.steps = list(steps)
+        self._timeout = attempt_timeout_s
+
+    def __call__(self, request: "ChatRequest") -> "BaseProvider":
+        """Return primary step's provider (M4.A protocol compatibility).
+
+        This is a placeholder for callers that only need to know which
+        provider to use (e.g. ``stream_chat``). Real chain execution
+        goes through :meth:`ainvoke`.
+        """
+        return self.steps[0].provider
+
+    async def ainvoke(self, request: "ChatRequest") -> "ChatResponse":
+        """Execute the chain; return first successful response.
+
+        On transient failure of any step, record the attempt and move to
+        the next. ``InvalidRequest`` (and any non-trigger exception)
+        propagates immediately — these are caller errors, not transient
+        infrastructure problems.
+
+        Returns:
+            The :class:`ChatResponse` from the first successful step.
+
+        Raises:
+            FallbackChainExhausted: every step raised a trigger exception.
+            InvalidRequest: a step raised ``InvalidRequest`` (not retried,
+                surfaced immediately).
+            Exception: any non-trigger, non-``InvalidRequest`` exception
+                propagates (config bug / runtime crash — not a fallback
+                candidate).
+        """
+        attempts: list[AttemptRecord] = []
+        last_exc: BaseException | None = None
+        for step in self.steps:
+            rewritten = request.model_copy(update={"model": step.model})
+            try:
+                if self._timeout is not None:
+                    resp = await asyncio.wait_for(
+                        step.provider.chat(rewritten),
+                        timeout=self._timeout,
+                    )
+                else:
+                    resp = await step.provider.chat(rewritten)
+                return resp
+            except _FALLBACK_TRIGGERS as exc:
+                attempts.append(
+                    AttemptRecord(
+                        provider_name=step.provider.name,
+                        model=step.model,
+                        exc_type=type(exc).__name__,
+                    )
+                )
+                last_exc = exc
+                continue
+        # All steps exhausted.
+        assert last_exc is not None  # invariant: N>=1 steps always set this
+        raise FallbackChainExhausted(attempts=attempts) from last_exc
+
+
+__all__ = ["FallbackResolver", "PinnedResolver", "Resolver", "UnknownModelError"]

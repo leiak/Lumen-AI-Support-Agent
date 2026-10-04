@@ -60,6 +60,25 @@ LLM_TOKENS_TOTAL = Counter(
     ("provider", "model", "route_mode", "direction"),
 )
 
+# M4.B — fallback chain per-step observability.
+#
+# Distinct from ``lumen_llm_calls_total`` which records the OUTCOME of
+# the whole chain (single provider label = the winner). This counter
+# fires once per STEP regardless of chain success, so dashboards can
+# see "step 0 failed 5 times today" without needing to correlate with
+# the call outcome. Labels:
+#   provider: gateway-registered name
+#   model:    the step's pinned model (may differ from request.model)
+#   step:     0-based index in the chain
+#   outcome:  success / provider_unavailable / output_invalid /
+#             rate_limited / timeout
+# Cardinality ≈ providers × models × chain_length × 5 outcomes.
+LLM_FALLBACK_ATTEMPTS_TOTAL = Counter(
+    "lumen_llm_fallback_attempts_total",
+    "Per-step fallback chain attempts, by provider / model / step / outcome.",
+    ("provider", "model", "step", "outcome"),
+)
+
 
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
@@ -109,6 +128,7 @@ LUMEN_QA_SCORE_LATENCY = Histogram(
 
 __all__ = [
     "LLM_CALLS_TOTAL",
+    "LLM_FALLBACK_ATTEMPTS_TOTAL",
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",
     "LUMEN_QA_FLAGGED",
