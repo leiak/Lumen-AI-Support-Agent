@@ -225,3 +225,51 @@ def test_current_period_falls_back_to_utc_on_bad_malformed() -> None:
     period, period_start = _current_period("Not/A/Zone")
     assert len(period) == 7
     assert period_start.utcoffset() == timedelta(0)  # UTC fallback
+
+
+async def test_ainvoke_post_record_runs_for_single_provider_chain() -> None:
+    """Single-provider tenant — BudgetResolver.ainvoke must run post_record even
+    when the inner TenantResolver.ainvoke raises _NoChainConfigured.
+
+    Regression: without this fix, cap tracking is silently bypassed for
+    tenants with tenant_budgets row + single provider + no fallback chain.
+    """
+    from llm_client.tenant_resolver import _NoChainConfigured
+
+    # Inner TenantResolver.ainvoke raises _NoChainConfigured; sync __call__
+    # returns a primary provider with chat() that returns a fake response.
+    primary_provider = MagicMock()
+    response = MagicMock()
+    response.prompt_tokens = 100
+    response.completion_tokens = 50
+    primary_provider.chat = AsyncMock(return_value=response)
+
+    class _FakeInner:
+        async def ainvoke(self, request):
+            raise _NoChainConfigured()
+
+        def __call__(self, request):
+            return primary_provider
+
+    inner = _FakeInner()
+
+    cache = MagicMock()
+    cache.get_or_load_async = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 0)
+    )
+    repo = MagicMock()
+    repo.set_tokens_used = AsyncMock()
+
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    resp = await resolver.ainvoke(MagicMock())
+    assert resp is response
+    # post_record must have run via the single-provider fallback path
+    repo.set_tokens_used.assert_awaited_once_with(
+        tenant_id="t1", period="2026-10", tokens_used=150
+    )

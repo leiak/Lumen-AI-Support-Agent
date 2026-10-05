@@ -40,6 +40,7 @@ from core.business_metrics import (
     LLM_TENANT_BUDGET_SOFT_WARN_TOTAL,
 )
 from llm_client.exceptions import TenantBudgetExceeded
+from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.resolvers import Resolver
 from llm_client.types import ChatRequest, ChatResponse
 
@@ -109,7 +110,13 @@ class BudgetResolver:
             # Opt-out: no enforcement, no snapshot reads or writes.
             return await self._inner.ainvoke(request)
         period, period_start = await self._pre_check()
-        resp = await self._inner.ainvoke(request)
+        try:
+            resp = await self._inner.ainvoke(request)
+        except _NoChainConfigured:
+            # Single-provider tenant — replicate LLMClient's retry loop so
+            # _post_record still runs and cap tracking stays consistent.
+            primary = self._inner(request)  # sync __call__ returns primary provider
+            resp = await primary.chat(request)
         tokens_consumed = (
             getattr(resp, "prompt_tokens", 0) + getattr(resp, "completion_tokens", 0)
         )
