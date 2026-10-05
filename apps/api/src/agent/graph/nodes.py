@@ -46,7 +46,7 @@ appear.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
@@ -89,7 +89,7 @@ log = get_logger(__name__)
 # Local type alias matching the per-tenant LLMClient factory used
 # elsewhere in the agent package. We re-declare it here to avoid a
 # circular import with ``agent.simple_responder``.
-LLMClientFactory = Callable[[str], LLMClient]
+LLMClientFactory = Callable[[str], Awaitable[LLMClient]]
 
 # Stage 12 / Task 2 — maximum number of tool-call dispatches the
 # LLM node will perform in a single turn before bailing out with

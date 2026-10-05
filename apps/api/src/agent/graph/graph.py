@@ -32,7 +32,7 @@ and no streaming yet.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -59,7 +59,7 @@ log = get_logger(__name__)
 
 # Local type alias matching the per-tenant LLMClient factory used
 # elsewhere in the agent package.
-LLMClientFactory = Callable[[str], LLMClient]
+LLMClientFactory = Callable[[str], Awaitable[LLMClient]]
 
 # Node identifiers used by the conditional edge and the routing
 # function. Kept at module scope so the LLM-node name and the
