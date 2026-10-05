@@ -81,3 +81,34 @@ class FallbackChainExhausted(ProviderUnavailable):
             f"Fallback chain exhausted after {len(attempts)} attempt(s): "
             f"[{providers}]"
         )
+
+
+class TenantLlmNotConfigured(ProviderUnavailable):
+    """Raised when a tenant has zero enabled LLM provider configs.
+
+    Carries the ``tenant_id`` and the list of ``missing_providers``
+    so admins can diagnose which providers the tenant needs to
+    configure. Extends :class:`ProviderUnavailable` so existing callers
+    that catch ``ProviderUnavailable`` get this for free (``LLMClient``
+    treats it as a 5xx-equivalent failure → no retry, metric
+    ``outcome="unavailable"``).
+    """
+
+    def __init__(self, tenant_id: str, missing_providers: list[str]) -> None:
+        self.tenant_id = tenant_id
+        self.missing_providers = list(missing_providers)
+        super().__init__(
+            f"Tenant {tenant_id!r} has no LLM provider configured "
+            f"(missing one of: {list(missing_providers)})"
+        )
+
+
+__all__ = [
+    "AttemptRecord",
+    "FallbackChainExhausted",
+    "InvalidRequest",
+    "OutputInvalid",
+    "ProviderUnavailable",
+    "RateLimited",
+    "TenantLlmNotConfigured",
+]
