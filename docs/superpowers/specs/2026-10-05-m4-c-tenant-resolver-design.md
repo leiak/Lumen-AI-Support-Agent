@@ -45,6 +45,10 @@ These were confirmed during brainstorming and are baked into the design below. F
 - **Per-tenant token budget / spend caps** — M4.D.
 - **Dynamic key rotation** — key rotation requires service restart + re-encrypt of all rows. See tech debt #2.
 
+## 3. Background
+
+M4.A's resolver seam is the natural integration point: each `LLMClient` already receives a `tenant_id` (opaque string used for usage attribution). M4.B added a chain orchestrator on top of the same seam. M4.C adds **per-tenant provider configuration**: a `TenantResolver` that, given `tenant_id`, looks up that tenant's enabled API keys, decrypts them, builds a tenant-private `LLMGateway`, and exposes its default resolver. The seam contract is preserved — `TenantResolver` implements the same `Resolver` + optional `ainvoke` shape.
+
 ## 4. Architecture
 
 ```
@@ -246,6 +250,9 @@ GET /admin/tenants/{tenant_id}/llm-configs
 - `ainvoke(req)` delegates to the inner `FallbackResolver.ainvoke` if the tenant's chain has ≥ 2 steps; otherwise runs the prefix-routed provider directly. This keeps M4.B's `LLMClient.hasattr(resolver, "ainvoke")` branch working.
 
 ```python
+class _NoChainConfigured(Exception):
+    """Sentinel: tenant has only one provider, no fallback chain."""
+
 class TenantResolver:
     def __init__(self, *, gateway: LLMGateway) -> None:
         self._gateway = gateway
@@ -257,11 +264,12 @@ class TenantResolver:
     async def ainvoke(self, request: "ChatRequest") -> "ChatResponse":
         if hasattr(self._delegate, "ainvoke"):
             return await self._delegate.ainvoke(request)
-        # Single-provider tenant — no chain. Fall through to LLMClient's retry loop.
-        raise _NoChainConfigured()  # LLMClient falls back to sync path
+        # Single-provider tenant — no chain. Signal LLMClient to fall back
+        # to its own retry loop (which still works on this single provider).
+        raise _NoChainConfigured()
 ```
 
-`_NoChainConfigured` is a sentinel caught by `LLMClient.chat()` to fall back to its own retry loop (so the metric path stays identical). This keeps the contract clean: `TenantResolver` always exposes `ainvoke`; the body decides whether to delegate to a chain or hand control back to the client.
+`_NoChainConfigured` is a private sentinel (in `tenant_resolver.py`) caught by `LLMClient.chat()` to fall back to its own retry loop (so the metric path stays identical). This keeps the contract clean: `TenantResolver` always exposes `ainvoke`; the body decides whether to delegate to a chain or hand control back to the client.
 
 ### 8.2 Cache semantics
 
@@ -314,21 +322,15 @@ Demo / staging seeding: admins use the admin API to seed `tenant_llm_configs` fo
 
 ### 8.5 Metric behavior
 
-`TenantLlmNotConfigured` extends `ProviderUnavailable`, so `LLMClient.chat()` records:
+`TenantLlmNotConfigured` extends `ProviderUnavailable`, so `LLMClient.chat()` records the call with `route_mode="auto"` (because `TenantResolver` is neither a `PinnedResolver` nor a `FallbackResolver`) and `outcome="unavailable"`, `provider="<unknown>"`. The standard failure path already captures the resolution failure at the call-site level.
+
+For dedicated observability of "tenant not configured" (a misconfiguration rather than a transient failure), add a separate zero-label counter:
 
 ```
-LLM_CALLS_TOTAL{provider="<unknown>", model=<req.model>, route_mode="<tenant_not_configured>", outcome="unavailable"}.inc()
+LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL.inc()
 ```
 
-Wait, `route_mode` must be one of the existing constants. The `_route_mode_for()` function will return `auto` (because `TenantResolver` isn't a `PinnedResolver` / `FallbackResolver`). The exception is raised outside the chat loop, so we add a dedicated metric:
-
-```
-LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL{tenant_id=<id>, missing_providers_csv="anthropic,openai"}.inc()
-```
-
-Cardinality concern: `tenant_id` label would explode if there are many. **Hold** — use no label, just count (or `tenant_id` only at higher aggregation). Decision: **omit `tenant_id` label**; instead, log the tenant_id at WARNING with the event `llm_client.tenant_llm_not_configured`. Cardinality stays bounded.
-
-**Decision**: `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` counter with **no labels** (one series). PII discipline preserved (tenant_id in logs only).
+**Why no labels**: `tenant_id` as a label would explode cardinality for tenants-with-many-keys configurations and risk PII leakage via metric scraping. One series (the total count) is enough for ops alerting; tenant_id is logged at WARNING with event `llm_client.tenant_llm_not_configured` (provider name + tenant_id only, no key material).
 
 ### 8.6 Interaction with M4.B fallback chain
 
