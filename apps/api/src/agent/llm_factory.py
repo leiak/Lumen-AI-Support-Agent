@@ -1,17 +1,26 @@
 """Default LLMClient factory — builds tenant-scoped LLMClient instances
-backed by a per-tenant LLMGateway via BYOK config (M4.C).
+backed by a per-tenant LLMGateway via BYOK config (M4.C), optionally
+composed with a :class:`BudgetResolver` (M4.D) when the tenant has a
+``tenant_budgets`` row.
 
-Each tenant's provider keys are read from ``tenant_llm_configs``
-(Fernet-encrypted, see :class:`TenantLLMConfigCipher`), decrypted, and
-cached in-process. The cache absorbs the per-request DB + decrypt cost
-after the first call. Tenants with zero enabled providers raise
-:class:`TenantLlmNotConfigured` — strict mode, no silent fallback to
-the project-wide keys.
+Order of composition when budget is configured:
+    LLMClient → BudgetResolver → TenantResolver → FallbackResolver → Provider
 
-See M4.C spec §7 (data flow) and §8.4 (strict-mode boundary).
+Tenants without a ``tenant_budgets`` row are NOT wrapped — M4.D is
+opt-in per tenant. Existing M4.C strict-mode behavior
+(:class:`TenantLlmNotConfigured`) is preserved.
+
+PII discipline: error paths carry opaque IDs (``tenant_id``) and
+counters; never message content or API keys.
 """
 from __future__ import annotations
 
+from budget.cache import TenantBudgetSnapshotCache
+from budget.repository import (
+    TenantBudgetRepository,
+    TenantBudgetSnapshotRepository,
+)
+from budget.resolver import BudgetResolver
 from core.business_metrics import LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL
 from core.config import get_settings
 from llm_client.client import LLMClient
@@ -25,10 +34,12 @@ from llm_client.tenant_resolver import (
 from llm_client.usage import UsageRecorder
 
 
-# Module-level singleton cache (per process). Tests reset this via
-# ``agent.llm_factory._tenant_cache = None`` when they need a fresh
-# cipher (e.g. after monkeypatching ``TENANT_LLM_FERNET_KEY``).
+# Module-level singletons (per process). Tests reset via
+# ``agent.llm_factory._tenant_cache = None`` or
+# ``agent.llm_factory._budget_snapshot_cache = None`` when they need a
+# fresh cipher / cache (e.g. after monkeypatching env).
 _tenant_cache: TenantLLMConfigCache | None = None
+_budget_snapshot_cache: TenantBudgetSnapshotCache | None = None
 
 
 def _build_tenant_cache() -> TenantLLMConfigCache:
@@ -54,23 +65,43 @@ def _build_tenant_cache() -> TenantLLMConfigCache:
     return _tenant_cache
 
 
-async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
-    """Build a per-tenant ``LLMClient`` via the :class:`TenantResolver`.
+def _build_budget_snapshot_cache() -> TenantBudgetSnapshotCache:
+    """Construct the per-process ``TenantBudgetSnapshotCache`` singleton.
 
-    Strict mode: tenants with no enabled configs raise
-    :class:`TenantLlmNotConfigured` immediately at factory time — the
-    caller (API endpoint) catches and returns a 503-style response.
+    Mirrors :func:`_build_tenant_cache`. Reads TTL / maxsize from
+    settings (``tenant_budget_cache_*``); the cache absorbs the
+    per-request ``SUM(llm_usage)`` cost on cache miss (Task 2).
+    """
+    global _budget_snapshot_cache
+    if _budget_snapshot_cache is None:
+        settings = get_settings()
+        _budget_snapshot_cache = TenantBudgetSnapshotCache(
+            ttl_s=settings.tenant_budget_cache_ttl_s,
+            maxsize=settings.tenant_budget_cache_maxsize,
+            repo=TenantBudgetSnapshotRepository(),
+        )
+    return _budget_snapshot_cache
+
+
+async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
+    """Build a per-tenant ``LLMClient`` via ``TenantResolver`` (+ ``BudgetResolver`` if configured).
+
+    M4.C strict mode: tenants with no enabled provider configs raise
+    :class:`TenantLlmNotConfigured` immediately at factory time.
+
+    M4.D opt-in: tenants with a ``tenant_budgets`` row get their
+    resolver wrapped with :class:`BudgetResolver`; no row = no
+    enforcement (preserves existing M4.C behavior).
 
     Args:
-        tenant_id: opaque tenant identifier; must exist in ``tenants``
-            table.
+        tenant_id: opaque tenant identifier; must exist in ``tenants``.
 
     Raises:
         TenantLlmNotConfigured: tenant has zero enabled provider configs.
     """
-    cache = _build_tenant_cache()
+    tenant_cache = _build_tenant_cache()
     try:
-        resolver = await build_tenant_resolver(tenant_id, cache=cache)
+        inner_resolver = await build_tenant_resolver(tenant_id, cache=tenant_cache)
     except TenantLlmNotConfigured:
         # Strict-mode rejection — surface to ops via the zero-label
         # counter. Spec §8.5 deliberately omits ``tenant_id`` from the
@@ -79,6 +110,18 @@ async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
         # the tenant_id for ops triage.
         LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL.inc()
         raise
+
+    # M4.D opt-in: wrap with BudgetResolver only when a budget row exists.
+    budget = await TenantBudgetRepository().get_by_tenant(tenant_id)
+    resolver = inner_resolver
+    if budget is not None:
+        resolver = BudgetResolver(
+            inner=inner_resolver,
+            tenant_id=tenant_id,
+            budget=budget,
+            snapshot_cache=_build_budget_snapshot_cache(),
+        )
+
     return LLMClient(
         provider_resolver=resolver,
         tenant_id=tenant_id,
@@ -101,6 +144,7 @@ def _resolve_default_model() -> str:
 
 
 __all__ = [
+    "_build_budget_snapshot_cache",
     "_build_tenant_cache",
     "_default_llm_client_factory",
     "_resolve_default_model",

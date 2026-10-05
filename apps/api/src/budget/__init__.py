@@ -1,15 +1,21 @@
 """Budget layer (M4.D): per-tenant monthly token hard-cap enforcement.
 
-This package ships the ORM models in Task 1. Task 2 adds the repository
-+ LRU+TTL cache. Task 3 adds the BudgetResolver + factory wiring. Task 4
-adds the admin API. See ``docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design``.
+Public surface:
+- :class:`TenantBudget` + :class:`TenantBudgetSnapshot` — ORM models.
+- :class:`TenantBudgetRepository` + :class:`TenantBudgetSnapshotRepository` — CRUD + refresh.
+- :class:`TenantBudgetSnapshotCache` — in-process LRU + TTL cache.
+- :class:`BudgetResolver` — pre-check + post-record wrapper.
 """
+from budget.cache import TenantBudgetSnapshotCache
 from budget.models import TenantBudget, TenantBudgetSnapshot
 from budget.repository import TenantBudgetRepository, TenantBudgetSnapshotRepository
+from budget.resolver import BudgetResolver
 
 __all__ = [
+    "BudgetResolver",
     "TenantBudget",
-    "TenantBudgetSnapshot",
     "TenantBudgetRepository",
+    "TenantBudgetSnapshot",
+    "TenantBudgetSnapshotCache",
     "TenantBudgetSnapshotRepository",
 ]

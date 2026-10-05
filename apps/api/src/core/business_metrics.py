@@ -87,6 +87,19 @@ LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL = Counter(
     "Number of LLM calls rejected because the tenant has no enabled provider configs.",
 )
 
+# M4.D — Tenant budget enforcement counters (zero-label by design).
+# tenant_id stays in log lines only to keep cardinality bounded and
+# avoid PII leakage via metric scraping. Mirrors the M4.C discipline
+# for LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL.
+LLM_TENANT_BUDGET_EXCEEDED_TOTAL = Counter(
+    "lumen_llm_tenant_budget_exceeded_total",
+    "Number of LLM calls rejected because the tenant reached its monthly hard cap.",
+)
+LLM_TENANT_BUDGET_SOFT_WARN_TOTAL = Counter(
+    "lumen_llm_tenant_budget_soft_warn_total",
+    "Number of soft-warn events fired when a tenant crossed soft_warn_tokens.",
+)
+
 
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
@@ -137,6 +150,8 @@ LUMEN_QA_SCORE_LATENCY = Histogram(
 __all__ = [
     "LLM_CALLS_TOTAL",
     "LLM_FALLBACK_ATTEMPTS_TOTAL",
+    "LLM_TENANT_BUDGET_EXCEEDED_TOTAL",
+    "LLM_TENANT_BUDGET_SOFT_WARN_TOTAL",
     "LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL",
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",

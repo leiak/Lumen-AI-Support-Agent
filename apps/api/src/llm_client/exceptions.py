@@ -2,6 +2,7 @@
 
 All providers raise these — callers should be able to handle them uniformly.
 """
+from datetime import datetime
 from typing import NamedTuple
 
 
@@ -103,6 +104,36 @@ class TenantLlmNotConfigured(ProviderUnavailable):
         )
 
 
+class TenantBudgetExceeded(ProviderUnavailable):
+    """Raised when a tenant's monthly token hard cap has been reached.
+
+    Extends :class:`ProviderUnavailable` so callers catching
+    ProviderUnavailable get this for free. Carries ``tenant_id``,
+    ``period``, ``tokens_used``, ``hard_cap_tokens``, and
+    ``period_starts_at`` for diagnostics — admin / API layer surfaces
+    these as a 429-style response with structured body.
+    """
+
+    def __init__(
+        self,
+        *,
+        tenant_id: str,
+        period: str,
+        tokens_used: int,
+        hard_cap_tokens: int,
+        period_starts_at: datetime,
+    ) -> None:
+        self.tenant_id = tenant_id
+        self.period = period
+        self.tokens_used = tokens_used
+        self.hard_cap_tokens = hard_cap_tokens
+        self.period_starts_at = period_starts_at
+        super().__init__(
+            f"Tenant {tenant_id!r} has reached its monthly token hard cap "
+            f"({tokens_used} >= {hard_cap_tokens}) for period {period}"
+        )
+
+
 __all__ = [
     "AttemptRecord",
     "FallbackChainExhausted",
@@ -110,5 +141,6 @@ __all__ = [
     "OutputInvalid",
     "ProviderUnavailable",
     "RateLimited",
+    "TenantBudgetExceeded",
     "TenantLlmNotConfigured",
 ]
