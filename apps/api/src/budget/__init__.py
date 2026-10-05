@@ -5,8 +5,11 @@ This package ships the ORM models in Task 1. Task 2 adds the repository
 adds the admin API. See ``docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design``.
 """
 from budget.models import TenantBudget, TenantBudgetSnapshot
+from budget.repository import TenantBudgetRepository, TenantBudgetSnapshotRepository
 
 __all__ = [
     "TenantBudget",
     "TenantBudgetSnapshot",
+    "TenantBudgetRepository",
+    "TenantBudgetSnapshotRepository",
 ]
