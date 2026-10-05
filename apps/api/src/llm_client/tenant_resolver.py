@@ -41,13 +41,18 @@ if TYPE_CHECKING:
 
 
 class _NoChainConfigured(Exception):
-    """Private sentinel: tenant has a single provider, no fallback chain.
+    """Internal-but-exported sentinel: tenant has a single provider, no fallback chain.
 
     :meth:`TenantResolver.ainvoke` raises when the inner resolver is a
     ``_PrefixResolver`` (single-provider tenants) instead of a
     ``FallbackResolver``. ``LLMClient`` catches this and falls back to
     its own retry loop on the primary provider so the metric path
     stays identical to M4.A.
+
+    The leading underscore signals module-private, but the class is
+    re-exported in ``__all__`` so :class:`LLMClient` can catch it
+    without re-defining the sentinel. This is intentional cross-module
+    coupling per spec §8.1 — :class:`LLMClient` is the only consumer.
     """
 
 

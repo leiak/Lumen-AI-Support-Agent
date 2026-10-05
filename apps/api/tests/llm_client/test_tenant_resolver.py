@@ -73,8 +73,10 @@ def test_cache_lru_evicts_oldest() -> None:
     cache.get_or_load("t1")
     cache.get_or_load("t2")
     cache.get_or_load("t3")  # t0 evicted
-    assert cache.get("t0") is None  # evicted
-    assert cache.get("t3") == cache.get("t2") or cache.get("t3") is not None
+    assert cache.get("t0") is None  # evicted (oldest)
+    assert cache.get("t1") is not None  # still cached
+    assert cache.get("t2") is not None  # still cached
+    assert cache.get("t3") is not None  # just inserted
 
 
 def test_raises_when_no_enabled_providers() -> None:
