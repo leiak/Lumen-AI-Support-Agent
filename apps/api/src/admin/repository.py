@@ -20,15 +20,25 @@ The admin layer adds two layers of safety on top of the low-level
 The admin repository never returns the decrypted key; that contract
 is enforced by :class:`admin.schemas.tenant_llm_config.TenantLLMConfigRead`,
 which carries no key fields at all.
+
+M4.D Task 4 — admin budget config repository.
+
+:class:`AdminTenantBudgetRepository` mirrors the same tenant-existence
+check pattern. Budget config carries no secrets, so there is no
+encryption layer — just the existence check + delegation to the inner
+:class:`TenantBudgetRepository`.
 """
 from __future__ import annotations
 
+from budget.models import TenantBudget
+from budget.repository import TenantBudgetRepository
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import (
     TenantLLMConfig,
     TenantLLMConfigRepository,
 )
 
+from admin.schemas.budget import TenantBudgetCreate
 from admin.schemas.tenant_llm_config import TenantLLMConfigCreate
 from core.config import get_settings
 from tenant.repository import TenantRepository
@@ -85,4 +95,49 @@ class AdminTenantLLMConfigRepository:
         return await self._inner.list_by_tenant(tenant_id, enabled_only=False)
 
 
-__all__ = ["AdminTenantLLMConfigRepository"]
+class AdminTenantBudgetRepository:
+    """Admin-facing wrapper around :class:`TenantBudgetRepository`.
+
+    Mirrors :class:`AdminTenantLLMConfigRepository`'s tenant-existence
+    check + delegation pattern. No encryption layer — budget config
+    carries no secrets (just token counts + an IANA timezone string).
+    """
+
+    def __init__(self) -> None:
+        self._inner = TenantBudgetRepository()
+        self._tenants = TenantRepository()
+
+    async def upsert(
+        self, *, tenant_id: str, payload: TenantBudgetCreate,
+    ) -> TenantBudget:
+        """Upsert a tenant's budget config.
+
+        Raises:
+            ValueError: tenant does not exist. Caller (API layer)
+                translates to ``HTTPException(404)``. Anti-enumeration:
+                the same 404 is returned whether the tenant doesn't
+                exist OR the tenant exists but the caller can't see it.
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.upsert(
+            tenant_id=tenant_id,
+            soft_warn_tokens=payload.soft_warn_tokens,
+            hard_cap_tokens=payload.hard_cap_tokens,
+            period_anchor_tz=payload.period_anchor_tz,
+        )
+
+    async def get(self, tenant_id: str) -> TenantBudget | None:
+        """Return the budget row for a tenant (or ``None`` if not set).
+
+        Raises:
+            ValueError: tenant does not exist (see :meth:`upsert`).
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.get_by_tenant(tenant_id)
+
+
+__all__ = ["AdminTenantBudgetRepository", "AdminTenantLLMConfigRepository"]

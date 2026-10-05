@@ -54,11 +54,21 @@ from knowledge.models import (
     KnowledgeBase,
 )
 
-from admin.repository import AdminTenantLLMConfigRepository
+from admin.repository import (
+    AdminTenantBudgetRepository,
+    AdminTenantLLMConfigRepository,
+)
+from admin.schemas.budget import (
+    TenantBudgetCreate,
+    TenantBudgetRead,
+    TenantBudgetUsageRead,
+)
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
 )
+from budget.repository import TenantBudgetSnapshotRepository
+from budget.resolver import _current_period
 
 logger = logging.getLogger(__name__)
 
@@ -483,6 +493,136 @@ async def list_tenant_llm_configs(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# M4.D Task 4 — Tenant budget (per-tenant monthly token hard cap) admin endpoints.
+#
+# POST /api/v1/admin/tenants/{tenant_id}/budget
+#   upsert the budget config (soft_warn + hard_cap + period_anchor_tz);
+#   no secrets, no encryption.
+#
+# GET /api/v1/admin/tenants/{tenant_id}/budget
+#   read the current config; 404 if not yet configured.
+#
+# GET /api/v1/admin/tenants/{tenant_id}/budget/usage
+#   live snapshot of current-period tokens_used (computed against
+#   tenant_budget_snapshots, refreshed on cache miss via SUM(llm_usage)).
+#
+# Tenant-existence check lives in AdminTenantBudgetRepository —
+# 404 is returned for unknown tenant_ids, matching the M4.C
+# anti-enumeration pattern.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tenants/{tenant_id}/budget",
+    response_model=TenantBudgetRead,
+    status_code=201,
+)
+async def create_or_update_tenant_budget(
+    tenant_id: str,
+    payload: TenantBudgetCreate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantBudgetRead:
+    """Upsert a tenant's monthly token budget config.
+
+    Auth: requires admin JWT (per spec §7.2). Cross-tenant access
+    returns 404 (anti-enumeration) — mirrors M4.C llm-configs + kb-drafts
+    pattern.
+
+    Status codes
+    ------------
+    * 201 — created or updated.
+    * 401 — missing / invalid bearer token (raised by require_admin).
+    * 403 — token is not admin / owner role (raised by require_admin).
+    * 404 — tenant does not exist OR claims['tenant_id'] != path
+      ``tenant_id`` (anti-enumeration — same code either way).
+    * 422 — token counts negative or ``period_anchor_tz`` too long
+      (Pydantic validation).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: don't reveal that the target tenant exists
+        # to an admin of a different tenant. Same response as a real
+        # unknown tenant — see the ``ValueError`` branch below.
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        row = await AdminTenantBudgetRepository().upsert(
+            tenant_id=tenant_id, payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return TenantBudgetRead(
+        soft_warn_tokens=row.soft_warn_tokens,
+        hard_cap_tokens=row.hard_cap_tokens,
+        period_anchor_tz=row.period_anchor_tz,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get(
+    "/tenants/{tenant_id}/budget",
+    response_model=TenantBudgetRead,
+)
+async def get_tenant_budget(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantBudgetRead:
+    """Read a tenant's current budget config. 404 if not configured.
+
+    Auth: requires admin JWT. Cross-tenant access returns 404
+    (anti-enumeration) — mirrors M4.C pattern.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        row = await AdminTenantBudgetRepository().get(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    if row is None:
+        raise HTTPException(status_code=404, detail="not configured")
+    return TenantBudgetRead(
+        soft_warn_tokens=row.soft_warn_tokens,
+        hard_cap_tokens=row.hard_cap_tokens,
+        period_anchor_tz=row.period_anchor_tz,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get(
+    "/tenants/{tenant_id}/budget/usage",
+    response_model=TenantBudgetUsageRead,
+)
+async def get_tenant_budget_usage(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantBudgetUsageRead:
+    """Read the current period's token usage snapshot for a tenant.
+
+    On cache miss the snapshot is refreshed from ``llm_usage`` via
+    ``SUM(prompt_tokens + completion_tokens)`` for the period. Works
+    even when the tenant has no budget row yet (returns ``None`` for
+    soft_warn_tokens / hard_cap_tokens).
+
+    Auth: requires admin JWT. Cross-tenant access returns 404
+    (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    budget = await AdminTenantBudgetRepository().get(tenant_id=tenant_id)
+    period, period_start = _current_period(
+        budget.period_anchor_tz if budget else "UTC"
+    )
+    snap = await TenantBudgetSnapshotRepository().refresh(
+        tenant_id=tenant_id, period=period, period_starts_at=period_start,
+    )
+    return TenantBudgetUsageRead(
+        period=snap.period,
+        tokens_used=snap.tokens_used,
+        soft_warn_tokens=budget.soft_warn_tokens if budget else None,
+        hard_cap_tokens=budget.hard_cap_tokens if budget else None,
+        period_starts_at=period_start,
+    )
 
 
 __all__ = ["router"]
