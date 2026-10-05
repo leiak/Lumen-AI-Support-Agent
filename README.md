@@ -33,6 +33,7 @@
 | 20 | M3 — 5 个生产级技术债 (#17 admin JWT auth / #18 PDF text indexing / #16 SES tenant reverse-lookup / #19 multi-vision adapter / #20 admin SPA UI) | ✅ | 17 admin + 9 vision_embedder + 13 web vitest + 4 PDF retrieve |
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
 | 22 (M4.B) | LLM Gateway Fallback Resolver — chain-based failover on M4.A resolver seam (`FallbackResolver.ainvoke` + `FallbackChainExhausted(attempts)` + per-step `lumen_llm_fallback_attempts_total{provider,model,step,outcome}` + env-driven `LLM_FALLBACK_CHAIN`) | ✅ | 10 resolver + 5 client branch + 12 gateway/env + 6 factory + e2e + 3 regression |
+| 23 (M4.C) | LLM Gateway Tenant Resolver (BYOK) — per-tenant provider API keys (Fernet at rest + LRU/TTL cache + admin POST/GET endpoints + strict-mode `TenantLlmNotConfigured` + `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` zero-label counter) | ✅ | 4 cipher + 5 ORM + 9 resolver + 7 factory + 9 admin + 3 e2e |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -342,6 +343,35 @@ See [[m4-b-progress]] for full scope.
 
 29. **Spec §6.3 outcome vocabulary drift** — spec 列了 5 个 outcome (`success/provider_unavailable/output_invalid/rate_limited/timeout`);实现加了第 6 个 `other` 作为未映射异常类的 catch-all (defensive cardinality bound)。Spec 表需要更新;没有行为变更。(From Task 4 code quality Minor M2。)
 30. **Plan-level metric verification gap** — spec §7.2 #1 要求验证 `step=1` counter + `route_mode="fallback"`;spec §7.2 #3 要求验证 `lumen_llm_fallback_attempts_total{outcome="provider_unavailable"} ×2`。Plan Step 4.4 测试代码未包含;实现正确,如需显式 metric assertion 是 follow-up。(From Task 4 spec reviewer。)
+
+### M4.C — Tenant Resolver (BYOK)
+
+Per-tenant provider API keys (BYOK), encrypted at rest with Fernet,
+cached with in-process LRU + TTL. See
+`docs/superpowers/specs/2026-10-05-m4-c-tenant-resolver-design`.
+
+| Component | Status |
+|---|---|
+| `TenantLLMConfigCipher` (Fernet) | shipped |
+| `tenant_llm_configs` table + repo | shipped |
+| `TenantResolver` (LRU + TTL cache) | shipped |
+| `_default_llm_client_factory` async + strict mode | shipped |
+| `POST /admin/tenants/{id}/llm-configs` + `GET` | shipped |
+| `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` metric | shipped |
+
+#### M4.C known tech debt
+
+1. **No explicit cache invalidation on admin write** — admin POSTs do not
+   invalidate; operators see propagation within ≤ 60s (TTL window).
+   Follow-up: add Redis pub/sub (`admin.channel:tenant_llm_changed`).
+2. **Fernet key rotation** — master key is loaded once at startup.
+   Rotation requires (a) restart, (b) re-encrypt every row, (c) update env.
+   No zero-downtime rotation.
+3. **No audit log** — `tenant_llm_configs` updates are silent.
+4. **No per-tenant fallback chain** — chain is project-wide.
+5. **`enabled=FALSE` semantics** — currently "skip in resolver".
+6. **No per-tenant model override** — model is project-default per provider.
+7. **Demo / staging seeding** — demo tenant must be seeded via admin API.
 
 
 ## 仓库信息
