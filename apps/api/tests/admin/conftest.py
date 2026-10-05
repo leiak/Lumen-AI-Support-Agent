@@ -10,9 +10,17 @@ The ``admin/api.py`` module mounts under ``/api/v1/admin`` on the
 main app — we deliberately wire the FULL app (rather than a
 sliced admin-only FastAPI) so the routes are tested in the same code
 path as the real deployment.
+
+M4.C Task 4 — ``TENANT_LLM_FERNET_KEY`` is required by the
+``AdminTenantLLMConfigRepository`` (the Fernet cipher raises at
+construct time if missing). The autouse ``_ensure_fernet_key``
+fixture sets a fresh test key BEFORE ``get_settings()`` is
+instantiated so the cached singleton carries it. ``reset_settings``
+forces re-instantiation when the env changes.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -20,6 +28,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from auth.jwt import create_access_token
+from cryptography.fernet import Fernet
+from core.config import reset_settings
 from core.database import get_session, get_sessionmaker, reset_engine, reset_sessionmaker
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
@@ -34,6 +44,19 @@ def _reset_db_singletons() -> None:
     yield
     reset_engine()
     reset_sessionmaker()
+
+
+@pytest.fixture(autouse=True)
+def _ensure_fernet_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make sure ``TENANT_LLM_FERNET_KEY`` is set + ``get_settings()`` re-reads.
+
+    Autouse so admin API tests that instantiate
+    :class:`AdminTenantLLMConfigRepository` (M4.C Task 4) don't blow
+    up at cipher construction time when ``.env`` doesn't carry the
+    key. Sets a freshly generated key per test for isolation.
+    """
+    monkeypatch.setenv("TENANT_LLM_FERNET_KEY", Fernet.generate_key().decode())
+    reset_settings()
 
 
 @pytest.fixture

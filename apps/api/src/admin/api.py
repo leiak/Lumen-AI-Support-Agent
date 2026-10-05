@@ -54,6 +54,12 @@ from knowledge.models import (
     KnowledgeBase,
 )
 
+from admin.repository import AdminTenantLLMConfigRepository
+from admin.schemas.tenant_llm_config import (
+    TenantLLMConfigCreate,
+    TenantLLMConfigRead,
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
@@ -363,6 +369,98 @@ async def reject_kb_draft(
         },
     )
     return {"draft_id": draft_id, "status": "REJECTED"}
+
+
+# ---------------------------------------------------------------------------
+# M4.C Task 4 — Tenant LLM config (BYOK) admin endpoints.
+#
+# POST /api/v1/admin/tenants/{tenant_id}/llm-configs
+#   upsert (encrypts the plaintext API key with Fernet before storage;
+#   response NEVER includes the decrypted key or the ciphertext)
+#
+# GET /api/v1/admin/tenants/{tenant_id}/llm-configs
+#   list providers (provider_name + base_url + enabled + timestamps);
+#   response NEVER includes key fields
+#
+# Tenant-existence check lives in AdminTenantLLMConfigRepository —
+# 404 is returned for unknown tenant_ids, matching the anti-enumeration
+# pattern used by the kb-drafts endpoints above.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tenants/{tenant_id}/llm-configs",
+    response_model=TenantLLMConfigRead,
+    status_code=201,
+)
+async def create_or_update_tenant_llm_config(
+    tenant_id: str,
+    payload: TenantLLMConfigCreate,
+) -> TenantLLMConfigRead:
+    """Upsert a tenant's LLM provider config (M4.C BYOK).
+
+    The plaintext ``api_key`` is encrypted at rest with Fernet (master
+    key from ``TENANT_LLM_FERNET_KEY``). The response NEVER includes
+    the key — neither the plaintext nor the ciphertext — so a leaked
+    API response cannot be replayed against the production LLM
+    provider even if the master key is later compromised.
+
+    Status codes
+    ------------
+    * 201 — created or updated.
+    * 404 — tenant does not exist (anti-enumeration).
+    * 422 — ``provider_name`` not in the allowlist, ``api_key`` empty
+      / too long, or ``base_url`` too long. Pydantic's response
+      detail does NOT echo the plaintext key.
+    """
+    try:
+        row = await AdminTenantLLMConfigRepository().upsert(
+            tenant_id=tenant_id, payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return TenantLLMConfigRead(
+        provider_name=row.provider_name,
+        base_url=row.base_url,
+        enabled=row.enabled,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get(
+    "/tenants/{tenant_id}/llm-configs",
+    response_model=list[TenantLLMConfigRead],
+)
+async def list_tenant_llm_configs(
+    tenant_id: str,
+) -> list[TenantLLMConfigRead]:
+    """List a tenant's LLM provider configs.
+
+    Returns ``provider_name`` + ``base_url`` + ``enabled`` +
+    ``created_at`` + ``updated_at`` only. The encrypted API key is
+    NEVER included in the response — even ciphertext leaks would
+    weaken the encryption story if the master key later leaked.
+
+    Status codes
+    ------------
+    * 200 — list (possibly empty) of configs.
+    * 404 — tenant does not exist (anti-enumeration).
+    """
+    try:
+        rows = await AdminTenantLLMConfigRepository().list(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return [
+        TenantLLMConfigRead(
+            provider_name=r.provider_name,
+            base_url=r.base_url,
+            enabled=r.enabled,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
 
 
 __all__ = ["router"]
