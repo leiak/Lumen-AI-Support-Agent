@@ -124,6 +124,26 @@ class Settings(BaseSettings):
         default=None, alias="LLM_FALLBACK_ATTEMPT_TIMEOUT_S"
     )
 
+    # M4.C — Tenant BYOK. ``tenant_llm_fernet_key`` is required at
+    # startup; the cipher raises RuntimeError if missing. Generate with:
+    # ``python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'``
+    #
+    # ``tenant_llm_cache_ttl_s`` controls the in-process LRU cache TTL
+    # (per spec §8.2). 60s amortizes the per-tenant DB + decrypt cost
+    # over the typical chat workload while bounding config-staleness.
+    #
+    # ``tenant_llm_cache_maxsize`` caps the LRU eviction. With ~1KB per
+    # cached resolver, 1024 entries ≈ 1MB worst case.
+    tenant_llm_fernet_key: str | None = Field(
+        default=None, alias="TENANT_LLM_FERNET_KEY"
+    )
+    tenant_llm_cache_ttl_s: float = Field(
+        default=60.0, alias="TENANT_LLM_CACHE_TTL_S"
+    )
+    tenant_llm_cache_maxsize: int = Field(
+        default=1024, alias="TENANT_LLM_CACHE_MAXSIZE"
+    )
+
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
     # ``qa_judge_model`` default is a placeholder (the M2.B rollout will
