@@ -17,7 +17,7 @@ Every query carries ``tenant_id`` — cross-tenant access returns
 draft IDs across tenants cannot distinguish "exists but yours"
 from "doesn't exist".
 
-Tech debt #17 — JWT auth on all 4 admin endpoints (in progress):
+Tech debt #17 — JWT auth on all 6 admin endpoints (M4.C Task 4 review):
 ``tenant_id`` is derived from ``claims["tenant_id"]`` (via
 ``Depends(require_admin)``); ``reviewer_id`` from ``claims["sub"]``.
 Cross-tenant access returns 404 (anti-enumeration parity with M1).
@@ -396,6 +396,7 @@ async def reject_kb_draft(
 async def create_or_update_tenant_llm_config(
     tenant_id: str,
     payload: TenantLLMConfigCreate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
 ) -> TenantLLMConfigRead:
     """Upsert a tenant's LLM provider config (M4.C BYOK).
 
@@ -405,14 +406,25 @@ async def create_or_update_tenant_llm_config(
     API response cannot be replayed against the production LLM
     provider even if the master key is later compromised.
 
+    Auth: requires admin JWT (per spec §7.2). Cross-tenant access
+    returns 404 (anti-enumeration) — mirrors kb-drafts pattern.
+
     Status codes
     ------------
     * 201 — created or updated.
-    * 404 — tenant does not exist (anti-enumeration).
+    * 401 — missing / invalid bearer token (raised by require_admin).
+    * 403 — token is not admin / owner role (raised by require_admin).
+    * 404 — tenant does not exist OR claims['tenant_id'] != path
+      ``tenant_id`` (anti-enumeration — same code either way).
     * 422 — ``provider_name`` not in the allowlist, ``api_key`` empty
       / too long, or ``base_url`` too long. Pydantic's response
       detail does NOT echo the plaintext key.
     """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: don't reveal that the target tenant exists
+        # to an admin of a different tenant. Same response as a real
+        # unknown tenant — see the ``ValueError`` branch below.
+        raise HTTPException(status_code=404, detail="not found")
     try:
         row = await AdminTenantLLMConfigRepository().upsert(
             tenant_id=tenant_id, payload=payload,
@@ -434,6 +446,7 @@ async def create_or_update_tenant_llm_config(
 )
 async def list_tenant_llm_configs(
     tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
 ) -> list[TenantLLMConfigRead]:
     """List a tenant's LLM provider configs.
 
@@ -442,11 +455,20 @@ async def list_tenant_llm_configs(
     NEVER included in the response — even ciphertext leaks would
     weaken the encryption story if the master key later leaked.
 
+    Auth: requires admin JWT (per spec §7.2). Cross-tenant access
+    returns 404 (anti-enumeration) — mirrors kb-drafts pattern.
+
     Status codes
     ------------
     * 200 — list (possibly empty) of configs.
-    * 404 — tenant does not exist (anti-enumeration).
+    * 401 — missing / invalid bearer token (raised by require_admin).
+    * 403 — token is not admin / owner role (raised by require_admin).
+    * 404 — tenant does not exist OR claims['tenant_id'] != path
+      ``tenant_id`` (anti-enumeration — same code either way).
     """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: same rationale as POST above.
+        raise HTTPException(status_code=404, detail="not found")
     try:
         rows = await AdminTenantLLMConfigRepository().list(tenant_id=tenant_id)
     except ValueError as e:
