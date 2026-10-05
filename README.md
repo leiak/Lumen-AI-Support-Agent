@@ -34,6 +34,7 @@
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
 | 22 (M4.B) | LLM Gateway Fallback Resolver — chain-based failover on M4.A resolver seam (`FallbackResolver.ainvoke` + `FallbackChainExhausted(attempts)` + per-step `lumen_llm_fallback_attempts_total{provider,model,step,outcome}` + env-driven `LLM_FALLBACK_CHAIN`) | ✅ | 10 resolver + 5 client branch + 12 gateway/env + 6 factory + e2e + 3 regression |
 | 23 (M4.C) | LLM Gateway Tenant Resolver (BYOK) — per-tenant provider API keys (Fernet at rest + LRU/TTL cache + admin POST/GET endpoints + strict-mode `TenantLlmNotConfigured` + `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` zero-label counter) | ✅ | 4 cipher + 5 ORM + 9 resolver + 7 factory + 9 admin + 3 e2e |
+| 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -372,6 +373,34 @@ cached with in-process LRU + TTL. See
 5. **`enabled=FALSE` semantics** — currently "skip in resolver".
 6. **No per-tenant model override** — model is project-default per provider.
 7. **Demo / staging seeding** — demo tenant must be seeded via admin API.
+
+### M4.D — Budget Layer
+
+Per-tenant monthly token hard-cap enforcement. `BudgetResolver` wraps the
+M4.C `TenantResolver` to reject calls that would exceed the configured
+monthly cap. See `docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design`.
+
+| Component | Status |
+|---|---|
+| `tenant_budgets` + `tenant_budget_snapshots` tables | shipped |
+| `TenantBudgetRepository` + `TenantBudgetSnapshotRepository` | shipped |
+| `TenantBudgetSnapshotCache` (LRU + TTL) | shipped |
+| `BudgetResolver` (pre-check + post-record) | shipped |
+| `TenantBudgetExceeded` exception | shipped |
+| Factory wiring (opt-in per tenant) | shipped |
+| `POST /admin/tenants/{id}/budget` + GET + usage endpoints | shipped |
+| `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `SOFT_WARN_TOTAL` metrics | shipped |
+
+#### M4.D known tech debt
+
+1. **No automatic period reset job** — reset is lazy on next access; if a tenant goes silent for 2 months, the stale period row stays. Acceptable: rows accumulate ≤ 12/year/tenant.
+2. **No top-up mechanism** — once hit, the tenant stays blocked until manual admin action (raise `hard_cap_tokens`) or month rollover.
+3. **Snapshot inconsistency window** — ≤ TTL (60s default). Within that window, a tenant could go slightly over the cap before being rejected.
+4. **Soft-warn is per-period, not sticky** — fires once per period on threshold cross; if admin lowers the cap mid-period, the warn may re-fire or not fire correctly.
+5. **No per-model breakdown** — budget is total tokens; can't enforce "max 100k Sonnet, 1M Haiku".
+6. **No budget for non-LLM costs** (KB retrieval, embedding) — LLM only.
+7. **Snapshot refresh doesn't lock** — concurrent SUM() calls could double-insert. Mitigated by UNIQUE constraint + ON CONFLICT.
+8. **No integration with provider 429s** — provider rate limits are surfaced but don't update the budget state.
 
 
 ## 仓库信息
