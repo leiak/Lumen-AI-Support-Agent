@@ -144,6 +144,17 @@ class Settings(BaseSettings):
         default=1024, alias="TENANT_LLM_CACHE_MAXSIZE"
     )
 
+    # M4.D — Tenant token budget. Cache TTL + maxsize mirror the
+    # M4.C ``tenant_llm_cache_*`` defaults; the snapshot cache absorbs
+    # per-request ``SUM(llm_usage)`` cost. Budget enforcement is opt-in
+    # per tenant (no ``tenant_budgets`` row = no enforcement).
+    tenant_budget_cache_ttl_s: float = Field(
+        default=60.0, alias="TENANT_BUDGET_CACHE_TTL_S"
+    )
+    tenant_budget_cache_maxsize: int = Field(
+        default=1024, alias="TENANT_BUDGET_CACHE_MAXSIZE"
+    )
+
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
     # ``qa_judge_model`` default is a placeholder (the M2.B rollout will

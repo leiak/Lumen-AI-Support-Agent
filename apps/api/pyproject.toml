@@ -69,6 +69,7 @@ addopts = "-ra --strict-markers"
 markers = [
     "integration: requires real DB/Redis/Qdrant",
     "slow: slow tests",
+    "skip_postgres: requires a live Postgres testcontainer (skipped in CI without one)",
 ]
 
 [tool.ruff]
