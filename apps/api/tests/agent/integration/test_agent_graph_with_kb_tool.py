@@ -188,7 +188,9 @@ async def test_search_internal_kb_tool_invoked_through_graph_loop() -> None:
         kb_repository=kb_repo,
     )
     llm = _ScriptedLLM()
-    factory = MagicMock(return_value=llm)
+    # M4.C — production factory is now async (DB lookup on cache miss).
+    # Use AsyncMock so ``await factory(tenant_id)`` returns ``llm``.
+    factory = AsyncMock(return_value=llm)
 
     node = make_llm_node(
         llm_client_factory=factory,

@@ -47,6 +47,23 @@ from tenant.repository import TenantRepository
 from widget.adapter import WebWidgetAdapter
 from widget.ws.manager import ConnectionManager
 
+
+def _async_factory_returning(client: object) -> Any:
+    """Return an async factory that always returns ``client``.
+
+    M4.C — the production ``_default_llm_client_factory`` is now
+    ``async def`` (cache miss path awaits the per-tenant DB lookup).
+    The test patches above must therefore be async too — otherwise
+    ``await self._llm_client_factory(...)`` inside ``SimpleResponder``
+    raises ``TypeError: object coroutine can't be used in 'await'
+    expression``.
+    """
+
+    async def _factory(_tenant_id: str) -> Any:
+        return client
+
+    return _factory
+
 # ============================================================================
 # Fixtures / helpers
 # ============================================================================
@@ -574,7 +591,12 @@ async def test_ws_broadcast_carries_ai_reply(monkeypatch: pytest.MonkeyPatch) ->
         monkeypatch.setattr(
             simple_responder,
             "_default_llm_client_factory",
-            lambda _tenant_id: _FakeLLMClient(),
+            # M4.C — production factory is now async (DB lookup on
+            # cache miss); the stub must match or ``await
+            # self._llm_client_factory(...)`` raises
+            # ``TypeError: object coroutine can't be used in 'await'
+            # expression``.
+            _async_factory_returning(_FakeLLMClient()),
         )
 
         # Capture broadcasts via the manager singleton that the autouse

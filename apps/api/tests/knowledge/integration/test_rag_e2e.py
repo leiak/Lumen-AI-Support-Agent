@@ -420,9 +420,25 @@ def _install_stub_llm(
     monkeypatch.setattr(
         simple_responder_module,
         "_default_llm_client_factory",
-        lambda _tenant_id: llm,
+        # M4.C — production factory is now async (DB lookup on cache
+        # miss); the stub must match the signature or ``await
+        # self._llm_client_factory(...)`` raises TypeError.
+        _async_factory_returning(llm),
     )
     return llm if isinstance(llm, _CapturingLLM) else llm  # type: ignore[return-value]
+
+
+def _async_factory_returning(client: object) -> Any:
+    """Return an async factory that always returns ``client``.
+
+    Companion helper for the M4.C factory-signature change — see
+    :mod:`agent.llm_factory` docstring.
+    """
+
+    async def _factory(_tenant_id: str) -> Any:
+        return client
+
+    return _factory
 
 
 async def _ensure_collection_ready() -> None:

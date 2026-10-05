@@ -79,6 +79,14 @@ LLM_FALLBACK_ATTEMPTS_TOTAL = Counter(
     ("provider", "model", "step", "outcome"),
 )
 
+# M4.C — Tenant LLM not-configured counter (zero-label by design).
+# Spec §8.5: tenant_id stays in logs only to keep cardinality bounded
+# and avoid PII leakage via metric scraping.
+LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL = Counter(
+    "lumen_llm_tenant_not_configured_total",
+    "Number of LLM calls rejected because the tenant has no enabled provider configs.",
+)
+
 
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
@@ -129,6 +137,7 @@ LUMEN_QA_SCORE_LATENCY = Histogram(
 __all__ = [
     "LLM_CALLS_TOTAL",
     "LLM_FALLBACK_ATTEMPTS_TOTAL",
+    "LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL",
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",
     "LUMEN_QA_FLAGGED",

@@ -445,7 +445,11 @@ async def test_suggest_llm_failure_returns_fallback_with_warning(
     async def fake_retrieve_chunks(**_kwargs: Any) -> list[Any]:
         return []
 
-    def _boom_llm(_tenant_id: str) -> Any:
+    async def _boom_llm(_tenant_id: str) -> Any:
+        # M4.C — production factory is now async; this stub MUST be
+        # async too, otherwise ``await self._llm_client_factory(...)``
+        # raises ``TypeError: object coroutine can't be used in
+        # 'await' expression``.
         raise RateLimited("simulated rate limit")
 
     monkeypatch.setattr(service_module.ConversationService, "get", fake_get)
@@ -556,10 +560,17 @@ async def test_suggest_rag_failure_returns_no_rag_turn_kind(
     # Also patch the raw ``retrieve_chunks`` import to return
     # an empty list (no citations even if RAG had chunks).
     monkeypatch.setattr(suggest_module, "retrieve_chunks", fake_retrieve)
+    # M4.C — the production factory is now async (DB lookup on
+    # cache miss). The monkeypatch must match — a sync lambda
+    # here would break ``await self._llm_client_factory(...)``
+    # inside ``SuggestionService.suggest_reply``.
+    async def _factory(tenant_id: str) -> _FakeLLMClient:
+        return _FakeLLMClient(tenant_id)
+
     monkeypatch.setattr(
         suggest_module,
         "_default_llm_client_factory",
-        lambda tenant_id: _FakeLLMClient(tenant_id),
+        _factory,
     )
 
     app = _build_app()
@@ -898,10 +909,15 @@ async def test_suggest_does_not_dispatch_tools(
 
     monkeypatch.setattr(suggest_module, "RAGService", _RagEmpty)
     monkeypatch.setattr(suggest_module, "retrieve_chunks", fake_retrieve)
+
+    # M4.C — async factory stub (see comment on the other patches).
+    async def _factory(tenant_id: str) -> _ToolCallLLMClient:
+        return _ToolCallLLMClient(tenant_id)
+
     monkeypatch.setattr(
         suggest_module,
         "_default_llm_client_factory",
-        lambda tenant_id: _ToolCallLLMClient(tenant_id),
+        _factory,
     )
 
     app = _build_app()
@@ -1197,7 +1213,11 @@ async def test_suggest_service_llm_raises_rate_limited_returns_fallback(
                 retrieval_score_max=0.0,
             )
 
-    def _boom(_tenant_id: str) -> Any:
+    async def _boom(_tenant_id: str) -> Any:
+        # M4.C — production factory is now async; this stub MUST be
+        # async too, otherwise ``await self._llm_client_factory(...)``
+        # raises ``TypeError: object coroutine can't be used in
+        # 'await' expression``.
         raise RateLimited("simulated rate limit")
 
     monkeypatch.setattr(service_module.ConversationService, "get", fake_get)
@@ -1320,10 +1340,17 @@ async def test_suggest_service_rag_hits_with_citations(
     monkeypatch.setattr(
         suggest_module, "retrieve_chunks", fake_retrieve_chunks
     )
+    # M4.C — the production factory is now async (DB lookup on
+    # cache miss). The monkeypatch must match — a sync lambda
+    # here would break ``await self._llm_client_factory(...)``
+    # inside ``SuggestionService.suggest_reply``.
+    async def _factory(tenant_id: str) -> _FakeLLMClient:
+        return _FakeLLMClient(tenant_id)
+
     monkeypatch.setattr(
         suggest_module,
         "_default_llm_client_factory",
-        lambda tenant_id: _FakeLLMClient(tenant_id),
+        _factory,
     )
 
     result = await SuggestionService().suggest_reply(
@@ -1441,10 +1468,17 @@ async def test_suggest_service_truncates_citation_text(
     monkeypatch.setattr(
         suggest_module, "retrieve_chunks", fake_retrieve_chunks
     )
+    # M4.C — the production factory is now async (DB lookup on
+    # cache miss). The monkeypatch must match — a sync lambda
+    # here would break ``await self._llm_client_factory(...)``
+    # inside ``SuggestionService.suggest_reply``.
+    async def _factory(tenant_id: str) -> _FakeLLMClient:
+        return _FakeLLMClient(tenant_id)
+
     monkeypatch.setattr(
         suggest_module,
         "_default_llm_client_factory",
-        lambda tenant_id: _FakeLLMClient(tenant_id),
+        _factory,
     )
 
     result = await SuggestionService().suggest_reply(

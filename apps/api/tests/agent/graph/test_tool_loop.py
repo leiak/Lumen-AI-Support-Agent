@@ -64,7 +64,7 @@ async def test_tool_loop_stops_when_no_tool_calls() -> None:
     llm.chat = AsyncMock(
         return_value=AIMessage(content="answer", tool_calls=[])
     )
-    factory = MagicMock(return_value=llm)
+    factory = AsyncMock(return_value=llm)
     node = make_llm_node(
         llm_client_factory=factory, model="test-model", tools=[]
     )
@@ -122,7 +122,7 @@ async def test_tool_loop_handles_one_tool_call_then_done() -> None:
             AIMessage(content="final answer", tool_calls=[]),
         ]
     )
-    factory = MagicMock(return_value=llm)
+    factory = AsyncMock(return_value=llm)
     node = make_llm_node(
         llm_client_factory=factory,
         model="test-model",
@@ -162,7 +162,7 @@ async def test_tool_loop_max_iterations_safety() -> None:
             ],
         )
     )
-    factory = MagicMock(return_value=llm)
+    factory = AsyncMock(return_value=llm)
     node = make_llm_node(
         llm_client_factory=factory, model="test-model", tools=[]
     )
@@ -206,7 +206,7 @@ async def test_tool_loop_handles_unknown_tool() -> None:
             AIMessage(content="recovered", tool_calls=[]),
         ]
     )
-    factory = MagicMock(return_value=llm)
+    factory = AsyncMock(return_value=llm)
     node = make_llm_node(
         llm_client_factory=factory, model="test-model", tools=[]
     )

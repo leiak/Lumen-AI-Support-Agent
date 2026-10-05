@@ -45,7 +45,7 @@ the rest of the workspace uses.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -119,7 +119,9 @@ class SuggestionResult:
 # one declared in ``agent.simple_responder`` — duplicated here
 # to avoid a re-import (and the implicit cycle that would
 # require). The shape is identical and stable.
-LLMClientFactory = Callable[[str], LLMClient]
+# M4.C — the factory is now ``async`` so the cache miss path can await
+# the per-tenant DB lookup; callers must ``await`` it.
+LLMClientFactory = Callable[[str], Awaitable[LLMClient]]
 
 
 def _truncate_citation_text(text: str, *, limit: int) -> str:
@@ -323,7 +325,7 @@ class SuggestionService:
 
         # ---- Step 7: call the LLM (fail-safe) ------------------------
         try:
-            client = self._llm_client_factory(tenant_id)
+            client = await self._llm_client_factory(tenant_id)
             request = ChatRequest(
                 model=self._model,
                 messages=llm_messages,

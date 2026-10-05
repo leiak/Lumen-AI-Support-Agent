@@ -8,7 +8,7 @@ end-to-end flow with stubbed services.
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -96,13 +96,20 @@ def _capturing_llm_client(
     return client
 
 
-def _make_factory(client: MagicMock) -> Callable[[str], LLMClient]:
-    """Return a per-tenant LLMClient factory that always hands out
-    ``client``. Defined as a ``def`` rather than a ``lambda`` to keep
-    ruff's E731 happy.
+def _make_factory(client: MagicMock) -> Callable[[str], Awaitable[LLMClient]]:
+    """Return an async per-tenant LLMClient factory that always hands
+    out ``client``.
+
+    M4.C — the production ``_default_llm_client_factory`` is now
+    ``async def`` (cache miss path awaits the per-tenant DB lookup).
+    Tests that wire a custom factory MUST pass an async callable or
+    ``await llm_client_factory(tenant_id)`` raises ``TypeError:
+    object coroutine can't be used in 'await' expression``. Defined
+    as a regular function (not a ``lambda``) to keep ruff's E731
+    happy.
     """
 
-    def _factory(_tenant_id: str) -> LLMClient:
+    async def _factory(_tenant_id: str) -> LLMClient:
         return client
 
     return _factory
@@ -569,7 +576,7 @@ async def test_llm_node_threads_tenant_id_to_factory() -> None:
     """Tenant isolation: llm_node passes state['tenant_id'] to the factory."""
     captured_tenant: dict[str, str] = {}
 
-    def _factory(tenant_id: str) -> LLMClient:
+    async def _factory(tenant_id: str) -> LLMClient:
         captured_tenant["value"] = tenant_id
         return _capturing_llm_client(content="ok")
 

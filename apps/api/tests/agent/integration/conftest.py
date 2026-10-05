@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -482,9 +482,24 @@ def stub_llm_capture(
     monkeypatch.setattr(
         simple_responder_module,
         "_default_llm_client_factory",
-        lambda _tenant_id: llm,
+        _async_factory(llm),
     )
     return llm
+
+
+def _async_factory(llm: object) -> Callable[[str], Awaitable[object]]:
+    """Return an async factory returning ``llm`` regardless of tenant.
+
+    M4.C — the production factory is now ``async def`` (cache miss
+    awaits the per-tenant DB lookup). The monkeypatch must match the
+    shape or callers that ``await`` it would receive a coroutine
+    wrapping a coroutine.
+    """
+
+    async def _factory(_tenant_id: str) -> object:
+        return llm
+
+    return _factory
 
 
 # ============================================================================

@@ -19,6 +19,22 @@ from knowledge.rag_service import RagContext
 from llm_client.types import ChatResponse
 
 
+def _async_factory(client: object):
+    """Return an async ``llm_client_factory`` that always returns ``client``.
+
+    M4.C — the production factory is now ``async def`` (cache miss
+    awaits the per-tenant DB lookup). Tests that wire a custom factory
+    MUST pass an async callable or ``await self._llm_client_factory(...)``
+    raises ``TypeError: object coroutine can't be used in 'await
+    expression``. This helper keeps the call sites concise.
+    """
+
+    async def _factory(_tenant_id: str) -> object:
+        return client
+
+    return _factory
+
+
 def _empty_rag_context() -> RagContext:
     """A no-op RAG context for unit tests that don't exercise RAG."""
     return RagContext(
@@ -87,7 +103,7 @@ async def test_responder_returns_none_when_conversation_not_found() -> None:
     conv_service.get = AsyncMock(return_value=None)
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: AsyncMock(),
+        llm_client_factory=_async_factory(AsyncMock()),
         rag_service=_empty_rag_service(),
     )
 
@@ -104,7 +120,7 @@ async def test_responder_skips_when_not_ai_handling() -> None:
     conv_service.get = AsyncMock(return_value=conv)
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: AsyncMock(),
+        llm_client_factory=_async_factory(AsyncMock()),
         rag_service=_empty_rag_service(),
     )
 
@@ -129,7 +145,7 @@ async def test_responder_returns_ai_response_on_llm_success() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -159,7 +175,7 @@ async def test_responder_returns_fallback_on_llm_failure() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -188,7 +204,7 @@ async def test_responder_returns_fallback_on_empty_llm_content() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -219,7 +235,7 @@ async def test_responder_keeps_latest_messages_when_overflowed() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -254,7 +270,7 @@ async def test_responder_skips_tool_messages_in_history() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -278,7 +294,7 @@ async def test_responder_caps_history_at_max_history_messages() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -308,7 +324,7 @@ async def test_responder_maps_agent_and_ai_to_assistant_role() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -337,7 +353,7 @@ async def test_responder_handles_list_messages_returning_none() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -385,7 +401,7 @@ async def test_responder_summarizes_overflow_messages() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -420,7 +436,7 @@ async def test_responder_does_not_summarize_below_threshold() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -455,7 +471,7 @@ async def test_responder_summary_failure_uses_truncated_transcript() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -505,7 +521,7 @@ async def test_responder_summary_keeps_latest_unchanged() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     await responder.respond(tenant_id="t1", conversation_id="c1")
@@ -538,7 +554,7 @@ async def test_responder_applies_chat_temperature_and_max_tokens_to_llm_request(
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -579,7 +595,7 @@ async def test_responder_does_not_inject_rag_twice() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=rag_service,
     )
 
@@ -691,7 +707,7 @@ async def test_simple_responder_calls_escalate_to_human_queue_on_escalation() ->
 
     responder = SimpleResponder(
         conv_service=conv_service,  # type: ignore[arg-type]
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -756,7 +772,7 @@ async def test_simple_responder_does_not_persist_synthetic_messages() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,  # type: ignore[arg-type]
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -798,7 +814,7 @@ async def test_simple_responder_logs_escalation_event(capsys: object) -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,  # type: ignore[arg-type]
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -830,7 +846,7 @@ async def test_simple_responder_returns_fallback_on_graph_exception(
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: AsyncMock(),
+        llm_client_factory=_async_factory(AsyncMock()),
         rag_service=_empty_rag_service(),
     )
 
@@ -876,7 +892,7 @@ async def test_simple_responder_resets_escalation_context_on_success() -> None:
     fake_client = _fake_client(content="ok")
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
 
@@ -919,7 +935,7 @@ async def test_responder_streams_deltas_via_on_delta() -> None:
 
     responder = SimpleResponder(
         conv_service=conv_service,
-        llm_client_factory=lambda _t: fake_client,
+        llm_client_factory=_async_factory(fake_client),
         rag_service=_empty_rag_service(),
     )
     result = await responder.respond(

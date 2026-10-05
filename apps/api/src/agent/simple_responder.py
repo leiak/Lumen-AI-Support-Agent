@@ -71,7 +71,9 @@ MAX_HISTORY_BEFORE_SUMMARY = 50
 
 # Type alias for the per-tenant LLMClient factory. Stage 7+ may swap
 # this for a config-driven resolver that picks model + provider per tenant.
-LLMClientFactory = Callable[[str], LLMClient]
+# M4.C — the factory is now ``async`` so the cache miss path can await
+# the per-tenant DB lookup; callers must ``await`` it.
+LLMClientFactory = Callable[[str], Awaitable[LLMClient]]
 
 # Re-export the prompt / fallback constants from
 # :mod:`agent.graph.prompts` for backward compatibility. The
@@ -396,7 +398,7 @@ class SimpleResponder:
         transcript = "\n".join(
             f"{m.role}: {m.content_text}" for m in messages
         )
-        client = self._llm_client_factory(tenant_id)
+        client = await self._llm_client_factory(tenant_id)
         request = ChatRequest(
             model=self._model,
             messages=[

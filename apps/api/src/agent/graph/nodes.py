@@ -394,7 +394,7 @@ def make_llm_node(
         tool_by_name = {t.name: t for t in active_tools}
 
         try:
-            client = llm_client_factory(tenant_id)
+            client = await llm_client_factory(tenant_id)
             # Mutable message list — Stage 12 / Task 2 tool loop
             # appends a ``ToolMessage`` (ChatMessage(role=TOOL, ...))
             # for each dispatch and rebuilds the ``ChatRequest`` from
