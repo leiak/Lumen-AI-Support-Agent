@@ -175,6 +175,41 @@ async def test_get_usage_returns_period_and_tokens_used(
         await _delete_tenant(tenant.id)
 
 
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_usage_unknown_tenant_returns_404(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Anti-enumeration: unknown tenant_id on /usage must return 404, not 500.
+
+    Regression for Task 4 review — without the try/except ValueError,
+    AdminTenantBudgetRepository.get() raised ValueError which FastAPI
+    translated to 500, breaking anti-enumeration (could distinguish
+    'tenant exists but cross-tenant' from 'tenant does not exist').
+
+    Both branches — cross-tenant (hardcoded ``"not found"`` detail) and
+    unknown-tenant (ValueError ``"unknown tenant: ..."`` detail) — must
+    agree on status code 404. The detail text differs by branch but
+    status_code uniformity is the load-bearing invariant.
+    """
+    fake_tenant_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"  # valid ULID format
+    token = admin_token_for(tenant_id=fake_tenant_id)
+    resp = await async_client.get(
+        f"/api/v1/admin/tenants/{fake_tenant_id}/budget/usage",
+        headers=auth_headers(token),
+    )
+    # Load-bearing invariant: 404 (not 500). Same status code as the
+    # cross-tenant branch — anti-enumeration holds.
+    assert resp.status_code == 404
+    assert resp.status_code != 500
+    # The repository's ValueError becomes the detail. Either the
+    # hardcoded "not found" (cross-tenant) or the repository's
+    # "unknown tenant: ..." string is fine — both keep status 404.
+    detail = resp.json().get("detail", "").lower()
+    assert ("not found" in detail) or ("unknown tenant" in detail)
+
+
 # ---------------------------------------------------------------------------
 # Auth — mirrors M4.C (tech debt follow-up).
 # ---------------------------------------------------------------------------
@@ -225,6 +260,7 @@ __all__ = [
     "test_post_upserts_existing_row",
     "test_get_returns_current_budget",
     "test_get_usage_returns_period_and_tokens_used",
+    "test_get_usage_unknown_tenant_returns_404",
     "test_post_without_token_returns_401",
     "test_post_with_cross_tenant_admin_returns_404",
 ]

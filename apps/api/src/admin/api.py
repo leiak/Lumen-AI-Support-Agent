@@ -609,7 +609,10 @@ async def get_tenant_budget_usage(
     """
     if claims.get("tenant_id") != tenant_id:
         raise HTTPException(status_code=404, detail="not found")
-    budget = await AdminTenantBudgetRepository().get(tenant_id=tenant_id)
+    try:
+        budget = await AdminTenantBudgetRepository().get(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     period, period_start = _current_period(
         budget.period_anchor_tz if budget else "UTC"
     )
