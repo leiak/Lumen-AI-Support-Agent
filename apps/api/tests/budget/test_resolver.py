@@ -1,7 +1,7 @@
 """Tests for BudgetResolver pre-check + post-record behavior."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -200,3 +200,28 @@ async def test_exception_carries_full_context() -> None:
     assert exc.value.hard_cap_tokens == 500
     assert exc.value.period_starts_at is not None
     assert isinstance(exc.value.period_starts_at, datetime)
+
+
+def test_current_period_honors_tz_name() -> None:
+    """_current_period uses ZoneInfo(tz_name) for the period_start."""
+    from budget.resolver import _current_period
+    # Asia/Shanghai is UTC+8; March 1 00:00 SHA = Feb 28 16:00 UTC
+    period, period_start = _current_period("Asia/Shanghai")
+    assert len(period) == 7  # YYYY-MM
+    # period_start is at 00:00 in Asia/Shanghai
+    assert period_start.hour == 0
+    assert period_start.minute == 0
+    # Verify tz is correctly set (Asia/Shanghai is +08:00)
+    assert period_start.utcoffset() == timedelta(hours=8)
+    # Same test for UTC
+    period_utf8, period_start_utc = _current_period("UTC")
+    assert period_start_utc.utcoffset() == timedelta(0)
+
+
+def test_current_period_falls_back_to_utc_on_bad_malformed() -> None:
+    """Malformed tz_name does not crash — falls back to UTC."""
+    from budget.resolver import _current_period
+    # "Not/A/Zone" is not a valid IANA name
+    period, period_start = _current_period("Not/A/Zone")
+    assert len(period) == 7
+    assert period_start.utcoffset() == timedelta(0)  # UTC fallback

@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from budget.cache import TenantBudgetSnapshotCache
 from budget.models import TenantBudget
@@ -46,15 +47,22 @@ logger = logging.getLogger(__name__)
 
 
 def _current_period(tz_name: str = "UTC") -> tuple[str, datetime]:
-    """Return ``(period_string, period_start_datetime)`` for the given timezone.
+    """Return (period, period_start) for the given IANA timezone.
 
     Period format: ``YYYY-MM``. Period start: 1st of the month at 00:00
-    in the configured timezone (default UTC). Tests can override by
-    patching ``budget.resolver._current_period``.
+    in the configured timezone (default UTC). Used by the budget
+    pre-check + post-record path so the snapshot table aggregates
+    align with the tenant's local calendar month, not UTC.
+
+    Falls back to UTC if ``ZoneInfo(tz_name)`` raises (e.g. malformed
+    ``period_anchor_tz`` config) so the resolver never crashes.
     """
-    now = datetime.now(timezone.utc)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    now = datetime.now(tz)
     period = now.strftime("%Y-%m")
-    # 1st of month at 00:00 UTC
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return period, period_start
 
