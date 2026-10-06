@@ -20,7 +20,7 @@
 | `apps/api/src/budget/per_model.py` | New | `PerModelBreakdownCache` + `PerModelService` |
 | `apps/api/src/budget/exceptions.py` | New | `TenantBudgetRateLimited` exception |
 | `apps/api/src/budget/resolver.py` | Modify | `_compute_effective_cap`, `_maybe_raise_budget_gate`, accept `credit_service` + `per_model_cache` deps |
-| `apps/api/src/admin/schemas/budget.py` | Modify | Add `CreditRequest/Response`, `BreakdownItem`, extend `BudgetSnapshotResponse` |
+| `apps/api/src/admin/schemas/budget.py` | Modify | Add `CreditRequest/Response`, `BreakdownItem`, extend `TenantBudgetUsageRead` |
 | `apps/api/src/admin/api.py` | Modify | Add `POST/GET /admin/tenants/{tid}/credits`, extend `/admin/tenants/{tid}/budget/usage` snapshot endpoint, register exception handler |
 | `apps/api/src/main.py` | Modify | Register `@app.exception_handler(TenantBudgetRateLimited)` |
 | `apps/api/src/core/config.py` | Modify | Add 2 fields: `tenant_budget_429_skip_threshold_tokens` + `tenant_budget_per_model_cache_ttl_seconds` |
@@ -1835,12 +1835,13 @@ import pytest
 
 from apps.api.src.budget.exceptions import TenantBudgetRateLimited
 from apps.api.src.budget.resolver import BudgetResolver
-from core.business_metrics import LLM_BUDGET_GATE_TOTAL
-from llm_client.exceptions import RateLimited
+from apps.api.src.core.id_gen import new_id
+from apps.api.src.core.business_metrics import LLM_BUDGET_GATE_TOTAL
+from apps.api.src.llm_client.exceptions import RateLimited
 
 
 def _response(prompt=100, completion=50):
-    from llm_client.types import ChatResponse
+    from apps.api.src.llm_client.types import ChatResponse
     return ChatResponse(
         content="ok", provider="openai", model="gpt-4o-mini",
         prompt_tokens=prompt, completion_tokens=completion,
@@ -1860,31 +1861,30 @@ async def test_e2e_credit_grant_then_breakdown_then_gate(db_session) -> None:
         PerModelBreakdownCache,
         PerModelService,
     )
-    from ulid import ULID
 
     tenant_id = "tenant-e2e-packb"
     period = datetime.now(timezone.utc).strftime("%Y-%m")
 
     budget = TenantBudget(
-        id=str(ULID()), tenant_id=tenant_id,
+        id=new_id(), tenant_id=tenant_id,
         hard_cap_tokens=1000, soft_warn_tokens=2000,
         period_anchor_tz="UTC",
     )
     snap = TenantBudgetSnapshot(
-        id=str(ULID()), tenant_id=tenant_id, period=period,
+        id=new_id(), tenant_id=tenant_id, period=period,
         tokens_used=0, last_refreshed_at=datetime.now(timezone.utc),
     )
     db_session.add(budget)
     db_session.add(snap)
 
     # Seed two distinct (provider, model) llm_usage rows.
-    from llm_client.models import LLMUsage
+    from apps.api.src.llm_client.models import LLMUsage
     for prov, model, p, c in [
         ("openai", "gpt-4o-mini", 700, 350),
         ("anthropic", "haiku", 500, 250),
     ]:
         db_session.add(LLMUsage(
-            id=str(ULID()), tenant_id=tenant_id, provider=prov, model=model,
+            id=new_id(), tenant_id=tenant_id, provider=prov, model=model,
             prompt_tokens=p, completion_tokens=c,
             cost_usd=0.0, request_id="r", cached=False,
             metadata_json={}, created_at=datetime.now(timezone.utc),
