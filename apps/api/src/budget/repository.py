@@ -8,6 +8,7 @@ Post-record uses ``set_tokens_used`` which does an UPSERT on
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -87,15 +88,31 @@ class TenantBudgetSnapshotRepository:
             return result.scalar_one_or_none()
 
     async def set_tokens_used(
-        self, *, tenant_id: str, period: str, tokens_used: int
+        self,
+        *,
+        tenant_id: str,
+        period: str,
+        tokens_used: int,
+        soft_warn_fired_at: datetime | None = None,
     ) -> TenantBudgetSnapshot:
-        """Upsert tokens_used for (tenant_id, period).
+        """Upsert tokens_used (and optionally soft_warn_fired_at) for (tenant_id, period).
+
+        Pack A #4: when ``soft_warn_fired_at`` is None on input, the existing
+        row's value is preserved (no NULL overwrite). This is the carry-over
+        behavior that keeps sticky soft-warn from accidentally clearing the
+        original fire timestamp on subsequent calls in the same period.
 
         Concurrent calls: the second one wins (last-writer-wins). Acceptable
         for budget tracking — exact values aren't billing-grade.
         """
         sm = get_sessionmaker()
         async with sm() as session:
+            set_clause: dict[str, Any] = {"tokens_used": tokens_used}
+            # Pack A #4: only overwrite soft_warn_fired_at when an explicit
+            # non-None value is provided. Passing None leaves the existing
+            # value untouched (sticky behavior).
+            if soft_warn_fired_at is not None:
+                set_clause["soft_warn_fired_at"] = soft_warn_fired_at
             stmt = (
                 pg_insert(TenantBudgetSnapshot)
                 .values(
@@ -103,10 +120,11 @@ class TenantBudgetSnapshotRepository:
                     tenant_id=tenant_id,
                     period=period,
                     tokens_used=tokens_used,
+                    soft_warn_fired_at=soft_warn_fired_at,
                 )
                 .on_conflict_do_update(
                     constraint="uq_tenant_budget_snapshots_tenant_period",
-                    set_={"tokens_used": tokens_used},
+                    set_=set_clause,
                 )
                 .returning(TenantBudgetSnapshot)
             )

@@ -56,6 +56,26 @@ async def test_snapshot_set_tokens_used_inserts_or_updates() -> None:
     assert snap2.tokens_used == 750
 
 
+async def test_snapshot_set_tokens_used_accepts_soft_warn_fired_at() -> None:
+    """Pack A #4: set_tokens_used optionally writes soft_warn_fired_at."""
+    tenant = await TenantRepository().create(name="Budget Soft Warn", plan=TenantPlan.PRO)
+    repo = TenantBudgetSnapshotRepository()
+    fired_at = datetime(2026, 10, 15, 12, 30, tzinfo=timezone.utc)
+    snap = await repo.set_tokens_used(
+        tenant_id=tenant.id, period="2026-10",
+        tokens_used=500, soft_warn_fired_at=fired_at,
+    )
+    assert snap.tokens_used == 500
+    assert snap.soft_warn_fired_at == fired_at
+    # Subsequent call WITHOUT soft_warn_fired_at preserves the previous
+    # value (no overwrite to NULL) — Pack A #4 carry-over behavior.
+    snap2 = await repo.set_tokens_used(
+        tenant_id=tenant.id, period="2026-10", tokens_used=750,
+    )
+    assert snap2.tokens_used == 750
+    assert snap2.soft_warn_fired_at == fired_at
+
+
 async def test_snapshot_refresh_sums_llm_usage() -> None:
     """refresh() runs SUM(prompt+completion) on llm_usage filtered by period."""
     tenant = await TenantRepository().create(name="Snapshot Refresh", plan=TenantPlan.PRO)
