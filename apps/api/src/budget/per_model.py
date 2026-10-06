@@ -188,7 +188,7 @@ class PerModelService:
 _default_cache: PerModelBreakdownCache | None = None
 
 
-def get_per_model_cache(ttl_seconds: int = 30) -> PerModelBreakdownCache:
+def get_per_model_cache(ttl_seconds: int | None = None) -> PerModelBreakdownCache:
     """Return the default process-local cache singleton.
 
     Spec §4.2: the cache is process-local — a single API replica
@@ -196,11 +196,33 @@ def get_per_model_cache(ttl_seconds: int = 30) -> PerModelBreakdownCache:
     would need a Redis-backed variant; Pack B ships the in-process
     version because that's the project norm (M4.D Pack A's snapshot
     cache is also in-process).
+
+    ``ttl_seconds`` is read from
+    ``settings.tenant_budget_per_model_cache_ttl_seconds`` on first
+    construction; callers passing an explicit value override the
+    setting. Subsequent calls return the already-constructed singleton
+    regardless of the parameter (singleton semantics — see
+    :func:`reset_per_model_cache` for tests that need to swap).
     """
     global _default_cache
     if _default_cache is None:
+        if ttl_seconds is None:
+            from core.config import get_settings
+
+            ttl_seconds = get_settings().tenant_budget_per_model_cache_ttl_seconds
         _default_cache = PerModelBreakdownCache(ttl_seconds=ttl_seconds)
     return _default_cache
+
+
+def reset_per_model_cache() -> None:
+    """Drop the module-level singleton (test reset helper).
+
+    Symmetric with ``reset_settings`` / ``reset_engine`` / etc. — not
+    used in production but lets test modules that call
+    :func:`get_per_model_cache` start from a clean slate.
+    """
+    global _default_cache
+    _default_cache = None
 
 
 __all__ = [
@@ -208,4 +230,5 @@ __all__ = [
     "PerModelBreakdownCache",
     "PerModelService",
     "get_per_model_cache",
+    "reset_per_model_cache",
 ]

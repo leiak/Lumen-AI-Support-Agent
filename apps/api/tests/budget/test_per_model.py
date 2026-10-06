@@ -94,6 +94,49 @@ def test_different_periods_isolated() -> None:
     assert cache.get("t1", "2026-11") is not None
 
 
+def test_get_per_model_cache_reads_ttl_from_settings(monkeypatch) -> None:
+    """Pack B #5: get_per_model_cache() honors
+    TENANT_BUDGET_PER_MODEL_CACHE_TTL_SECONDS on first construction.
+
+    Regression test for the dead-config bug caught by the Pack B final
+    review: the setting was declared but never consumed — every call
+    site used the hardcoded 30s default.
+    """
+    from core.config import get_settings, reset_settings
+    from budget.per_model import (
+        get_per_model_cache,
+        reset_per_model_cache,
+    )
+
+    monkeypatch.setenv("TENANT_BUDGET_PER_MODEL_CACHE_TTL_SECONDS", "7")
+    reset_settings()
+    reset_per_model_cache()
+    try:
+        cache = get_per_model_cache()
+        assert cache._ttl == 7   # type: ignore[attr-defined] — internal attr
+    finally:
+        reset_per_model_cache()
+        reset_settings()
+
+
+def test_reset_per_model_cache_drops_singleton() -> None:
+    """Pack B #5: reset_per_model_cache() drops the singleton so the
+    next get_per_model_cache() constructs a fresh one."""
+    from budget.per_model import (
+        PerModelBreakdownCache,
+        get_per_model_cache,
+        reset_per_model_cache,
+    )
+
+    cache1 = get_per_model_cache()
+    assert isinstance(cache1, PerModelBreakdownCache)
+    reset_per_model_cache()
+    cache2 = get_per_model_cache()
+    # A fresh instance after reset (singleton was dropped).
+    assert cache2 is not cache1
+    reset_per_model_cache()
+
+
 # ---------------------------------------------------------------------------
 # PerModelService integration tests (DB required).
 # ---------------------------------------------------------------------------
