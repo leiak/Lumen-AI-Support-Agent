@@ -155,6 +155,8 @@ class CreditService:
 ### 3.4 Admin API (`apps/api/src/admin/api.py`)
 
 ```python
+from tenant.repository import TenantRepository   # used for existence check
+
 @router.post(
     "/tenants/{tenant_id}/credits",
     status_code=201,
@@ -170,7 +172,7 @@ async def grant_credit(
     # tokens have tenant_id=None (via create_access_token's extra override).
     if claims.get("tenant_id") is not None:
         raise HTTPException(status_code=404, detail="not found")
-    if not await _tenant_exists(tenant_id):
+    if await TenantRepository().get_by_id(tenant_id) is None:
         raise HTTPException(status_code=404, detail="tenant not found")
     sm = get_sessionmaker()
     async with sm() as session:
@@ -197,7 +199,7 @@ async def list_credits(
     # Super-admin only — same as POST above.
     if claims.get("tenant_id") is not None:
         raise HTTPException(status_code=404, detail="not found")
-    if not await _tenant_exists(tenant_id):
+    if await TenantRepository().get_by_id(tenant_id) is None:
         raise HTTPException(status_code=404, detail="tenant not found")
     sm = get_sessionmaker()
     async with sm() as session:
