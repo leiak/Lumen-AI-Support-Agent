@@ -510,7 +510,6 @@ async def test_pre_check_uses_effective_cap_includes_credits() -> None:
     cache.get_or_load_async = AsyncMock(return_value=snap)
     snap_repo = MagicMock()
     snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
-    snap_repo.upsert = AsyncMock()
     snap_repo.set_tokens_used = AsyncMock()
 
     credit_svc = MagicMock()

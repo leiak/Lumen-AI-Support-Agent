@@ -69,17 +69,6 @@ def _current_period(tz_name: str = "UTC") -> tuple[str, datetime]:
     return period, period_start
 
 
-def _base_hard_cap(budget: TenantBudget | None) -> int:
-    """Return the configured ``hard_cap_tokens`` or 0 when absent.
-
-    Defensive helper: a missing budget OR ``hard_cap_tokens is None``
-    both collapse to 0 so the effective-cap math stays valid. The async
-    pre-check returns early before reaching the comparison when the
-    budget is missing, but the helper is safe to call regardless.
-    """
-    if budget is None:
-        return 0
-    return budget.hard_cap_tokens or 0
 
 
 class BudgetResolver:
@@ -127,8 +116,13 @@ class BudgetResolver:
             The :class:`ChatResponse` from the inner resolver.
 
         Raises:
-            TenantBudgetExceeded: ``tokens_used >= hard_cap_tokens`` at
-                pre-check (no delegate call made).
+            TenantBudgetExceeded: ``tokens_used >= effective_cap`` at
+                pre-check (no delegate call made). Note the payload's
+                ``hard_cap_tokens`` field carries ``effective_cap``
+                (base + credits) when credits are configured — the
+                field name is preserved for backward compatibility with
+                Pack A callers, but the value reflects the cap that was
+                actually crossed.
         """
         if self._budget is None:
             # Opt-out: no enforcement, no snapshot reads or writes.
@@ -241,8 +235,16 @@ class BudgetResolver:
         callers) we fall back to base-only enforcement. This preserves
         backward compatibility: existing call sites that don't pass a
         credit service see the same behavior as before.
+
+        Sync shim caveat: ``_pre_check_sync`` cannot await
+        ``sum_for_period`` and therefore uses the base ``hard_cap_tokens``
+        directly. This is a known limitation of the M4.A sync protocol —
+        in production all credit-bearing tenants go through ``ainvoke``.
         """
-        base = _base_hard_cap(self._budget)
+        # _pre_check returns early when budget is None OR hard_cap_tokens
+        # is None, so by the time we get here ``self._budget`` is non-None.
+        # Defensive ``or 0`` covers ``hard_cap_tokens is None`` anyway.
+        base = self._budget.hard_cap_tokens or 0
         if self._credit_service is None:
             return base
         return base + await self._credit_service.sum_for_period(
