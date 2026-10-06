@@ -135,6 +135,14 @@ class PerModelService:
         concept (it controls the month boundary for cap enforcement);
         per-model breakdowns use UTC month boundaries because the
         raw ``created_at`` is UTC.
+
+        Known limitation (Pack B): for tenants with
+        ``period_anchor_tz != "UTC"`` (e.g. ``America/Los_Angeles``),
+        the snapshot's ``tokens_used`` reflects the anchored month but
+        the breakdown aggregates a wider UTC window. Admin UI may show
+        ``sum(breakdown.total_tokens) > tokens_used`` on boundary days.
+        Fixing requires passing ``tz_name`` through this chain — out of
+        Pack B scope. Most tenants use the default ``UTC`` anchor.
         """
         cached = self._cache.get(tenant_id, period)
         if cached is not None:
@@ -155,17 +163,23 @@ class PerModelService:
             .where(LLMUsage.cached == False)  # noqa: E712 — only billable calls
             .group_by(LLMUsage.provider, LLMUsage.model)
         )
-        rows = [
-            ModelUsage(
-                provider=row.provider,
-                model=row.model,
-                prompt_tokens=int(row[2] or 0),
-                completion_tokens=int(row[3] or 0),
-                total_tokens=int(row[2] or 0) + int(row[3] or 0),
-                request_count=int(row[4]),
+        rows = []
+        for row in result:
+            # ``func.coalesce(..., 0)`` already returns int(0) on empty
+            # groups, so ``int(row[2])`` is safe — but assert defensively
+            # in case the dialect returns Decimal/None.
+            prompt_tokens = int(row[2] or 0)
+            completion_tokens = int(row[3] or 0)
+            rows.append(
+                ModelUsage(
+                    provider=row.provider,
+                    model=row.model,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    request_count=int(row[4]),
+                )
             )
-            for row in result
-        ]
         self._cache.set(tenant_id, period, rows)
         return rows
 

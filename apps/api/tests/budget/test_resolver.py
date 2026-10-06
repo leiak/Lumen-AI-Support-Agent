@@ -599,3 +599,60 @@ async def test_effective_cap_falls_back_when_no_credit_service() -> None:
     assert exc.value.hard_cap_tokens == 8000
     # Inner resolver must NOT have been called.
     inner.ainvoke.assert_not_called()
+
+
+async def test_post_record_invalidates_per_model_cache() -> None:
+    """Pack B #5: _post_record must invalidate the per-model cache so the
+    next ``GET /admin/tenants/{tid}/budget/usage?breakdown=true`` reflects
+    this call's token consumption, not a 30s-stale snapshot.
+    """
+    from budget.per_model import PerModelBreakdownCache
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
+    snap_cache = MagicMock()
+    snap = _make_snapshot("t1", "2026-10", 0)
+    snap_repo = MagicMock()
+    snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    snap_repo.set_tokens_used = AsyncMock()
+    # Real PerModelBreakdownCache so we can assert invalidate() lands.
+    per_model_cache = PerModelBreakdownCache(ttl_seconds=30)
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(),
+        snapshot_cache=snap_cache,
+        snapshot_repo=snap_repo,
+        per_model_cache=per_model_cache,
+    )
+    # Pre-populate cache with a sentinel so we can assert it was cleared.
+    from budget.per_model import ModelUsage
+    per_model_cache.set("t1", "2026-10", [
+        ModelUsage("openai", "gpt-4o-mini", 0, 0, 0, 0),
+    ])
+    assert per_model_cache.get("t1", "2026-10") is not None   # sanity
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # Cache entry must be dropped (post-record invalidate).
+    assert per_model_cache.get("t1", "2026-10") is None
+
+
+async def test_post_record_skips_invalidate_when_no_cache() -> None:
+    """Pack B #5 backward compat: resolver constructed without
+    ``per_model_cache`` (Pack A callers) must not raise during _post_record.
+    """
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response())
+    snap_cache = MagicMock()
+    snap = _make_snapshot("t1", "2026-10", 0)
+    snap_repo = MagicMock()
+    snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    snap_repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(),
+        snapshot_cache=snap_cache,
+        snapshot_repo=snap_repo,
+        # per_model_cache omitted → no invalidate call, no AttributeError
+    )
+    # Must complete without raising.
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    snap_repo.set_tokens_used.assert_awaited()
