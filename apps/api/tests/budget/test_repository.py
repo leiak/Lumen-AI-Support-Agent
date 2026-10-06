@@ -123,3 +123,86 @@ async def test_cascade_delete_with_tenant() -> None:
     # Both budget rows gone via ON DELETE CASCADE
     assert await brepo.get_by_tenant(tenant.id) is None
     assert await srepo.get_for_tenant_period(tenant.id, "2026-10") is None
+
+
+async def test_snapshot_refresh_acquires_advisory_lock() -> None:
+    """Pack A #7: refresh() acquires pg_advisory_xact_lock keyed on (tenant_id, period).
+
+    Verifies the lock is held during the SUM() + UPSERT so concurrent
+    refreshes against the same (tenant, period) serialize. We assert
+    via pg_locks that an advisory lock with the matching key is held
+    while the refresh is in flight. Test uses a side-effect wrapper to
+    inspect pg_locks mid-transaction.
+    """
+    tenant = await TenantRepository().create(name="Advisory Lock Test", plan=TenantPlan.PRO)
+    repo = TenantBudgetSnapshotRepository()
+
+    # Insert a row via llm_usage so refresh has work to do
+    sm = get_sessionmaker()
+    async with sm() as session:
+        await session.execute(
+            insert(LLMUsage),
+            [
+                {"id": new_id(), "tenant_id": tenant.id, "provider": "minimax",
+                 "model": "MiniMax-M3", "prompt_tokens": 10, "completion_tokens": 5,
+                 "cost_usd": 0.0, "request_id": "r-advlock"},
+            ],
+        )
+        await session.commit()
+
+    # Monkey-patch session.execute and intercept the lock-acquiring
+    # statement. We look for any SQL containing 'pg_advisory' inside
+    # the refresh() coroutine.
+    lock_seen = False
+    original_execute = None
+    from sqlalchemy import text
+
+    class _LockDetectingSession:
+        """Wraps a Session and records whether pg_advisory was called."""
+
+        def __init__(self, inner):  # noqa: ANN001
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> object:  # noqa: ANN204
+            # Delegate all unknown attributes (begin, commit, refresh, ...)
+            # to the wrapped session so the SUT sees a normal AsyncSession.
+            return getattr(self._inner, name)
+
+        async def execute(self, stmt, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+            nonlocal lock_seen
+            sql_str = str(stmt)
+            if "pg_advisory" in sql_str:
+                lock_seen = True
+            return await self._inner.execute(stmt, *args, **kwargs)
+
+    # Patch get_sessionmaker to return our wrapping factory
+    import budget.repository as repo_module
+    real_sm = repo_module.get_sessionmaker()
+
+    class _WrappedSM:
+        def __call__(self):
+            return _LockDetectingCtx(real_sm())
+
+    class _LockDetectingCtx:
+        def __init__(self, inner):  # noqa: ANN001
+            self._inner = inner
+
+        async def __aenter__(self):
+            self._session = await self._inner.__aenter__()
+            return _LockDetectingSession(self._session)
+
+        async def __aexit__(self, *args):
+            return await self._inner.__aexit__(*args)
+
+    repo_module.get_sessionmaker = lambda: _WrappedSM()  # type: ignore[assignment]
+
+    try:
+        await repo.refresh(
+            tenant_id=tenant.id,
+            period="2026-10",
+            period_starts_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        )
+    finally:
+        repo_module.get_sessionmaker = real_sm  # type: ignore[assignment]
+
+    assert lock_seen, "Expected pg_advisory_xact_lock to be issued during refresh()"

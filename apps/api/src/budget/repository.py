@@ -145,9 +145,15 @@ class TenantBudgetSnapshotRepository:
 
         Called on cache miss when no row exists for the current period.
         Idempotent: re-running refreshes the cached value.
+
+        Pack A #7: holds ``pg_advisory_xact_lock(hashtext(tenant_id||':'||period))``
+        for the duration of the transaction so concurrent refreshes for the
+        same (tenant, period) serialize. Different (tenant, period) pairs
+        do NOT block each other (different hashtext keys).
         """
         # Late import to avoid circular dep with llm_client.models
         from llm_client.models import LLMUsage
+        from sqlalchemy import text
 
         # LLMUsage.created_at is TIMESTAMP WITHOUT TIME ZONE — strip tz if present
         # so asyncpg can bind the value without offset-naive/aware mismatch.
@@ -156,38 +162,46 @@ class TenantBudgetSnapshotRepository:
 
         sm = get_sessionmaker()
         async with sm() as session:
-            sum_expr = func.coalesce(
-                func.sum(LLMUsage.prompt_tokens + LLMUsage.completion_tokens), 0
-            )
-            result = await session.execute(
-                select(sum_expr).where(
-                    LLMUsage.tenant_id == tenant_id,
-                    LLMUsage.created_at >= period_starts_at,
+            async with session.begin():
+                # Advisory lock keyed on hashtext(tenant_id||':'||period).
+                # Same (tenant, period) → same hash → serializes.
+                # Different combinations → different hashes → no blocking.
+                # Released automatically when the transaction ends.
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+                    {"key": f"{tenant_id}:{period}"},
                 )
-            )
-            total = int(result.scalar_one())
-            stmt = (
-                pg_insert(TenantBudgetSnapshot)
-                .values(
-                    id=new_id(),
-                    tenant_id=tenant_id,
-                    period=period,
-                    tokens_used=total,
+                sum_expr = func.coalesce(
+                    func.sum(LLMUsage.prompt_tokens + LLMUsage.completion_tokens), 0
                 )
-                .on_conflict_do_update(
-                    constraint="uq_tenant_budget_snapshots_tenant_period",
-                    set_={
-                        "tokens_used": total,
-                        "last_refreshed_at": func.now(),
-                    },
+                result = await session.execute(
+                    select(sum_expr).where(
+                        LLMUsage.tenant_id == tenant_id,
+                        LLMUsage.created_at >= period_starts_at,
+                    )
                 )
-                .returning(TenantBudgetSnapshot)
-            )
-            ins_result = await session.execute(stmt)
-            row_obj = ins_result.scalar_one()
-            await session.commit()
-            await session.refresh(row_obj)
-            return row_obj
+                total = int(result.scalar_one())
+                stmt = (
+                    pg_insert(TenantBudgetSnapshot)
+                    .values(
+                        id=new_id(),
+                        tenant_id=tenant_id,
+                        period=period,
+                        tokens_used=total,
+                    )
+                    .on_conflict_do_update(
+                        constraint="uq_tenant_budget_snapshots_tenant_period",
+                        set_={
+                            "tokens_used": total,
+                            "last_refreshed_at": func.now(),
+                        },
+                    )
+                    .returning(TenantBudgetSnapshot)
+                )
+                ins_result = await session.execute(stmt)
+                row_obj = ins_result.scalar_one()
+                await session.refresh(row_obj)
+                return row_obj
 
 
 __all__ = ["TenantBudgetRepository", "TenantBudgetSnapshotRepository"]
