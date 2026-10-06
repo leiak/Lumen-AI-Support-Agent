@@ -60,6 +60,9 @@ from admin.repository import (
 )
 from admin.schemas.budget import (
     CleanupResponse,
+    CreditListResponse,
+    CreditRequest,
+    CreditResponse,
     TenantBudgetCreate,
     TenantBudgetRead,
     TenantBudgetUsageRead,
@@ -69,8 +72,11 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigRead,
 )
 from budget.cleanup import run_budget_cleanup
+from budget.credits import CreditService
+from budget.per_model import get_per_model_cache
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
+from tenant.repository import TenantRepository
 
 logger = logging.getLogger(__name__)
 
@@ -667,6 +673,120 @@ async def trigger_budget_cleanup(
     return CleanupResponse(
         deleted_rows=stats["deleted_rows"],
         cutoff_period=stats["cutoff_period"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# M4.D Pack B #2 — super-admin credit grant + list endpoints.
+#
+# POST /api/v1/admin/tenants/{tenant_id}/credits
+#   insert an immutable audit row (super_admin only — 404 for
+#   per-tenant admins via the same anti-enumeration pattern as
+#   /budget/cleanup above).
+#
+# GET /api/v1/admin/tenants/{tenant_id}/credits?period=YYYY-MM
+#   list + sum total of credit rows in the requested UTC month.
+#
+# Anti-enumeration mirrors /budget/cleanup: per-tenant admin tokens
+# have ``tenant_id`` set in claims; super-admin tokens have
+# ``tenant_id=None`` (via ``create_access_token``'s ``extra`` override)
+# and are the only callers that bypass the gate.
+#
+# Tenant-existence check uses ``TenantRepository().get_by_id`` (NOT
+# ``AdminTenantBudgetRepository`` — we don't need a budget row to exist
+# to grant credits; a tenant with no budget config can still receive
+# credits).
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tenants/{tenant_id}/credits",
+    status_code=201,
+    response_model=CreditResponse,
+)
+async def grant_credit(
+    tenant_id: str,
+    body: CreditRequest,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> CreditResponse:
+    """Grant a manual token credit to a tenant (Pack B #2).
+
+    Inserts an immutable row into ``tenant_budget_credits`` with the
+    super-admin's user id from claims (``claims["sub"]``). The
+    effective cap for the current period becomes
+    ``hard_cap_tokens + SUM(credits for current period)`` — recomputed
+    on the next resolver pre-check.
+
+    Auth: super-admin only. Per-tenant admin tokens (which always
+    carry ``tenant_id`` in claims) get a 404 — anti-enumeration
+    mirrors ``/budget/cleanup``.
+
+    Status codes
+    ------------
+    * 201 — credit row inserted; returns the row.
+    * 401 — missing / invalid bearer token (raised by require_admin).
+    * 403 — token is not admin / owner role (raised by require_admin).
+    * 404 — token has ``tenant_id`` claim (anti-enumeration) OR the
+      target tenant doesn't exist.
+    * 422 — ``tokens <= 0`` or note empty / too long (Pydantic).
+    """
+    if claims.get("tenant_id") is not None:
+        # Anti-enumeration: per-tenant admin can't probe super-admin
+        # endpoint existence. Same response as unknown tenant.
+        raise HTTPException(status_code=404, detail="not found")
+    if await TenantRepository().get_by_id(tenant_id) is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        svc_obj = CreditService(session, get_per_model_cache())
+        credit = await svc_obj.grant(
+            tenant_id=tenant_id,
+            tokens=body.tokens,
+            note=body.note,
+            granted_by=claims["sub"],
+        )
+        await session.commit()
+    return CreditResponse.model_validate(credit)
+
+
+@router.get(
+    "/tenants/{tenant_id}/credits",
+    response_model=CreditListResponse,
+)
+async def list_credits(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    period: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
+) -> CreditListResponse:
+    """List credit grants for ``(tenant_id, period)`` (Pack B #2).
+
+    Returns the chronological list of grants + the total tokens
+    granted in the period. Used by the admin SPA "Credits" tab to
+    audit who got topped up when.
+
+    Auth: super-admin only — same anti-enumeration pattern as POST.
+
+    Status codes
+    ------------
+    * 200 — list (possibly empty) of grants + total.
+    * 401 / 403 — auth gate.
+    * 404 — token has ``tenant_id`` claim OR the target tenant
+      doesn't exist.
+    * 422 — ``period`` doesn't match ``YYYY-MM`` (Pydantic / FastAPI
+      Query regex).
+    """
+    if claims.get("tenant_id") is not None:
+        raise HTTPException(status_code=404, detail="not found")
+    if await TenantRepository().get_by_id(tenant_id) is None:
+        raise HTTPException(status_code=404, detail="tenant not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        svc_obj = CreditService(session, get_per_model_cache())
+        rows = await svc_obj.list_for_period(tenant_id, period)
+        total = await svc_obj.sum_for_period(tenant_id, period)
+    return CreditListResponse(
+        credits=[CreditResponse.model_validate(r) for r in rows],
+        total_tokens=total,
     )
 
 

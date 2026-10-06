@@ -306,6 +306,154 @@ async def test_cleanup_endpoint_requires_jwt_auth(
     assert "cutoff_period" in body
 
 
+# ---------------------------------------------------------------------------
+# Pack B #2 — credit grant + list endpoints (super-admin only).
+#
+# Anti-enumeration mirrors /budget/cleanup: per-tenant admin tokens
+# always carry ``tenant_id`` in claims and get a 404 on these endpoints.
+# Super-admin tokens (claims have tenant_id=None via the ``extra``
+# override on ``create_access_token``) bypass the gate.
+# ---------------------------------------------------------------------------
+
+
+def _super_admin_token() -> str:
+    """Issue a super-admin JWT with ``claims['tenant_id'] == None``.
+
+    Mirrors the pattern in ``test_cleanup_endpoint_requires_jwt_auth``
+    above.
+    """
+    from auth.jwt import create_access_token
+
+    return create_access_token(
+        tenant_id="ignored",  # required by signature; overridden below
+        user_id="super-1",
+        role="admin",
+        extra={"tenant_id": None},  # JWT payload's tenant_id becomes None
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_credits_as_super_admin_returns_201(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Super-admin POST /credits returns 201 with the row echoed."""
+    tenant = await TenantRepository().create(
+        name="Admin Credit Grant", plan=TenantPlan.PRO
+    )
+    try:
+        super_token = _super_admin_token()
+        resp = await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/credits",
+            json={"tokens": 500, "note": "Q4 promo"},
+            headers=auth_headers(super_token),
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["tenant_id"] == tenant.id
+        assert body["tokens"] == 500
+        assert body["note"] == "Q4 promo"
+        assert body["granted_by"] == "super-1"
+        assert body["period"]  # YYYY-MM
+        assert body["id"]  # ULID is non-empty
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_credits_as_per_tenant_admin_returns_404(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Anti-enumeration: per-tenant admin probing → 404 (tenant_id != None)."""
+    tenant = await TenantRepository().create(
+        name="Admin Credit PerTenant", plan=TenantPlan.PRO
+    )
+    try:
+        # Per-tenant admin JWT has tenant_id claim set to tenant.id.
+        tenant_token = admin_token_for(tenant_id=tenant.id, user_id="admin-1")
+        resp = await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/credits",
+            json={"tokens": 500, "note": "probe"},
+            headers=auth_headers(tenant_token),
+        )
+        assert resp.status_code == 404
+        # Anti-enumeration: detail must not distinguish "exists but wrong role"
+        # from "doesn't exist".
+        assert "not found" in resp.json().get("detail", "").lower()
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_credits_as_super_admin_returns_list(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Super-admin GET /credits returns the credits array + total_tokens."""
+    tenant = await TenantRepository().create(
+        name="Admin Credit List", plan=TenantPlan.PRO
+    )
+    try:
+        super_token = _super_admin_token()
+        # Seed two grants via POST so the GET has something to return.
+        for amount, note in [(100, "first"), (200, "second")]:
+            r = await async_client.post(
+                f"/api/v1/admin/tenants/{tenant.id}/credits",
+                json={"tokens": amount, "note": note},
+                headers=auth_headers(super_token),
+            )
+            assert r.status_code == 201, r.text
+
+        # Resolve the current UTC period so the query matches the rows the
+        # POSTs just wrote.
+        from datetime import datetime, timezone
+
+        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+
+        resp = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant.id}/credits?period={current_period}",
+            headers=auth_headers(super_token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert "credits" in body
+        assert "total_tokens" in body
+        assert body["total_tokens"] == 300  # 100 + 200
+        # Rows returned in created_at-ascending order (first, then second).
+        assert len(body["credits"]) == 2
+        assert body["credits"][0]["tokens"] == 100
+        assert body["credits"][1]["tokens"] == 200
+        assert body["credits"][0]["note"] == "first"
+        assert body["credits"][1]["note"] == "second"
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_credits_as_per_tenant_admin_returns_404(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Anti-enumeration: per-tenant admin GET /credits → 404."""
+    tenant = await TenantRepository().create(
+        name="Admin Credit List 404", plan=TenantPlan.PRO
+    )
+    try:
+        tenant_token = admin_token_for(tenant_id=tenant.id, user_id="admin-1")
+        resp = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant.id}/credits?period=2026-10",
+            headers=auth_headers(tenant_token),
+        )
+        assert resp.status_code == 404
+    finally:
+        await _delete_tenant(tenant.id)
+
+
 __all__ = [
     "test_post_creates_budget_row",
     "test_post_upserts_existing_row",
@@ -315,4 +463,8 @@ __all__ = [
     "test_post_without_token_returns_401",
     "test_post_with_cross_tenant_admin_returns_404",
     "test_cleanup_endpoint_requires_jwt_auth",
+    "test_post_credits_as_super_admin_returns_201",
+    "test_post_credits_as_per_tenant_admin_returns_404",
+    "test_get_credits_as_super_admin_returns_list",
+    "test_get_credits_as_per_tenant_admin_returns_404",
 ]

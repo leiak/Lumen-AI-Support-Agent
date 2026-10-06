@@ -1,6 +1,8 @@
 """Pydantic schemas for tenant budget admin endpoints.
 
 M4.D Task 4 — admin budget config + usage snapshot.
+M4.D Pack B #2 — credit grant + list schemas (``CreditRequest``,
+``CreditResponse``, ``CreditListResponse``).
 
 Field notes
 -----------
@@ -21,7 +23,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class TenantBudgetCreate(BaseModel):
@@ -67,8 +69,61 @@ class CleanupResponse(BaseModel):
     cutoff_period: str  # YYYY-MM
 
 
+# ---------------------------------------------------------------------------
+# Pack B #2 — credit grant schemas.
+#
+# ``CreditRequest`` is the body for POST /admin/tenants/{tid}/credits.
+# ``CreditResponse`` is the per-row response shape; ``CreditListResponse``
+# wraps the array + sum for GET /admin/tenants/{tid}/credits.
+# ``from_attributes = True`` on CreditResponse lets the route handler
+# pass an ORM ``TenantBudgetCredit`` directly to ``model_validate`` —
+# matches the read pattern used by TenantBudgetRead for TenantBudget rows.
+# ---------------------------------------------------------------------------
+
+
+class CreditRequest(BaseModel):
+    """Request body for POST /admin/tenants/{tenant_id}/credits.
+
+    ``tokens`` must be positive (validated both here and by the DB
+    check constraint + the service-level guard). ``note`` is required
+    and bounded at 500 chars to keep the audit log readable.
+    """
+
+    tokens: int = Field(..., gt=0)
+    note: str = Field(..., min_length=1, max_length=500)
+
+
+class CreditResponse(BaseModel):
+    """Response body — single credit grant row.
+
+    Mirrors the :class:`TenantBudgetCredit` ORM column-for-column;
+    ``model_validate(credit_row)`` populates all fields including the
+    server-stamped ``id``, ``period``, ``granted_by``, ``created_at``.
+    """
+
+    id: str
+    tenant_id: str
+    period: str
+    tokens: int
+    note: str
+    granted_by: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CreditListResponse(BaseModel):
+    """Response body for GET /admin/tenants/{tenant_id}/credits."""
+
+    credits: list[CreditResponse]
+    total_tokens: int
+
+
 __all__ = [
     "CleanupResponse",
+    "CreditListResponse",
+    "CreditRequest",
+    "CreditResponse",
     "TenantBudgetCreate",
     "TenantBudgetRead",
     "TenantBudgetUsageRead",
