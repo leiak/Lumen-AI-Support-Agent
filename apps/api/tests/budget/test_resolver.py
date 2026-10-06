@@ -488,3 +488,115 @@ async def test_post_record_carries_over_soft_warn_fired_at() -> None:
     call_kwargs = repo.set_tokens_used.await_args.kwargs
     # Existing timestamp preserved (not overwritten with None)
     assert call_kwargs["soft_warn_fired_at"] == existing_ts
+
+
+# ---------------------------------------------------------------------------
+# Pack B #2 — BudgetResolver computes effective_cap = hard_cap_tokens + credits
+# ---------------------------------------------------------------------------
+
+
+async def test_pre_check_uses_effective_cap_includes_credits() -> None:
+    """Pack B #2: effective_cap = hard_cap_tokens + sum_for_period(credits).
+
+    Setup: hard_cap=8000, credits=2000 → effective_cap=10000.
+    tokens_used=8500 should pass pre-check (8500 < 10000),
+    even though 8500 > 8000 base.
+    """
+    budget = _make_budget(hard_cap_tokens=8000)
+    snap = _make_snapshot("t1", "2026-10", tokens_used=8500)
+    cache = MagicMock()
+    # Legacy cache path isn't used when DB-direct is enabled (default),
+    # but we mock it defensively for the fallback path.
+    cache.get_or_load_async = AsyncMock(return_value=snap)
+    snap_repo = MagicMock()
+    snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    snap_repo.upsert = AsyncMock()
+    snap_repo.set_tokens_used = AsyncMock()
+
+    credit_svc = MagicMock()
+    credit_svc.sum_for_period = AsyncMock(return_value=2000)
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
+
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=budget,
+        snapshot_cache=cache,
+        snapshot_repo=snap_repo,
+        credit_service=credit_svc,
+    )
+    result = await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # Pre-check passed (no TenantBudgetExceeded raised).
+    assert result.prompt_tokens == 100
+    # Post-record wrote the new total.
+    snap_repo.set_tokens_used.assert_awaited()
+    # Credit sum was queried exactly once for the pre-check.
+    credit_svc.sum_for_period.assert_awaited_once_with("t1", "2026-10")
+
+
+async def test_pre_check_rejects_when_used_at_effective_cap() -> None:
+    """Pack B #2: tokens_used=10000 >= effective_cap=10000 → TenantBudgetExceeded."""
+    budget = _make_budget(hard_cap_tokens=8000)
+    snap = _make_snapshot("t1", "2026-10", tokens_used=10000)
+    cache = MagicMock()
+    cache.get_or_load_async = AsyncMock(return_value=snap)
+    snap_repo = MagicMock()
+    snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    snap_repo.set_tokens_used = AsyncMock()
+
+    credit_svc = MagicMock()
+    credit_svc.sum_for_period = AsyncMock(return_value=2000)
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock()
+
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=budget,
+        snapshot_cache=cache,
+        snapshot_repo=snap_repo,
+        credit_service=credit_svc,
+    )
+    with pytest.raises(TenantBudgetExceeded):
+        await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # Inner resolver must NOT have been called (rejection happened first).
+    inner.ainvoke.assert_not_called()
+    # And no post-record write happened either.
+    snap_repo.set_tokens_used.assert_not_called()
+    # Credit sum was still queried (pre-check needs it).
+    credit_svc.sum_for_period.assert_awaited_once_with("t1", "2026-10")
+
+
+async def test_effective_cap_falls_back_when_no_credit_service() -> None:
+    """Pack B #2: backward compat — credit_service=None → effective_cap = base.
+
+    With hard_cap=8000 and tokens_used=8500 (no credits), pre-check should
+    reject because 8500 >= 8000 base cap.
+    """
+    budget = _make_budget(hard_cap_tokens=8000)
+    snap = _make_snapshot("t1", "2026-10", tokens_used=8500)
+    cache = MagicMock()
+    cache.get_or_load_async = AsyncMock(return_value=snap)
+    snap_repo = MagicMock()
+    snap_repo.get_for_tenant_period = AsyncMock(return_value=snap)
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock()
+
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=budget,
+        snapshot_cache=cache,
+        snapshot_repo=snap_repo,
+        # credit_service omitted → backward compat: effective_cap = base
+    )
+    with pytest.raises(TenantBudgetExceeded) as exc:
+        await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # Exception still carries the BASE cap (8000), not effective_cap (8000 same here).
+    assert exc.value.hard_cap_tokens == 8000
+    # Inner resolver must NOT have been called.
+    inner.ainvoke.assert_not_called()

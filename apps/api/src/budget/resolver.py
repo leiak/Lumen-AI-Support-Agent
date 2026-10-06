@@ -69,6 +69,19 @@ def _current_period(tz_name: str = "UTC") -> tuple[str, datetime]:
     return period, period_start
 
 
+def _base_hard_cap(budget: TenantBudget | None) -> int:
+    """Return the configured ``hard_cap_tokens`` or 0 when absent.
+
+    Defensive helper: a missing budget OR ``hard_cap_tokens is None``
+    both collapse to 0 so the effective-cap math stays valid. The async
+    pre-check returns early before reaching the comparison when the
+    budget is missing, but the helper is safe to call regardless.
+    """
+    if budget is None:
+        return 0
+    return budget.hard_cap_tokens or 0
+
+
 class BudgetResolver:
     """Wraps an inner resolver with monthly token hard-cap enforcement."""
 
@@ -80,12 +93,22 @@ class BudgetResolver:
         budget: TenantBudget | None,
         snapshot_cache: TenantBudgetSnapshotCache,
         snapshot_repo: TenantBudgetSnapshotRepository | None = None,
+        credit_service: Any | None = None,
+        per_model_cache: Any | None = None,
     ) -> None:
         self._inner = inner
         self._tenant_id = tenant_id
         self._budget = budget
         self._snapshot_cache = snapshot_cache
         self._snapshot_repo = snapshot_repo or TenantBudgetSnapshotRepository()
+        # Pack B #2: optional CreditService for effective_cap = base + credits.
+        # When None, the resolver falls back to base-only enforcement
+        # (backward compatible with the Pack A constructor signature).
+        self._credit_service = credit_service
+        # Pack B #5: reserved for Task 4 — accepts a PerModelBreakdownCache
+        # so we don't need to modify this constructor again when Task 4
+        # wires the invalidate calls into _post_record.
+        self._per_model_cache = per_model_cache
 
     def __call__(self, request: ChatRequest) -> Any:
         """Sync ``Resolver`` shim (M4.A protocol compatibility).
@@ -193,16 +216,38 @@ class BudgetResolver:
                 period=period,
                 period_starts_at=period_start,
             )
-        if snap.tokens_used >= self._budget.hard_cap_tokens:
+        # Pack B #2: effective_cap = hard_cap_tokens + sum(credits for period).
+        effective_cap = await self._compute_effective_cap(period)
+        if snap.tokens_used >= effective_cap:
             LLM_TENANT_BUDGET_EXCEEDED_TOTAL.inc()
             raise TenantBudgetExceeded(
                 tenant_id=self._tenant_id,
                 period=period,
                 tokens_used=snap.tokens_used,
-                hard_cap_tokens=self._budget.hard_cap_tokens,
+                hard_cap_tokens=effective_cap,
                 period_starts_at=period_start,
             )
         return period, period_start
+
+    # ---- effective cap (Pack B #2) -----------------------------------------
+
+    async def _compute_effective_cap(self, period: str) -> int:
+        """Spec §3.6: effective cap = ``hard_cap_tokens`` + sum(credits).
+
+        ``CreditService.sum_for_period`` returns 0 when no rows match
+        (never NULL), so the math is safe — no coalescing needed.
+
+        When no ``credit_service`` is configured (Pack A constructor
+        callers) we fall back to base-only enforcement. This preserves
+        backward compatibility: existing call sites that don't pass a
+        credit service see the same behavior as before.
+        """
+        base = _base_hard_cap(self._budget)
+        if self._credit_service is None:
+            return base
+        return base + await self._credit_service.sum_for_period(
+            self._tenant_id, period
+        )
 
     # ---- post-record -------------------------------------------------------
 
