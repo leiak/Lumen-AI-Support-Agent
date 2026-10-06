@@ -34,7 +34,7 @@
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
 | 22 (M4.B) | LLM Gateway Fallback Resolver — chain-based failover on M4.A resolver seam (`FallbackResolver.ainvoke` + `FallbackChainExhausted(attempts)` + per-step `lumen_llm_fallback_attempts_total{provider,model,step,outcome}` + env-driven `LLM_FALLBACK_CHAIN`) | ✅ | 10 resolver + 5 client branch + 12 gateway/env + 6 factory + e2e + 3 regression |
 | 23 (M4.C) | LLM Gateway Tenant Resolver (BYOK) — per-tenant provider API keys (Fernet at rest + LRU/TTL cache + admin POST/GET endpoints + strict-mode `TenantLlmNotConfigured` + `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` zero-label counter) | ✅ | 4 cipher + 5 ORM + 9 resolver + 7 factory + 9 admin + 3 e2e |
-| 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e |
+| 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics; **Pack A**: sticky soft-warn (`soft_warn_fired_at`) + DB-direct pre-check + `pg_advisory_xact_lock` in `refresh()` + daily cleanup cron + `/admin/budget/cleanup` super-admin endpoint) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e + **Pack A: 2 migration + 2 repo + 6 resolver + 4 cleanup + 1 admin + 3 e2e** |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -384,23 +384,29 @@ monthly cap. See `docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design`.
 |---|---|
 | `tenant_budgets` + `tenant_budget_snapshots` tables | shipped |
 | `TenantBudgetRepository` + `TenantBudgetSnapshotRepository` | shipped |
-| `TenantBudgetSnapshotCache` (LRU + TTL) | shipped |
+| `TenantBudgetSnapshotCache` (LRU + TTL) | shipped (Pack A: dead code in default config — soft escape hatch only) |
 | `BudgetResolver` (pre-check + post-record) | shipped |
 | `TenantBudgetExceeded` exception | shipped |
 | Factory wiring (opt-in per tenant) | shipped |
 | `POST /admin/tenants/{id}/budget` + GET + usage endpoints | shipped |
 | `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `SOFT_WARN_TOTAL` metrics | shipped |
+| **Pack A** — `tenant_budget_snapshots.soft_warn_fired_at` (sticky soft-warn) | shipped |
+| **Pack A** — DB-direct pre-check (`tenant_budget_pre_check_use_db`, default True) | shipped |
+| **Pack A** — `pg_advisory_xact_lock` in `refresh()` | shipped |
+| **Pack A** — `run_budget_cleanup()` (13-month retention, LIMIT 10000) | shipped |
+| **Pack A** — arq cron `budget_cleanup_task` at 02:00 UTC daily | shipped |
+| **Pack A** — `POST /admin/budget/cleanup` super-admin manual trigger | shipped |
 
-#### M4.D known tech debt
+#### M4.D known tech debt (post Pack A)
 
-1. **No automatic period reset job** — reset is lazy on next access; if a tenant goes silent for 2 months, the stale period row stays. Acceptable: rows accumulate ≤ 12/year/tenant.
-2. **No top-up mechanism** — once hit, the tenant stays blocked until manual admin action (raise `hard_cap_tokens`) or month rollover.
-3. **Snapshot inconsistency window** — ≤ TTL (60s default). Within that window, a tenant could go slightly over the cap before being rejected.
-4. **Soft-warn is per-period, not sticky** — fires once per period on threshold cross; if admin lowers the cap mid-period, the warn may re-fire or not fire correctly.
-5. **No per-model breakdown** — budget is total tokens; can't enforce "max 100k Sonnet, 1M Haiku".
-6. **No budget for non-LLM costs** (KB retrieval, embedding) — LLM only.
-7. **Snapshot refresh doesn't lock** — concurrent SUM() calls could double-insert. Mitigated by UNIQUE constraint + ON CONFLICT.
-8. **No integration with provider 429s** — provider rate limits are surfaced but don't update the budget state.
+1. ~~**No automatic period reset job** — reset is lazy on next access; if a tenant goes silent for 2 months, the stale period row stays. Acceptable: rows accumulate ≤ 12/year/tenant.~~ **Closed in Pack A** (`apps/api/src/budget/cleanup.py` + arq cron `budget_cleanup_task` at 02:00 UTC daily + `POST /admin/budget/cleanup` super-admin endpoint; 13-month retention, LIMIT 10000 batched; 4 cleanup tests + 1 admin auth test pass).
+2. **No top-up mechanism** — *Deferred to Pack B.* If a tenant hits hard cap mid-month, there's no manual credit / soft-raise escape hatch — admin must edit `tenant_budgets.hard_cap_tokens` directly.
+3. ~~**Snapshot inconsistency window** — ≤ TTL (60s default). Within that window, a tenant could go slightly over the cap before being rejected.~~ **Closed in Pack A** (`BudgetResolver._pre_check` reads `tenant_budget_snapshots` directly from DB when `tenant_budget_pre_check_use_db=True` — the default; `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` increments before any provider HTTP). 1 resolver test + 1 e2e test pass.
+4. ~~**Soft-warn is per-period, not sticky** — fires once per period on threshold cross; if admin lowers the cap mid-period, the warn may re-fire or not fire correctly.~~ **Closed in Pack A** (`tenant_budget_snapshots.soft_warn_fired_at` records the fire timestamp; sticky across calls; `set_tokens_used(soft_warn_fired_at=None)` carry-over preserves existing timestamp; 1 resolver test + 1 e2e test pass).
+5. **No per-model breakdown** — *Deferred to Pack B.* `tokens_used` aggregates all models for a tenant. If a tenant uses `claude-opus` + `claude-haiku`, the breakdown is opaque — the admin can only see total monthly tokens.
+6. **No non-LLM cost budget** — *Deferred to Pack C.* Only LLM tokens are budgeted. SES email sends, SMS transactions, KB retrieval, embedding calls — none are tracked against the monthly cap.
+7. ~~**Snapshot refresh doesn't lock** — concurrent SUM() calls could double-insert. Mitigated by UNIQUE constraint + ON CONFLICT.~~ **Closed in Pack A** (`TenantBudgetSnapshotRepository.refresh()` acquires `pg_advisory_xact_lock(hashtext(tenant_id||':'||period))` — concurrent refreshes for same `(tenant, period)` serialize; 1 repository test passes).
+8. **No provider 429 integration** — *Deferred to Pack B.* When a provider rate-limits mid-month, the resolver retries the chain (M4.B) but doesn't preempt based on budget. A tenant could rack up fallback retry overhead before `soft_warn_tokens` ever crosses.
 
 
 ## 仓库信息
