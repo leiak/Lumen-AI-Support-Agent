@@ -100,6 +100,12 @@ LLM_TENANT_BUDGET_SOFT_WARN_TOTAL = Counter(
     "Number of soft-warn events fired when a tenant crossed soft_warn_tokens.",
 )
 
+# M4.D Pack A — auto-cleanup observability.
+LLM_BUDGET_CLEANUP_ROWS_DELETED_TOTAL = Counter(
+    "lumen_budget_cleanup_rows_deleted_total",
+    "Number of tenant_budget_snapshots rows deleted by the cleanup task.",
+)
+
 
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
@@ -148,6 +154,7 @@ LUMEN_QA_SCORE_LATENCY = Histogram(
 
 
 __all__ = [
+    "LLM_BUDGET_CLEANUP_ROWS_DELETED_TOTAL",
     "LLM_CALLS_TOTAL",
     "LLM_FALLBACK_ATTEMPTS_TOTAL",
     "LLM_TENANT_BUDGET_EXCEEDED_TOTAL",

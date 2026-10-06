@@ -155,6 +155,26 @@ class Settings(BaseSettings):
         default=1024, alias="TENANT_BUDGET_CACHE_MAXSIZE"
     )
 
+    # M4.D Pack A — Operational hygiene + correctness.
+    #
+    # ``tenant_budget_pre_check_use_db`` — when True (default), the
+    # ``BudgetResolver._pre_check`` queries the snapshot table directly
+    # instead of going through the in-process LRU cache. This closes
+    # the ≤60s overshoot window documented in M4.D §11 (tech-debt #3).
+    # Set False only as a soft escape hatch for tenants that tolerate
+    # up-to-one-call overshoot in exchange for reduced DB read load.
+    #
+    # ``tenant_budget_cleanup_retention_months`` — drives the daily
+    # ``budget_cleanup_task`` arq cron. 13 = 12 audit retention + 1
+    # buffer month. Lowering it shrinks the audit window; raising it
+    # keeps more history at the cost of disk.
+    tenant_budget_pre_check_use_db: bool = Field(
+        default=True, alias="TENANT_BUDGET_PRE_CHECK_USE_DB"
+    )
+    tenant_budget_cleanup_retention_months: int = Field(
+        default=13, alias="TENANT_BUDGET_CLEANUP_RETENTION_MONTHS"
+    )
+
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
     # ``qa_judge_model`` default is a placeholder (the M2.B rollout will

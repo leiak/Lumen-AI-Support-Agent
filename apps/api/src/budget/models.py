@@ -83,6 +83,10 @@ class TenantBudgetSnapshot(Base):
         server_default=func.now(),
         nullable=False,
     )
+    soft_warn_fired_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
 
 __all__ = ["TenantBudget", "TenantBudgetSnapshot"]
