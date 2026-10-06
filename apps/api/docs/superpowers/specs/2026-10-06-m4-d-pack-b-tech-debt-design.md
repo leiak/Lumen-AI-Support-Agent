@@ -32,9 +32,10 @@ Out of scope: any change to M4.B's `FallbackResolver` chain semantics, M4.C's `T
                                 │ REST
                 ┌───────────────▼──────────────────────┐
                 │      admin/api.py (Pack A + Pack B)  │
-                │  POST /admin/budget/{tid}/credits    │  ← #2 (new)
-                │  GET  /admin/budget/{tid}/credits    │  ← #2 (new)
-                │  GET  /admin/budget/{tid}/snapshot   │  ← #5 (extend w/ breakdown)
+                │  POST /admin/tenants/{tid}/credits   │  ← #2 (new, super_admin only)
+                │  GET  /admin/tenants/{tid}/credits   │  ← #2 (new, super_admin only)
+                │  GET  /admin/tenants/{tid}/budget/   │  ← #5 (extend w/ ?breakdown=true)
+                │       usage                          │
                 └───────────────┬──────────────────────┘
                                 │
         ┌───────────────────────┼─────────────────────┐
@@ -154,47 +155,62 @@ class CreditService:
 ### 3.4 Admin API (`apps/api/src/admin/api.py`)
 
 ```python
-@router.post("/admin/budget/{tenant_id}/credits",
-             status_code=201, response_model=CreditResponse)
+@router.post(
+    "/tenants/{tenant_id}/credits",
+    status_code=201,
+    response_model=CreditResponse,
+)
 async def grant_credit(
     tenant_id: str,
     body: CreditRequest,
-    request: Request,
-):
-    require_admin(request, role="admin", tenant_id=None)  # super_admin only
-    if not await tenant_exists(tenant_id):
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> CreditResponse:
+    # Super-admin only — same anti-enumeration pattern as /budget/cleanup
+    # (Pack A #1). Per-tenant admin tokens have tenant_id set; super-admin
+    # tokens have tenant_id=None (via create_access_token's extra override).
+    if claims.get("tenant_id") is not None:
+        raise HTTPException(status_code=404, detail="not found")
+    if not await _tenant_exists(tenant_id):
         raise HTTPException(status_code=404, detail="tenant not found")
-    async with get_sessionmaker()() as session:
+    sm = get_sessionmaker()
+    async with sm() as session:
         svc = CreditService(session, get_per_model_cache())
         credit = await svc.grant(
             tenant_id=tenant_id,
             tokens=body.tokens,
             note=body.note,
-            granted_by=request.state.user.user_id,
+            granted_by=claims["sub"],
         )
         await session.commit()
-    return CreditResponse.from_orm(credit)
+    return CreditResponse.model_validate(credit)
 
 
-@router.get("/admin/budget/{tenant_id}/credits",
-            response_model=CreditListResponse)
+@router.get(
+    "/tenants/{tenant_id}/credits",
+    response_model=CreditListResponse,
+)
 async def list_credits(
     tenant_id: str,
-    period: str = Query(..., regex=r"^\d{4}-\d{2}$"),
-    request: Request = None,
-):
-    require_admin(request, role="admin", tenant_id=None)
-    if not await tenant_exists(tenant_id):
+    period: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
+    claims: Annotated[dict[str, Any], Depends(require_admin)] = None,
+) -> CreditListResponse:
+    # Super-admin only — same as POST above.
+    if claims.get("tenant_id") is not None:
+        raise HTTPException(status_code=404, detail="not found")
+    if not await _tenant_exists(tenant_id):
         raise HTTPException(status_code=404, detail="tenant not found")
-    async with get_sessionmaker()() as session:
+    sm = get_sessionmaker()
+    async with sm() as session:
         svc = CreditService(session, get_per_model_cache())
         rows = await svc.list_for_period(tenant_id, period)
         total = await svc.sum_for_period(tenant_id, period)
-    return CreditListResponse(credits=[CreditResponse.from_orm(r) for r in rows],
-                              total_tokens=total)
+    return CreditListResponse(
+        credits=[CreditResponse.model_validate(r) for r in rows],
+        total_tokens=total,
+    )
 ```
 
-Anti-enumeration: per-tenant admins get HTTP 404 on these endpoints (consistent with Pack A's pattern). `require_admin(..., tenant_id=None)` means only super_admin tokens pass; per-tenant admin tokens get a generic 404 even when the path is correct.
+Anti-enumeration mirrors Pack A's `/budget/cleanup` pattern: per-tenant admin tokens (which always have `tenant_id` set to their own tenant) get HTTP 404 on these endpoints. Only super-admin tokens (with `tenant_id=None` via `create_access_token`'s `extra` override) can grant or list credits.
 
 ### 3.5 Schemas (`apps/api/src/admin/schemas/budget.py`)
 
@@ -353,14 +369,16 @@ Cache invalidation triggers:
 Existing Pack A endpoint:
 
 ```
-GET /admin/budget/{tenant_id}/snapshot
+GET /api/v1/admin/tenants/{tenant_id}/budget/usage
 ```
 
 Extends with optional `?breakdown=true` query param:
 
 ```
-GET /admin/budget/{tenant_id}/snapshot?breakdown=true
+GET /api/v1/admin/tenants/{tenant_id}/budget/usage?breakdown=true
 ```
+
+Auth (unchanged from Pack A): per-tenant admin sees own tenant; cross-tenant → 404. Super-admin tokens (tenant_id=None) ALSO see 404 against per-tenant endpoints in this codebase — pre-existing limitation that Pack B does NOT fix (out of scope).
 
 Response (with breakdown):
 
@@ -572,7 +590,7 @@ Single `test_pack_b_e2e.py` covering the full flow:
 4. Next 200-token call succeeds → `tokens_used=1200`.
 5. Force `tokens_used=1450`, mock `RateLimited` → gate fires (remaining=50 < 1000), `TenantBudgetRateLimited` raised, HTTP 429.
 6. Verify `LLM_BUDGET_GATE_TOTAL` counter incremented by 1.
-7. Query `GET /admin/budget/{tenant_id}/snapshot?breakdown=true` → response includes 2 distinct (provider, model) entries summing to 1450 (one openai, one anthropic), `effective_cap=1500`, `credits_total=500`.
+7. Query `GET /admin/tenants/{tenant_id}/budget/usage?breakdown=true` → response includes 2 distinct (provider, model) entries summing to 1450 (one openai, one anthropic), `effective_cap=1500`, `credits_total=500`.
 
 ---
 
