@@ -17,7 +17,7 @@ Pack B closes 3 of the 4 deferred M4.D tech debt items:
 |---|------|------------------|
 | 2 | No top-up mechanism | Manual credit grant by super_admin, current-month only, immutable audit log. Effective cap = base + credits. |
 | 5 | No per-model breakdown | Read-only observability: lazy `GROUP BY` on `llm_usage` with 30s in-process cache, surfaced via `?breakdown=true` on existing snapshot endpoint. No cap enforcement. |
-| 8 | No provider 429 integration | Post-mortem budget gate: when `FallbackResolver` raises `ProviderRateLimited` and remaining budget is below a configurable threshold, raise `TenantBudgetRateLimited` (HTTP 429 + counter). Otherwise let 429 propagate. |
+| 8 | No provider 429 integration | Post-mortem budget gate: when `FallbackResolver` raises `RateLimited` and remaining budget is below a configurable threshold, raise `TenantBudgetRateLimited` (HTTP 429 + counter). Otherwise let 429 propagate. |
 
 Out of scope: any change to M4.B's `FallbackResolver` chain semantics, M4.C's `TenantResolver` / Fernet, or Pack A's pre-check / soft-warn / cleanup logic. Pack B is purely additive.
 
@@ -114,6 +114,8 @@ Index `ix_tenant_budget_credits_tenant_period` declared via `__table_args__`.
 ### 3.3 CreditService (`apps/api/src/budget/credits.py`)
 
 ```python
+from budget.resolver import _current_period   # shared with resolver for period-bound semantics
+
 class CreditService:
     def __init__(self, session: AsyncSession, per_model_cache: PerModelBreakdownCache):
         self._session = session
@@ -124,7 +126,7 @@ class CreditService:
             raise ValueError("tokens must be > 0")
         if not note.strip():
             raise ValueError("note must be non-empty")
-        period = current_period_utc()
+        period, _ = _current_period("UTC")        # credits always bound to UTC month
         credit = TenantBudgetCredit(
             id=ulid(),
             tenant_id=tenant_id,
@@ -384,7 +386,7 @@ Response (with breakdown):
 }
 ```
 
-Without `?breakdown=true`, response identical to Pack A (no behavior change for existing callers). `effective_cap` and `credits_total` always present (cheap; just one extra `SUM` query inside the snapshot fetch).
+Without `?breakdown=true`, response adds `effective_cap` and `credits_total` to Pack A's existing fields but omits `breakdown`. All Pack A fields stay present and unchanged (additive only — existing JSON parsers continue to work). `effective_cap` and `credits_total` are computed from a single `SUM(tenant_budget_credits.tokens WHERE period=current_period)` query inside the snapshot fetch.
 
 Schemas:
 
@@ -449,11 +451,14 @@ class TenantBudgetRateLimited(Exception):
 
 ### 5.2 Resolver changes (`apps/api/src/budget/resolver.py`)
 
-`ainvoke` adds a try/except around the inner call:
+Add imports for `RateLimited` (from `llm_client.exceptions`) and `TenantBudgetRateLimited` (from `budget.exceptions`). `ainvoke` adds a try/except around the inner call:
 
 ```python
+from llm_client.exceptions import RateLimited, TenantBudgetExceeded
+from budget.exceptions import TenantBudgetRateLimited
+
 async def ainvoke(self, request: ChatRequest) -> ChatResponse:
-    period = current_period(self._budget.period_anchor_tz)
+    period, _ = _current_period(self._budget.period_anchor_tz)
     snap, _ = await self._ensure_snapshot(period)
     effective_cap = await self._compute_effective_cap(period)
     if snap.tokens_used >= effective_cap:
@@ -461,7 +466,7 @@ async def ainvoke(self, request: ChatRequest) -> ChatResponse:
 
     try:
         resp = await self._inner.ainvoke(request)
-    except ProviderRateLimited:
+    except RateLimited:
         # 429 — provider rejected before token consumption.
         # Invalidate per-model cache (the request did hit a provider).
         # Do NOT post_record (no tokens billed).
@@ -521,7 +526,7 @@ Disabling the gate: set `TENANT_BUDGET_429_SKIP_THRESHOLD_TOKENS=0` (no remainin
 
 ### 5.5 FastAPI exception handler
 
-Registered in `apps/api/src/main.py` (the API app factory), alongside the existing handler for `TenantBudgetExceeded`:
+Registered in `apps/api/src/main.py` (the API app factory). No prior handler exists for `TenantBudgetExceeded` (it currently propagates as FastAPI's default 500); Pack B registers a handler **only** for the new `TenantBudgetRateLimited`:
 
 ```python
 from budget.exceptions import TenantBudgetRateLimited
@@ -540,12 +545,14 @@ async def _budget_rate_limited_handler(request, exc):
     )
 ```
 
+(`TenantBudgetExceeded` handler registration is intentionally NOT in Pack B scope — the cap-exceeded path's behavior remains unchanged from Pack A. Adding it would be a small UX improvement but is a behavior change beyond closing tech debt items #2/#5/#8.)
+
 ### 5.6 Tests for #8
 
 | Test | Asserts |
 |------|---------|
-| `test_budget_gate_raises_when_remaining_below_threshold.py` | snap at `effective_cap - 500`, mock inner raises `ProviderRateLimited` → `TenantBudgetRateLimited` |
-| `test_budget_gate_does_not_raise_when_remaining_above.py` | snap at `effective_cap - 5000`, mock raises `ProviderRateLimited` → re-raised (gate did not fire) |
+| `test_budget_gate_raises_when_remaining_below_threshold.py` | snap at `effective_cap - 500`, mock inner raises `RateLimited` → `TenantBudgetRateLimited` |
+| `test_budget_gate_does_not_raise_when_remaining_above.py` | snap at `effective_cap - 5000`, mock raises `RateLimited` → re-raised (gate did not fire) |
 | `test_budget_gate_does_not_post_record_on_429.py` | After gate path, `snapshot_repo.set_tokens_used` not called |
 | `test_budget_gate_invalidates_per_model_cache.py` | After 429 path, `per_model_cache.invalidate` called |
 | `test_budget_gate_metric_increments.py` | `LLM_BUDGET_GATE_TOTAL` count += 1 on gate fire |
@@ -563,7 +570,7 @@ Single `test_pack_b_e2e.py` covering the full flow:
 2. 5 successful 200-token calls → `tokens_used=1000`, next call raises `TenantBudgetExceeded`.
 3. Super_admin grants credit of 500 tokens → effective_cap = 1500.
 4. Next 200-token call succeeds → `tokens_used=1200`.
-5. Force `tokens_used=1450`, mock `ProviderRateLimited` → gate fires (remaining=50 < 1000), `TenantBudgetRateLimited` raised, HTTP 429.
+5. Force `tokens_used=1450`, mock `RateLimited` → gate fires (remaining=50 < 1000), `TenantBudgetRateLimited` raised, HTTP 429.
 6. Verify `LLM_BUDGET_GATE_TOTAL` counter incremented by 1.
 7. Query `GET /admin/budget/{tenant_id}/snapshot?breakdown=true` → response includes 2 distinct (provider, model) entries summing to 1450 (one openai, one anthropic), `effective_cap=1500`, `credits_total=500`.
 
