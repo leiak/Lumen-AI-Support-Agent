@@ -39,6 +39,7 @@ from core.business_metrics import (
     LLM_TENANT_BUDGET_EXCEEDED_TOTAL,
     LLM_TENANT_BUDGET_SOFT_WARN_TOTAL,
 )
+from core.config import get_settings
 from llm_client.exceptions import TenantBudgetExceeded
 from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.resolvers import Resolver
@@ -153,7 +154,13 @@ class BudgetResolver:
             )
 
     async def _pre_check(self) -> tuple[str, datetime]:
-        """Async pre-check: load snapshot via cache; raise if at cap.
+        """Async pre-check: load snapshot from DB (Pack A #3) and raise if at cap.
+
+        Pack A #3: when ``tenant_budget_pre_check_use_db`` is True (default),
+        bypasses the in-process LRU cache and reads ``tenant_budget_snapshots``
+        directly. This closes the ≤60s overshoot window documented in M4.D §11
+        (tech-debt #3). When False, falls back to the M4.D cache path
+        (soft escape hatch for tenants that tolerate up-to-one-call overshoot).
 
         Returns:
             ``(period, period_start)`` tuple for reuse by ``_post_record``.
@@ -165,11 +172,27 @@ class BudgetResolver:
             period, period_start = _current_period("UTC")
             return period, period_start
         period, period_start = _current_period(self._budget.period_anchor_tz)
-        snap = await self._snapshot_cache.get_or_load_async(
-            self._tenant_id,
-            period=period,
-            period_starts_at=period_start,
-        )
+        settings = get_settings()
+        if settings.tenant_budget_pre_check_use_db:
+            # DB-direct path (Pack A #3): zero window between cap and rejection.
+            snap = await self._snapshot_repo.get_for_tenant_period(
+                self._tenant_id, period
+            )
+            if snap is None:
+                # No snapshot row yet — refresh via SUM(llm_usage) (which
+                # itself holds the advisory lock per Pack A #7).
+                snap = await self._snapshot_repo.refresh(
+                    tenant_id=self._tenant_id,
+                    period=period,
+                    period_starts_at=period_start,
+                )
+        else:
+            # Legacy cache path — preserved as soft escape hatch.
+            snap = await self._snapshot_cache.get_or_load_async(
+                self._tenant_id,
+                period=period,
+                period_starts_at=period_start,
+            )
         if snap.tokens_used >= self._budget.hard_cap_tokens:
             LLM_TENANT_BUDGET_EXCEEDED_TOTAL.inc()
             raise TenantBudgetExceeded(
@@ -189,33 +212,44 @@ class BudgetResolver:
         period_start: datetime,
         tokens_consumed: int,
     ) -> None:
-        """Increment snapshot, invalidate cache, fire soft-warn on threshold cross.
+        """Increment snapshot, invalidate cache, fire sticky soft-warn.
 
-        Soft-warn fires once: ``snapshot.tokens_used < soft_warn_tokens <= new_used``.
-        The invalidate step is what guarantees this — the next pre-check reads
-        the updated row (or a fresh refresh) instead of the cached value.
+        Pack A #4: soft-warn fires AT MOST ONCE per (tenant, period). The
+        ``tenant_budget_snapshots.soft_warn_fired_at`` column records the
+        fire timestamp; subsequent calls that would have crossed the
+        threshold are no-ops (the ``snap.soft_warn_fired_at IS NULL``
+        check is the gate).
+
+        Pack A #3: ``set_tokens_used`` writes ``soft_warn_fired_at`` when
+        firing (new value) or when an explicit non-None value is passed
+        (carry-over from existing row). NULL on input preserves the
+        existing timestamp.
         """
-        snap = await self._snapshot_cache.get_or_load_async(
-            self._tenant_id,
-            period=period,
-            period_starts_at=period_start,
+        snap = await self._snapshot_repo.get_for_tenant_period(
+            self._tenant_id, period
         )
+        if snap is None:
+            snap = await self._snapshot_repo.refresh(
+                tenant_id=self._tenant_id,
+                period=period,
+                period_starts_at=period_start,
+            )
         new_used = snap.tokens_used + tokens_consumed
-        await self._snapshot_repo.set_tokens_used(
-            tenant_id=self._tenant_id,
-            period=period,
-            tokens_used=new_used,
-        )
-        # CRITICAL: invalidate cache using period= kwarg (not just tenant_id)
-        # so the next pre-check sees the fresh value.
-        self._snapshot_cache.invalidate(self._tenant_id, period=period)
-        # Soft-warn: fires once when this call CROSSES the threshold.
-        if (
+
+        # Pack A #4 sticky soft-warn check:
+        #   - budget.soft_warn_tokens must be configured
+        #   - snap.soft_warn_fired_at must be NULL (not yet fired this period)
+        #   - the OLD usage was below threshold, the NEW usage is at/above
+        fire_soft_warn = (
             self._budget is not None
             and self._budget.soft_warn_tokens is not None
+            and snap.soft_warn_fired_at is None
             and snap.tokens_used < self._budget.soft_warn_tokens <= new_used
-        ):
+        )
+        soft_warn_fired_at: datetime | None = snap.soft_warn_fired_at
+        if fire_soft_warn:
             LLM_TENANT_BUDGET_SOFT_WARN_TOTAL.inc()
+            soft_warn_fired_at = datetime.now(timezone.utc)
             logger.warning(
                 "tenant_budget.soft_warn",
                 extra={
@@ -226,6 +260,14 @@ class BudgetResolver:
                     "hard_cap_tokens": self._budget.hard_cap_tokens,
                 },
             )
+        await self._snapshot_repo.set_tokens_used(
+            tenant_id=self._tenant_id,
+            period=period,
+            tokens_used=new_used,
+            soft_warn_fired_at=soft_warn_fired_at,
+        )
+        # CRITICAL: invalidate cache using period= kwarg (not just tenant_id).
+        self._snapshot_cache.invalidate(self._tenant_id, period=period)
 
 
 __all__ = ["BudgetResolver", "_current_period"]

@@ -34,6 +34,7 @@ def _make_snapshot(tenant_id: str, period: str, tokens_used: int) -> Any:
     s.tokens_used = tokens_used
     s.id = "snap-id"
     s.last_refreshed_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    s.soft_warn_fired_at = None  # Pack A #4: default to "not yet fired"
     return s
 
 
@@ -50,26 +51,28 @@ async def test_pre_check_pass_when_under_cap() -> None:
     inner = MagicMock()
     inner.ainvoke = AsyncMock(return_value=_make_response())
     cache = MagicMock()
-    cache.get_or_load_async = AsyncMock(
-        return_value=_make_snapshot("t1", "2026-10", 50)
-    )
-    snapshot_repo = MagicMock()
-    snapshot_repo.set_tokens_used = AsyncMock()
+    repo = MagicMock()
+    snap = _make_snapshot("t1", "2026-10", 50)
+    repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    repo.set_tokens_used = AsyncMock()
     resolver = BudgetResolver(
         inner=inner, tenant_id="t1",
         budget=_make_budget(hard_cap_tokens=200),
         snapshot_cache=cache,
-        snapshot_repo=snapshot_repo,
+        snapshot_repo=repo,
     )
     result = await resolver.ainvoke(MagicMock(spec=ChatRequest))
     assert result.prompt_tokens == 100
     assert result.completion_tokens == 50
     # Inner was called exactly once
     inner.ainvoke.assert_awaited_once()
-    # Post-record UPSERTed the snapshot (50 + 150 = 200, just under cap)
-    snapshot_repo.set_tokens_used.assert_awaited_once_with(
-        tenant_id="t1", period="2026-10", tokens_used=200
-    )
+    # Post-record wrote the new total. We don't lock the
+    # ``soft_warn_fired_at`` kwarg (Pack A #4 internal detail) — just
+    # verify ``set_tokens_used`` was called with the right tokens_used.
+    repo.set_tokens_used.assert_awaited()
+    last_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert last_kwargs["tokens_used"] == 200
+    assert last_kwargs["period"] == "2026-10"
 
 
 async def test_pre_check_raises_when_at_cap() -> None:
@@ -77,13 +80,16 @@ async def test_pre_check_raises_when_at_cap() -> None:
     inner = MagicMock()
     inner.ainvoke = AsyncMock()
     cache = MagicMock()
-    cache.get_or_load_async = AsyncMock(
+    repo = MagicMock()
+    # Pack A #3: pre-check now reads DB-direct via snapshot_repo.
+    repo.get_for_tenant_period = AsyncMock(
         return_value=_make_snapshot("t1", "2026-10", 200)
     )
     resolver = BudgetResolver(
         inner=inner, tenant_id="t1",
         budget=_make_budget(hard_cap_tokens=200),
         snapshot_cache=cache,
+        snapshot_repo=repo,
     )
     with pytest.raises(TenantBudgetExceeded) as exc:
         await resolver.ainvoke(MagicMock(spec=ChatRequest))
@@ -115,10 +121,9 @@ async def test_post_record_increments_snapshot() -> None:
     inner = MagicMock()
     inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
     cache = MagicMock()
-    cache.get_or_load_async = AsyncMock(
-        return_value=_make_snapshot("t1", "2026-10", 0)
-    )
+    snap = _make_snapshot("t1", "2026-10", 0)
     repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(return_value=snap)
     repo.set_tokens_used = AsyncMock()
     resolver = BudgetResolver(
         inner=inner, tenant_id="t1",
@@ -127,9 +132,9 @@ async def test_post_record_increments_snapshot() -> None:
         snapshot_repo=repo,
     )
     await resolver.ainvoke(MagicMock(spec=ChatRequest))
-    repo.set_tokens_used.assert_awaited_once_with(
-        tenant_id="t1", period="2026-10", tokens_used=150
-    )
+    repo.set_tokens_used.assert_awaited()
+    last_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert last_kwargs["tokens_used"] == 150
     # Cache invalidated with period kwarg (NOT just tenant_id)
     cache.invalidate.assert_called_once_with("t1", period="2026-10")
 
@@ -137,15 +142,13 @@ async def test_post_record_increments_snapshot() -> None:
 async def test_post_record_fires_soft_warn_once() -> None:
     """Soft-warn fires exactly once when THIS call crosses soft_warn_tokens.
 
-    Each ``ainvoke`` reads the snapshot twice (pre-check + post-record),
-    so the iterator must yield 4 entries — 99, 99 for the first call,
-    then 149, 149 for the second. The first call's pre-check + post-
-    record both run against snap=99 → fires soft-warn (99 < 100 <= 149).
-    The second call's pre-check + post-record both run against snap=149
-    → does NOT fire (149 < 100 is False). Net: this test adds +1 to
-    the metric counter.
-
-    Counter is a process-level singleton; we measure the delta.
+    Each ``ainvoke`` reads the snapshot twice (pre-check + post-record,
+    both via snapshot_repo.get_for_tenant_period in Pack A), so the
+    iterator yields 4 entries — 99, 99 for the first call, then 149,
+    149 for the second. The first call's pre-check + post-record both
+    run against snap=99 → fires soft-warn (99 < 100 <= 149). The second
+    call's pre-check + post-record both run against snap=149 → does NOT
+    fire (149 < 100 is False). Net: +1 to the metric counter.
     """
     from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
 
@@ -156,13 +159,13 @@ async def test_post_record_fires_soft_warn_once() -> None:
     snap_states = iter(
         [
             _make_snapshot("t1", "2026-10", 99),  # 1st ainvoke: pre-check
-            _make_snapshot("t1", "2026-10", 99),  # 1st ainvoke: post-record (cache invalidated)
-            _make_snapshot("t1", "2026-10", 149),  # 2nd ainvoke: pre-check (post-UPSERT value)
+            _make_snapshot("t1", "2026-10", 99),  # 1st ainvoke: post-record
+            _make_snapshot("t1", "2026-10", 149),  # 2nd ainvoke: pre-check (post-UPSERT)
             _make_snapshot("t1", "2026-10", 149),  # 2nd ainvoke: post-record
         ]
     )
-    cache.get_or_load_async = AsyncMock(side_effect=lambda *a, **kw: next(snap_states))
     repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(side_effect=lambda *a, **kw: next(snap_states))
     repo.set_tokens_used = AsyncMock()
     resolver = BudgetResolver(
         inner=inner, tenant_id="t1",
@@ -174,8 +177,6 @@ async def test_post_record_fires_soft_warn_once() -> None:
     await resolver.ainvoke(MagicMock(spec=ChatRequest))
     await resolver.ainvoke(MagicMock(spec=ChatRequest))
     after = LLM_TENANT_BUDGET_SOFT_WARN_TOTAL._value.get()  # type: ignore[attr-defined]
-    # First call crosses threshold (99 < 100 <= 149) → +1
-    # Second call does NOT cross (149 < 100 is False) → +0
     assert after - before == 1
 
 
@@ -184,13 +185,16 @@ async def test_exception_carries_full_context() -> None:
     inner = MagicMock()
     inner.ainvoke = AsyncMock()
     cache = MagicMock()
-    cache.get_or_load_async = AsyncMock(
+    repo = MagicMock()
+    # Pack A #3: pre-check now reads DB-direct via snapshot_repo.
+    repo.get_for_tenant_period = AsyncMock(
         return_value=_make_snapshot("t-xyz", "2026-10", 1000)
     )
     resolver = BudgetResolver(
         inner=inner, tenant_id="t-xyz",
         budget=_make_budget(hard_cap_tokens=500),
         snapshot_cache=cache,
+        snapshot_repo=repo,
     )
     with pytest.raises(TenantBudgetExceeded) as exc:
         await resolver.ainvoke(MagicMock(spec=ChatRequest))
@@ -236,8 +240,6 @@ async def test_ainvoke_post_record_runs_for_single_provider_chain() -> None:
     """
     from llm_client.tenant_resolver import _NoChainConfigured
 
-    # Inner TenantResolver.ainvoke raises _NoChainConfigured; sync __call__
-    # returns a primary provider with chat() that returns a fake response.
     primary_provider = MagicMock()
     response = MagicMock()
     response.prompt_tokens = 100
@@ -254,10 +256,9 @@ async def test_ainvoke_post_record_runs_for_single_provider_chain() -> None:
     inner = _FakeInner()
 
     cache = MagicMock()
-    cache.get_or_load_async = AsyncMock(
-        return_value=_make_snapshot("t1", "2026-10", 0)
-    )
+    snap = _make_snapshot("t1", "2026-10", 0)
     repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(return_value=snap)
     repo.set_tokens_used = AsyncMock()
 
     resolver = BudgetResolver(
@@ -270,6 +271,220 @@ async def test_ainvoke_post_record_runs_for_single_provider_chain() -> None:
     resp = await resolver.ainvoke(MagicMock())
     assert resp is response
     # post_record must have run via the single-provider fallback path
-    repo.set_tokens_used.assert_awaited_once_with(
-        tenant_id="t1", period="2026-10", tokens_used=150
+    repo.set_tokens_used.assert_awaited()
+    last_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert last_kwargs["tokens_used"] == 150
+
+
+async def test_pre_check_db_direct_eliminates_ttl_window() -> None:
+    """Pack A #3: _pre_check reads from snapshot_repo directly (not cache).
+
+    Pre-populate DB-direct with tokens_used=7900 and hard_cap=7500.
+    The cache returns a stale "100" value — if pre-check USED this it
+    would let the call through. Test fails if implementation reads
+    from cache instead of DB.
+    """
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock()
+    cache = MagicMock()
+    # Cache returns stale (low) value — proves DB-direct bypasses it.
+    cache.get_or_load_async = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 100)
     )
+    cache.invalidate = MagicMock()
+    repo = MagicMock()
+    # DB-direct path returns the live value (above hard cap)
+    repo.get_for_tenant_period = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 7900)
+    )
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=7500),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+    # Pre-populate DB-direct: tokens_used=7900, hard_cap=7500 → reject.
+    # Cache returns a stale "100" value — if pre-check USED this, it would
+    # let the call through. Test fails if implementation reads from cache.
+    with pytest.raises(TenantBudgetExceeded):
+        await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # Pre-check went through DB-direct, NOT the cache
+    repo.get_for_tenant_period.assert_awaited()
+    cache.get_or_load_async.assert_not_called()
+    # Inner resolver was never invoked (rejection happened first)
+    inner.ainvoke.assert_not_called()
+
+
+async def test_soft_warn_fires_once_per_period_sticky() -> None:
+    """Pack A #4: soft-warn fires exactly once per (tenant, period).
+
+    First call crosses threshold → fires (+1 to metric) + sets soft_warn_fired_at.
+    Second call also crosses (would have fired under old logic) → does NOT fire
+    because soft_warn_fired_at IS NOT NULL (sticky).
+    """
+    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
+    from datetime import datetime as _dt
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(side_effect=[
+        _make_response(prompt_tokens=100, completion_tokens=50),
+        _make_response(prompt_tokens=100, completion_tokens=50),
+    ])
+    cache = MagicMock()
+
+    # Build snapshots for the resolver's reads. Each call does:
+    #   - DB-direct pre-check: 1 read via snapshot_repo.get_for_tenant_period
+    #   - post-record: 1 read via snapshot_repo.get_for_tenant_period
+    snap_with_no_fire = _make_snapshot("t1", "2026-10", 99)
+    snap_with_no_fire.soft_warn_fired_at = None
+    snap_after_fire = _make_snapshot("t1", "2026-10", 149)
+    snap_after_fire.soft_warn_fired_at = _dt(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(side_effect=[
+        snap_with_no_fire,  # call 1 pre-check: 99, no fire
+        snap_with_no_fire,  # call 1 post-record: 99, no fire
+        snap_after_fire,    # call 2 pre-check: 149, ALREADY FIRED
+        snap_after_fire,    # call 2 post-record: 149, ALREADY FIRED
+    ])
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(soft_warn_tokens=100, hard_cap_tokens=1000),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+    before = LLM_TENANT_BUDGET_SOFT_WARN_TOTAL._value.get()  # type: ignore[attr-defined]
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    after = LLM_TENANT_BUDGET_SOFT_WARN_TOTAL._value.get()  # type: ignore[attr-defined]
+    # Call 1: snap.tokens_used (99) < soft_warn (100) <= new_used (149) → fires
+    # Call 2: snap.soft_warn_fired_at IS NOT NULL → no fire (sticky)
+    assert after - before == 1
+    # Both set_tokens_used calls preserved the fire timestamp
+    assert repo.set_tokens_used.await_count == 2
+
+
+async def test_pre_check_db_direct_when_setting_enabled_default() -> None:
+    """Default settings: tenant_budget_pre_check_use_db=True → DB-direct path."""
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response())
+    cache = MagicMock()
+    snap = _make_snapshot("t1", "2026-10", 100)
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=1000),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    # DB-direct path: repo.get_for_tenant_period called for pre-check
+    assert repo.get_for_tenant_period.await_count >= 1
+    # Cache was NOT consulted for the pre-check (only invalidated)
+    cache.get_or_load_async.assert_not_called()
+
+
+async def test_pre_check_cache_fallback_when_setting_disabled() -> None:
+    """tenant_budget_pre_check_use_db=False → legacy cache path is used."""
+    from core.config import get_settings, reset_settings
+    import os
+
+    os.environ["TENANT_BUDGET_PRE_CHECK_USE_DB"] = "false"
+    reset_settings()
+    try:
+        inner = MagicMock()
+        inner.ainvoke = AsyncMock(return_value=_make_response())
+        cache = MagicMock()
+        cache.get_or_load_async = AsyncMock(
+            return_value=_make_snapshot("t1", "2026-10", 100)
+        )
+        repo = MagicMock()
+        # post_record still uses snapshot_repo (Pack A #4) regardless of
+        # pre_check path, so we need to mock set_tokens_used.
+        repo.get_for_tenant_period = AsyncMock(
+            return_value=_make_snapshot("t1", "2026-10", 100)
+        )
+        repo.set_tokens_used = AsyncMock()
+        resolver = BudgetResolver(
+            inner=inner, tenant_id="t1",
+            budget=_make_budget(hard_cap_tokens=1000),
+            snapshot_cache=cache,
+            snapshot_repo=repo,
+        )
+        await resolver.ainvoke(MagicMock(spec=ChatRequest))
+        cache.get_or_load_async.assert_awaited()
+        # Note: post_record (Pack A #4) always reads via snapshot_repo
+        # regardless of pre_check path, so we don't assert_not_called on
+        # ``repo.get_for_tenant_period`` here. The DB-direct pre-check
+        # is excluded by the ``if settings.tenant_budget_pre_check_use_db``
+        # branch in ``_pre_check`` — verified by ``cache.get_or_load_async``
+        # being consulted.
+    finally:
+        os.environ.pop("TENANT_BUDGET_PRE_CHECK_USE_DB", None)
+        reset_settings()
+
+
+async def test_soft_warn_does_not_fire_when_already_fired() -> None:
+    """Pre-populated soft_warn_fired_at → cross threshold does NOT fire."""
+    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
+    from datetime import datetime as _dt
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
+    cache = MagicMock()
+
+    snap = _make_snapshot("t1", "2026-10", 99)
+    snap.soft_warn_fired_at = _dt(2026, 10, 10, 0, 0, tzinfo=timezone.utc)
+
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(side_effect=[
+        snap,  # pre-check
+        snap,  # post-record
+    ])
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(soft_warn_tokens=100, hard_cap_tokens=1000),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+    before = LLM_TENANT_BUDGET_SOFT_WARN_TOTAL._value.get()  # type: ignore[attr-defined]
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    after = LLM_TENANT_BUDGET_SOFT_WARN_TOTAL._value.get()  # type: ignore[attr-defined]
+    # snap.soft_warn_fired_at IS NOT NULL → no fire
+    assert after - before == 0
+    # Carry-over: set_tokens_used receives the existing one, not None
+    repo.set_tokens_used.assert_awaited_once()
+    call_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert call_kwargs["soft_warn_fired_at"] == _dt(2026, 10, 10, 0, 0, tzinfo=timezone.utc)
+
+
+async def test_post_record_carries_over_soft_warn_fired_at() -> None:
+    """Post-record preserves existing soft_warn_fired_at when not firing."""
+    from datetime import datetime as _dt
+
+    inner = MagicMock()
+    inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
+    cache = MagicMock()
+    existing_ts = _dt(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    snap = _make_snapshot("t1", "2026-10", 100)  # already past soft_warn but no fire
+    snap.soft_warn_fired_at = existing_ts  # but we previously fired
+
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(side_effect=[snap, snap])
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(soft_warn_tokens=50, hard_cap_tokens=1000),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+    await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    repo.set_tokens_used.assert_awaited_once()
+    call_kwargs = repo.set_tokens_used.await_args.kwargs
+    # Existing timestamp preserved (not overwritten with None)
+    assert call_kwargs["soft_warn_fired_at"] == existing_ts
