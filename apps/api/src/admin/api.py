@@ -59,6 +59,7 @@ from admin.repository import (
     AdminTenantLLMConfigRepository,
 )
 from admin.schemas.budget import (
+    CleanupResponse,
     TenantBudgetCreate,
     TenantBudgetRead,
     TenantBudgetUsageRead,
@@ -67,6 +68,7 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
 )
+from budget.cleanup import run_budget_cleanup
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
 
@@ -625,6 +627,46 @@ async def get_tenant_budget_usage(
         soft_warn_tokens=budget.soft_warn_tokens if budget else None,
         hard_cap_tokens=budget.hard_cap_tokens if budget else None,
         period_starts_at=period_start,
+    )
+
+
+# ---------------------------------------------------------------------------
+# M4.D Pack A — budget cleanup (tech-debt #1)
+#
+# POST /api/v1/admin/budget/cleanup
+#   Manually trigger the daily retention cleanup. Cross-tenant: only
+#   callable by super-admin (no tenant_id in claims).
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/budget/cleanup",
+    response_model=CleanupResponse,
+)
+async def trigger_budget_cleanup(
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> CleanupResponse:
+    """Manually trigger budget snapshot cleanup (M4.D Pack A #1).
+
+    Cross-tenant: only callable by super-admin (no tenant_id in claims).
+    The regular per-tenant admin gets a 404 — anti-enumeration mirrors
+    the other admin endpoints in this module.
+
+    Status codes
+    ------------
+    * 200 — cleanup ran, returns ``{deleted_rows, cutoff_period}``
+    * 401 — missing / invalid bearer token (raised by require_admin)
+    * 403 — token is not admin / owner role (raised by require_admin)
+    * 404 — token has ``tenant_id`` claim (anti-enumeration)
+    """
+    if claims.get("tenant_id") is not None:
+        # Anti-enumeration: don't reveal this endpoint exists to per-tenant
+        # admins (the cleanup task affects ALL tenants globally).
+        raise HTTPException(status_code=404, detail="not found")
+    stats = await run_budget_cleanup()
+    return CleanupResponse(
+        deleted_rows=stats["deleted_rows"],
+        cutoff_period=stats["cutoff_period"],
     )
 
 

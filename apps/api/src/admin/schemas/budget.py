@@ -60,7 +60,15 @@ class TenantBudgetUsageRead(BaseModel):
     period_starts_at: datetime
 
 
+class CleanupResponse(BaseModel):
+    """Response body for POST /admin/budget/cleanup."""
+
+    deleted_rows: int
+    cutoff_period: str  # YYYY-MM
+
+
 __all__ = [
+    "CleanupResponse",
     "TenantBudgetCreate",
     "TenantBudgetRead",
     "TenantBudgetUsageRead",

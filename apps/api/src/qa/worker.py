@@ -54,6 +54,7 @@ from arq.connections import ArqRedis
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from budget.cleanup import run_budget_cleanup
 from conversation.enums import MessageRole
 from conversation.models import Conversation, Message
 from conversation.repository import MessageRepository
@@ -376,6 +377,33 @@ async def qa_sla_alert_worker(ctx: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Arq cron: daily budget snapshot cleanup (M4.D Pack A #1)
+# ---------------------------------------------------------------------------
+
+
+async def budget_cleanup_task(ctx: dict[str, Any]) -> None:
+    """Delete tenant_budget_snapshots rows older than retention cutoff.
+
+    Cron: registered at minute={0}, hour={2} (02:00 UTC daily). The
+    retention period is configurable via
+    ``TENANT_BUDGET_CLEANUP_RETENTION_MONTHS`` (default 13 = 12 audit
+    + 1 buffer). Idempotent — re-running is a no-op.
+
+    The function delegates to :func:`budget.cleanup.run_budget_cleanup`
+    which handles the batched DELETE + metric increment + log line.
+    The task wrapper exists so the arq ``cron_jobs`` registration has
+    a stable import path; the cleanup logic lives in ``budget.cleanup``
+    so admin/CLI tooling can also trigger it directly.
+    """
+    stats = await run_budget_cleanup()
+    log.info(
+        "qa.budget_cleanup.completed",
+        deleted_rows=stats["deleted_rows"],
+        cutoff_period=stats["cutoff_period"],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Worker lifecycle hooks
 # ---------------------------------------------------------------------------
 
@@ -447,6 +475,8 @@ class WorkerSettings:
 
     * :func:`qa_judge_task` — main workload, enqueued per AI message.
     * :func:`qa_sla_alert_worker` — hourly cron, scans breached SLAs.
+    * :func:`budget_cleanup_task` — daily 02:00 UTC cron, deletes
+      expired tenant_budget_snapshots rows (M4.D Pack A #1).
 
     ``max_jobs=4``: the Judge is IO-bound (HTTP roundtrip to the
     LLM provider); 4 concurrent jobs is enough headroom without
@@ -455,7 +485,10 @@ class WorkerSettings:
     """
 
     functions = [qa_judge_task]
-    cron_jobs = [cron(qa_sla_alert_worker, minute={0})]
+    cron_jobs = [
+        cron(qa_sla_alert_worker, minute={0}),
+        cron(budget_cleanup_task, hour={2}, minute={0}),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     max_jobs = 4
@@ -485,6 +518,7 @@ def build_arq_redis() -> ArqRedis:
 __all__ = [
     "WorkerSettings",
     "build_arq_redis",
+    "budget_cleanup_task",
     "qa_judge_task",
     "qa_sla_alert_worker",
 ]

@@ -255,6 +255,57 @@ async def test_post_with_cross_tenant_admin_returns_404(
         await _delete_tenant(tenant_b.id)
 
 
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_cleanup_endpoint_requires_jwt_auth(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """POST /admin/budget/cleanup — JWT auth gate.
+
+    - Without bearer token → 401
+    - With regular admin JWT (claims has tenant_id) → 404 (anti-enumeration)
+    - With super-admin JWT (claims has no tenant_id claim) → 200 with stats
+
+    The super-admin token is issued by calling ``create_access_token`` with
+    ``extra={"tenant_id": None}`` — the JWT layer accepts this and the
+    resulting claims dict has ``claims.get("tenant_id")`` return ``None``,
+    which is what the anti-enumeration check bypasses on.
+    """
+    from auth.jwt import create_access_token
+
+    # 401 — no token
+    resp = await async_client.post("/api/v1/admin/budget/cleanup")
+    assert resp.status_code == 401
+
+    # 404 — admin token (has tenant_id claim)
+    tenant_token = admin_token_for(tenant_id="t-someone-else", user_id="admin-1")
+    resp = await async_client.post(
+        "/api/v1/admin/budget/cleanup",
+        headers=auth_headers(tenant_token),
+    )
+    assert resp.status_code == 404
+
+    # 200 — super-admin (no tenant_id claim via extra override).
+    # The role must still satisfy ``require_admin``'s gate (admin/owner),
+    # so we use ``role="admin"`` here — the load-bearing part for
+    # bypassing the anti-enumeration check is ``tenant_id=None``.
+    super_token = create_access_token(
+        tenant_id="ignored",  # required by signature; overridden below
+        user_id="super-1",
+        role="admin",
+        extra={"tenant_id": None},  # JWT payload's tenant_id becomes None
+    )
+    resp = await async_client.post(
+        "/api/v1/admin/budget/cleanup",
+        headers=auth_headers(super_token),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "deleted_rows" in body
+    assert "cutoff_period" in body
+
+
 __all__ = [
     "test_post_creates_budget_row",
     "test_post_upserts_existing_row",
@@ -263,4 +314,5 @@ __all__ = [
     "test_get_usage_unknown_tenant_returns_404",
     "test_post_without_token_returns_401",
     "test_post_with_cross_tenant_admin_returns_404",
+    "test_cleanup_endpoint_requires_jwt_auth",
 ]

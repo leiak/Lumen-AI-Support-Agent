@@ -670,10 +670,12 @@ def test_worker_settings_registers_qa_judge_task() -> None:
 
 
 def test_worker_settings_cron_includes_sla_worker() -> None:
-    """``WorkerSettings.cron_jobs`` has one entry for the SLA scan."""
+    """``WorkerSettings.cron_jobs`` has two entries (SLA scan + budget cleanup)."""
     from qa.worker import WorkerSettings
 
-    assert len(WorkerSettings.cron_jobs) == 1
+    # M4.D Pack A added the daily budget cleanup cron (hour={2}, minute={0}).
+    # The pre-existing hourly SLA scan (minute={0}) is still registered.
+    assert len(WorkerSettings.cron_jobs) == 2
 
 
 def test_worker_settings_max_jobs_is_io_bound_friendly() -> None:
