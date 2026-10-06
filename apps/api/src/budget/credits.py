@@ -16,7 +16,6 @@ a credit is granted (the effective cap changed).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
