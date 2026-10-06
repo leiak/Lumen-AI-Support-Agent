@@ -144,7 +144,7 @@ class BudgetResolver:
             if self._per_model_cache is not None:
                 self._per_model_cache.invalidate(self._tenant_id, period)
             settings = get_settings()
-            await self._maybe_raise_budget_gate(period, settings)
+            await self._maybe_raise_budget_gate(period, period_start, settings)
             raise  # gate did not fire → propagate 429
         tokens_consumed = (
             getattr(resp, "prompt_tokens", 0) + getattr(resp, "completion_tokens", 0)
@@ -264,7 +264,9 @@ class BudgetResolver:
 
     # ---- post-mortem gate (Pack B #8) ---------------------------------------
 
-    async def _maybe_raise_budget_gate(self, period: str, settings: Any) -> None:
+    async def _maybe_raise_budget_gate(
+        self, period: str, period_start: datetime, settings: Any
+    ) -> None:
         """Post-mortem gate: fire when remaining budget < threshold after 429.
 
         The gate is *post-mortem*: it observes AFTER the inner provider
@@ -272,20 +274,27 @@ class BudgetResolver:
         (the pre-check already enforces ``tokens_used >= effective_cap``).
 
         When ``settings.tenant_budget_429_skip_threshold_tokens`` is 0 the
-        gate is disabled — no remaining can be negative, so ``< 0`` is
-        always false and the comparison is vacuous.
+        gate is disabled — short-circuit happens before any DB reads so a
+        disabled gate costs nothing.
 
         Effective cap (``base + credits``) is used rather than base
         alone, mirroring the pre-check semantics: tenants with
         outstanding credits should not have their runway artificially
         shrunk by a 429 observation.
+
+        ``period_start`` is passed in (not recomputed) to match the value
+        :meth:`_pre_check` used — prevents a month-boundary drift where
+        the gate observes ``(period=N+1)`` while the snapshot UPSERT
+        still references ``period_start`` from period N.
         """
+        threshold = settings.tenant_budget_429_skip_threshold_tokens
+        if threshold == 0:
+            return  # gate disabled — short-circuit before any DB reads
         snap = await self._snapshot_repo.get_for_tenant_period(
             self._tenant_id, period
         )
         if snap is None:
             # No snapshot row yet — refresh via SUM(llm_usage).
-            period_start = _current_period(self._budget.period_anchor_tz)[1]
             snap = await self._snapshot_repo.refresh(
                 tenant_id=self._tenant_id,
                 period=period,
@@ -293,9 +302,6 @@ class BudgetResolver:
             )
         effective_cap = await self._compute_effective_cap(period)
         remaining = effective_cap - snap.tokens_used
-        threshold = settings.tenant_budget_429_skip_threshold_tokens
-        if threshold == 0:
-            return  # gate disabled
         if remaining < threshold:
             LLM_BUDGET_GATE_TOTAL.inc()
             raise TenantBudgetRateLimited(
