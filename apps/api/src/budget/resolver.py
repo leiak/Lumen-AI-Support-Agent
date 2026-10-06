@@ -315,6 +315,11 @@ class BudgetResolver:
         )
         # CRITICAL: invalidate cache using period= kwarg (not just tenant_id).
         self._snapshot_cache.invalidate(self._tenant_id, period=period)
+        # Pack B #5: invalidate per-model cache so the next breakdown
+        # query reflects this new llm_usage row. The cache is optional
+        # (older Pack A callers don't pass one) — guard with None-check.
+        if self._per_model_cache is not None:
+            self._per_model_cache.invalidate(self._tenant_id, period)
 
 
 __all__ = ["BudgetResolver", "_current_period"]

@@ -59,6 +59,7 @@ from admin.repository import (
     AdminTenantLLMConfigRepository,
 )
 from admin.schemas.budget import (
+    BreakdownItem,
     CleanupResponse,
     CreditListResponse,
     CreditRequest,
@@ -73,7 +74,7 @@ from admin.schemas.tenant_llm_config import (
 )
 from budget.cleanup import run_budget_cleanup
 from budget.credits import CreditService
-from budget.per_model import get_per_model_cache
+from budget.per_model import PerModelService, get_per_model_cache
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
 from tenant.repository import TenantRepository
@@ -604,6 +605,7 @@ async def get_tenant_budget(
 async def get_tenant_budget_usage(
     tenant_id: str,
     claims: Annotated[dict[str, Any], Depends(require_admin)],
+    breakdown: bool = Query(default=False, description="Include per-model breakdown"),
 ) -> TenantBudgetUsageRead:
     """Read the current period's token usage snapshot for a tenant.
 
@@ -611,6 +613,17 @@ async def get_tenant_budget_usage(
     ``SUM(prompt_tokens + completion_tokens)`` for the period. Works
     even when the tenant has no budget row yet (returns ``None`` for
     soft_warn_tokens / hard_cap_tokens).
+
+    Pack B additions
+    ----------------
+
+    * ``effective_cap`` — ``hard_cap_tokens + credits_total``. Always
+      included; mirrors the value the resolver pre-check enforces.
+    * ``credits_total`` — ``SUM(tenant_budget_credits.tokens)`` for the
+      current period. Always 0 when no grants exist.
+    * ``breakdown`` — per-provider/per-model token sums, populated only
+      when ``?breakdown=true`` is passed. Without the query param the
+      field is ``None`` (Pack A callers see no behavioral change).
 
     Auth: requires admin JWT. Cross-tenant access returns 404
     (anti-enumeration).
@@ -624,14 +637,41 @@ async def get_tenant_budget_usage(
     period, period_start = _current_period(
         budget.period_anchor_tz if budget else "UTC"
     )
-    snap = await TenantBudgetSnapshotRepository().refresh(
-        tenant_id=tenant_id, period=period, period_starts_at=period_start,
-    )
+    # All read-only Pack B queries share a single async context so the
+    # credit SUM and optional breakdown row scans see consistent
+    # ``llm_usage`` / ``tenant_budget_credits`` state.
+    sm = get_sessionmaker()
+    async with sm() as session:
+        snap = await TenantBudgetSnapshotRepository().refresh(
+            tenant_id=tenant_id, period=period, period_starts_at=period_start,
+        )
+        # Pack B #2: credits for current period (sum into effective_cap).
+        cred_svc = CreditService(session, get_per_model_cache())
+        credits_total = await cred_svc.sum_for_period(tenant_id, period)
+        # Pack B #5: optional per-model breakdown.
+        breakdown_items: list[BreakdownItem] | None = None
+        if breakdown:
+            pm_svc = PerModelService(session, get_per_model_cache())
+            breakdown_items = [
+                BreakdownItem(
+                    provider=r.provider, model=r.model,
+                    prompt_tokens=r.prompt_tokens,
+                    completion_tokens=r.completion_tokens,
+                    total_tokens=r.total_tokens,
+                    request_count=r.request_count,
+                )
+                for r in await pm_svc.get_breakdown(tenant_id, period)
+            ]
+    base_cap = budget.hard_cap_tokens if budget else None
+    effective_cap = (base_cap or 0) + credits_total
     return TenantBudgetUsageRead(
         period=snap.period,
         tokens_used=snap.tokens_used,
         soft_warn_tokens=budget.soft_warn_tokens if budget else None,
-        hard_cap_tokens=budget.hard_cap_tokens if budget else None,
+        hard_cap_tokens=base_cap,
+        effective_cap=effective_cap,                # NEW (Pack B #2)
+        credits_total=credits_total,                # NEW (Pack B #2)
+        breakdown=breakdown_items,                  # NEW (Pack B #5)
         period_starts_at=period_start,
     )
 

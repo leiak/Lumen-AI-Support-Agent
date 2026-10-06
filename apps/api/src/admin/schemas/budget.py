@@ -52,14 +52,46 @@ class TenantBudgetRead(BaseModel):
     updated_at: datetime
 
 
+class BreakdownItem(BaseModel):
+    """One row of the per-model breakdown (Pack B #5).
+
+    Mirrors :class:`budget.per_model.ModelUsage` field-for-field. The
+    ``ModelUsage`` dataclass is service-layer (typed by SQLAlchemy);
+    this Pydantic model is the wire shape consumed by the admin SPA.
+    """
+
+    provider: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    request_count: int
+
+
 class TenantBudgetUsageRead(BaseModel):
-    """Response body — live usage snapshot for the current period."""
+    """Response body — live usage snapshot for the current period.
+
+    Pack B additions
+    ----------------
+
+    * ``effective_cap`` — ``hard_cap_tokens + sum(credits for current
+      period)``. Same value the resolver pre-check uses, so the admin
+      SPA can show the *actual* cap rather than the base config.
+    * ``credits_total`` — sum of ``tenant_budget_credits.tokens`` for
+      the current period. Always 0 when no grants exist (never NULL).
+    * ``breakdown`` — per-provider/per-model token sums. Populated only
+      when the request carries ``?breakdown=true``; ``None`` otherwise
+      (Pack A callers see no behavioral change).
+    """
 
     period: str
     tokens_used: int
     soft_warn_tokens: int | None
     hard_cap_tokens: int | None
     period_starts_at: datetime
+    effective_cap: int                                # NEW (Pack B #2)
+    credits_total: int                                # NEW (Pack B #2)
+    breakdown: list[BreakdownItem] | None = None      # NEW (Pack B #5)
 
 
 class CleanupResponse(BaseModel):
@@ -120,6 +152,7 @@ class CreditListResponse(BaseModel):
 
 
 __all__ = [
+    "BreakdownItem",
     "CleanupResponse",
     "CreditListResponse",
     "CreditRequest",

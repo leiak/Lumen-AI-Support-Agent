@@ -454,6 +454,125 @@ async def test_get_credits_as_per_tenant_admin_returns_404(
         await _delete_tenant(tenant.id)
 
 
+# ---------------------------------------------------------------------------
+# Pack B #5 — snapshot endpoint `?breakdown=true` extension.
+#
+# Backward compatibility: omitting `?breakdown=true` returns
+# `breakdown=null` (Pack A wire shape). Adding the query param
+# triggers the per-model GROUP BY scan + caches it for 30s.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_usage_with_breakdown_true_includes_breakdown(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """`?breakdown=true` returns per-model array + effective_cap + credits_total."""
+    tenant = await TenantRepository().create(
+        name="Admin Budget Breakdown", plan=TenantPlan.PRO
+    )
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        # POST a budget so the usage endpoint has a base_cap to bind.
+        await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/budget",
+            json={"soft_warn_tokens": 800, "hard_cap_tokens": 1000},
+            headers=auth_headers(token),
+        )
+        resp = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant.id}/budget/usage?breakdown=true",
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Pack B #5 new fields present.
+        assert "breakdown" in body
+        assert isinstance(body["breakdown"], list)
+        # No llm_usage rows for this fresh tenant → empty breakdown.
+        assert body["breakdown"] == []
+        # Pack B #2 new fields present.
+        assert "effective_cap" in body
+        assert "credits_total" in body
+        # No credits granted → credits_total=0; effective_cap = base (1000).
+        assert body["credits_total"] == 0
+        assert body["effective_cap"] == 1000
+        # Pack A fields still present (no regression).
+        assert "tokens_used" in body
+        assert "soft_warn_tokens" in body
+        assert "hard_cap_tokens" in body
+        assert "period_starts_at" in body
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_usage_without_breakdown_omits_breakdown(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Without `?breakdown=true`, `breakdown` is null (Pack A backward compat)."""
+    tenant = await TenantRepository().create(
+        name="Admin Budget NoBreakdown", plan=TenantPlan.PRO
+    )
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/budget",
+            json={"soft_warn_tokens": 800, "hard_cap_tokens": 1000},
+            headers=auth_headers(token),
+        )
+        resp = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant.id}/budget/usage",
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Pack B #5: breakdown defaults to None when not requested.
+        assert body.get("breakdown") is None
+        # Pack B #2: effective_cap + credits_total are still populated
+        # (they're always-on fields, not gated by `?breakdown=true`).
+        assert body["effective_cap"] == 1000
+        assert body["credits_total"] == 0
+        # Pack A fields still present (no regression).
+        assert body["tokens_used"] == 0
+        assert body["soft_warn_tokens"] == 800
+        assert body["hard_cap_tokens"] == 1000
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_usage_breakdown_cross_tenant_returns_404(
+    async_client: AsyncClient,
+    admin_token_for,
+) -> None:
+    """Cross-tenant admin probing the usage endpoint → 404 (anti-enumeration)."""
+    tenant_a = await TenantRepository().create(
+        name="Admin Budget CrossBreakdown A", plan=TenantPlan.PRO
+    )
+    tenant_b = await TenantRepository().create(
+        name="Admin Budget CrossBreakdown B", plan=TenantPlan.PRO
+    )
+    try:
+        # Admin token for tenant A trying to read tenant B's usage.
+        token_a = admin_token_for(tenant_id=tenant_a.id)
+        resp = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant_b.id}/budget/usage?breakdown=true",
+            headers=auth_headers(token_a),
+        )
+        assert resp.status_code == 404
+        # Anti-enumeration: detail must not distinguish "exists, wrong
+        # tenant" from "doesn't exist".
+        assert "not found" in resp.json().get("detail", "").lower()
+    finally:
+        await _delete_tenant(tenant_a.id)
+        await _delete_tenant(tenant_b.id)
+
+
 __all__ = [
     "test_post_creates_budget_row",
     "test_post_upserts_existing_row",
@@ -467,4 +586,7 @@ __all__ = [
     "test_post_credits_as_per_tenant_admin_returns_404",
     "test_get_credits_as_super_admin_returns_list",
     "test_get_credits_as_per_tenant_admin_returns_404",
+    "test_get_usage_with_breakdown_true_includes_breakdown",
+    "test_get_usage_without_breakdown_omits_breakdown",
+    "test_get_usage_breakdown_cross_tenant_returns_404",
 ]
