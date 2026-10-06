@@ -2,13 +2,13 @@ from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
-from starlette.requests import Request
 from starlette.responses import Response
 
+from budget.exceptions import TenantBudgetRateLimited
 from channel.enums import ChannelType
 from core.config import get_settings
 from core.health import aggregate_health, liveness, readiness
@@ -58,6 +58,29 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+# M4.D Pack B #8 — post-mortem budget gate exception handler. When
+# BudgetResolver observes a 429 from the provider chain AND remaining
+# budget is below the configured threshold, it raises
+# TenantBudgetRateLimited. We translate that into an HTTP 429 with a
+# structured body so callers (admin SPA, agent SPA) can render a
+# tenant-specific error message instead of an opaque upstream 429.
+@app.exception_handler(TenantBudgetRateLimited)
+async def _budget_rate_limited_handler(
+    request: Request, exc: TenantBudgetRateLimited
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "budget_rate_limited",
+            "tenant_id": exc.tenant_id,
+            "period": exc.period,
+            "remaining": exc.remaining,
+            "threshold": exc.threshold,
+        },
+    )
+
 
 # CORS — required for the browser-side widget (cross-origin POST to
 # /api/v1/widget/token) and the agent workspace SPA. The allowlist is

@@ -33,14 +33,16 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from budget.cache import TenantBudgetSnapshotCache
+from budget.exceptions import TenantBudgetRateLimited
 from budget.models import TenantBudget
 from budget.repository import TenantBudgetSnapshotRepository
 from core.business_metrics import (
+    LLM_BUDGET_GATE_TOTAL,
     LLM_TENANT_BUDGET_EXCEEDED_TOTAL,
     LLM_TENANT_BUDGET_SOFT_WARN_TOTAL,
 )
 from core.config import get_settings
-from llm_client.exceptions import TenantBudgetExceeded
+from llm_client.exceptions import RateLimited, TenantBudgetExceeded
 from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.resolvers import Resolver
 from llm_client.types import ChatRequest, ChatResponse
@@ -135,6 +137,15 @@ class BudgetResolver:
             # _post_record still runs and cap tracking stays consistent.
             primary = self._inner(request)  # sync __call__ returns primary provider
             resp = await primary.chat(request)
+        except RateLimited:
+            # Provider chain exhausted on 429. Invalidate per-model cache
+            # (a request did hit a provider), do NOT post_record (no tokens
+            # billed), then check budget gate.
+            if self._per_model_cache is not None:
+                self._per_model_cache.invalidate(self._tenant_id, period)
+            settings = get_settings()
+            await self._maybe_raise_budget_gate(period, settings)
+            raise  # gate did not fire → propagate 429
         tokens_consumed = (
             getattr(resp, "prompt_tokens", 0) + getattr(resp, "completion_tokens", 0)
         )
@@ -250,6 +261,49 @@ class BudgetResolver:
         return base + await self._credit_service.sum_for_period(
             self._tenant_id, period
         )
+
+    # ---- post-mortem gate (Pack B #8) ---------------------------------------
+
+    async def _maybe_raise_budget_gate(self, period: str, settings: Any) -> None:
+        """Post-mortem gate: fire when remaining budget < threshold after 429.
+
+        The gate is *post-mortem*: it observes AFTER the inner provider
+        chain has already raised :class:`RateLimited`. It does NOT preempt
+        (the pre-check already enforces ``tokens_used >= effective_cap``).
+
+        When ``settings.tenant_budget_429_skip_threshold_tokens`` is 0 the
+        gate is disabled — no remaining can be negative, so ``< 0`` is
+        always false and the comparison is vacuous.
+
+        Effective cap (``base + credits``) is used rather than base
+        alone, mirroring the pre-check semantics: tenants with
+        outstanding credits should not have their runway artificially
+        shrunk by a 429 observation.
+        """
+        snap = await self._snapshot_repo.get_for_tenant_period(
+            self._tenant_id, period
+        )
+        if snap is None:
+            # No snapshot row yet — refresh via SUM(llm_usage).
+            period_start = _current_period(self._budget.period_anchor_tz)[1]
+            snap = await self._snapshot_repo.refresh(
+                tenant_id=self._tenant_id,
+                period=period,
+                period_starts_at=period_start,
+            )
+        effective_cap = await self._compute_effective_cap(period)
+        remaining = effective_cap - snap.tokens_used
+        threshold = settings.tenant_budget_429_skip_threshold_tokens
+        if threshold == 0:
+            return  # gate disabled
+        if remaining < threshold:
+            LLM_BUDGET_GATE_TOTAL.inc()
+            raise TenantBudgetRateLimited(
+                tenant_id=self._tenant_id,
+                period=period,
+                remaining=remaining,
+                threshold=threshold,
+            )
 
     # ---- post-record -------------------------------------------------------
 
