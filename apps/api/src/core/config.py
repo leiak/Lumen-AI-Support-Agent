@@ -175,6 +175,28 @@ class Settings(BaseSettings):
         default=13, alias="TENANT_BUDGET_CLEANUP_RETENTION_MONTHS"
     )
 
+    # M4.D Pack B — tech-debt follow-ups (#2/#5/#8).
+    #
+    # ``tenant_budget_429_skip_threshold_tokens`` — post-mortem budget
+    # gate. After a 429 from the provider chain, if the tenant's
+    # remaining tokens (effective_cap - tokens_used) is below this
+    # threshold, BudgetResolver raises TenantBudgetRateLimited
+    # (HTTP 429) instead of letting the upstream 429 propagate.
+    # Set to 0 to disable the gate entirely (no remaining can be < 0).
+    #
+    # ``tenant_budget_per_model_cache_ttl_seconds`` — in-process TTL
+    # for the per-model breakdown cache backing the
+    # ``?breakdown=true`` snapshot query. Short enough that admin
+    # dashboards refresh quickly, long enough to absorb burst traffic.
+    tenant_budget_429_skip_threshold_tokens: int = Field(
+        default=1000,
+        alias="TENANT_BUDGET_429_SKIP_THRESHOLD_TOKENS",
+    )
+    tenant_budget_per_model_cache_ttl_seconds: int = Field(
+        default=30,
+        alias="TENANT_BUDGET_PER_MODEL_CACHE_TTL_SECONDS",
+    )
+
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
     # ``qa_judge_model`` default is a placeholder (the M2.B rollout will

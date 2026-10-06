@@ -59,11 +59,16 @@ def test_upgrade_adds_soft_warn_fired_at_column(_alembic_upgraded: None) -> None
 
 
 def test_downgrade_drops_soft_warn_fired_at_column() -> None:
-    """After downgrade -1, the column is removed."""
+    """After downgrade -2 (skipping migration 19), the column is removed.
+
+    Pack B added migration 19 on top of 18; downgrade -1 now stops at
+    18 (where this column was added), so we must downgrade -2 to reach
+    the pre-18 state and observe the drop.
+    """
     cfg = Config("alembic.ini")
     cfg.set_main_option("script_location", "migrations")
     command.upgrade(cfg, "head")
-    command.downgrade(cfg, "-1")  # one revision back
+    command.downgrade(cfg, "-2")  # skip migration 19, back to pre-18 state
     cols = _columns_for("tenant_budget_snapshots")
     assert "soft_warn_fired_at" not in cols
     # Re-upgrade to leave DB clean for the next test.

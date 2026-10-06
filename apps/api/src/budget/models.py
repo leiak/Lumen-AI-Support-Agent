@@ -14,9 +14,12 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -89,4 +92,39 @@ class TenantBudgetSnapshot(Base):
     )
 
 
-__all__ = ["TenantBudget", "TenantBudgetSnapshot"]
+class TenantBudgetCredit(Base):
+    """One row per super_admin credit grant — immutable audit log.
+
+    Effective cap for a tenant in period P is computed as
+    ``tenant_budgets.hard_cap_tokens + SUM(tenant_budget_credits.tokens
+    WHERE period = P)``. Rows are append-only; no UPDATE/DELETE in app
+    code. Negative-token revocations (future) would be new rows with
+    negative tokens — schema accommodates but is out of Pack B scope.
+    """
+
+    __tablename__ = "tenant_budget_credits"
+    __table_args__ = (
+        Index(
+            "ix_tenant_budget_credits_tenant_period",
+            "tenant_id", "period",
+        ),
+        CheckConstraint("tokens > 0", name="ck_tenant_budget_credits_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(26), primary_key=True)  # ULID
+    tenant_id: Mapped[str] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    period: Mapped[str] = mapped_column(String(7), nullable=False)  # YYYY-MM
+    tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    granted_by: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+
+__all__ = ["TenantBudget", "TenantBudgetSnapshot", "TenantBudgetCredit"]

@@ -106,6 +106,15 @@ LLM_BUDGET_CLEANUP_ROWS_DELETED_TOTAL = Counter(
     "Number of tenant_budget_snapshots rows deleted by the cleanup task.",
 )
 
+# M4.D Pack B — post-mortem budget gate (#8). Fired by BudgetResolver
+# after a 429 from the provider chain when remaining budget is below
+# the configurable threshold. Zero-label by design; tenant_id stays
+# in log lines only (mirrors M4.C/M4.D discipline).
+LLM_BUDGET_GATE_TOTAL = Counter(
+    "lumen_llm_budget_gate_total",
+    "Number of times BudgetResolver raised TenantBudgetRateLimited after observing 429",
+)
+
 
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
@@ -155,6 +164,7 @@ LUMEN_QA_SCORE_LATENCY = Histogram(
 
 __all__ = [
     "LLM_BUDGET_CLEANUP_ROWS_DELETED_TOTAL",
+    "LLM_BUDGET_GATE_TOTAL",
     "LLM_CALLS_TOTAL",
     "LLM_FALLBACK_ATTEMPTS_TOTAL",
     "LLM_TENANT_BUDGET_EXCEEDED_TOTAL",
