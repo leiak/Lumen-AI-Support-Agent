@@ -6,7 +6,9 @@ services:
       POSTGRES_PASSWORD: aicustomer
       POSTGRES_DB: aicustomer
     ports:
-      - "5432:5432"
+      # Offset 25432 to avoid colliding with aitown-postgres-1 (127.0.0.1:5432)
+      # when both are up; postgres inside the compose network still listens on 5432.
+      - "25432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +20,8 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      # Offset 26379 — lumen-platform-redis already uses 26380.
+      - "26379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -28,9 +31,77 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.10.0
     ports:
-      - "6333:6333"
+      # Offset 26333 — qdrant is otherwise unbound; pick a stable non-default port.
+      - "26333:6333"
     volumes:
       - qdrantdata:/qdrant/storage
+
+  # Migration one-shot. Runs ``alembic upgrade head`` against the postgres
+  # service. The api service below depends on this with
+  # ``service_completed_successfully`` so uvicorn never comes up against
+  # an un-migrated schema. The image is the same as api (the wheel
+  # installs alembic), with volume mounts of src + alembic.ini +
+  # migrations so the M1 Dockerfile import issue
+  # (see memory: dockerfile-import-bug) is bypassed at runtime.
+  migrate:
+    build:
+      context: ../apps/api
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+        SERVICE_VERSION: ${SERVICE_VERSION:-dev}
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SERVICE_NAME: ai-customer-api
+      SERVICE_VERSION: ${SERVICE_VERSION:-dev}
+      GIT_SHA: ${GIT_SHA:-unknown}
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@postgres:5432/aicustomer
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
+      PYTHONPATH: /app/src
+    volumes:
+      # src — for absolute imports (``from core.config import ...``)
+      - ../apps/api/src:/app/src:ro
+      # alembic.ini + migrations — needed for `alembic upgrade head`
+      # to find the script_location + version_path
+      - ../apps/api/alembic.ini:/app/alembic.ini:ro
+      - ../apps/api/migrations:/app/migrations:ro
+    command:
+      - sh
+      - -c
+      - "cd /app && alembic upgrade head"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # E2E seed one-shot. Runs the base tenant/users/channel seed
+  # (tests/e2e/scripts/seed.py) followed by the Pack B budget/credit/
+  # usage seed (tests/e2e/scripts/seed_budget.py). Idempotent — safe
+  # to re-run. Both scripts auto-locate the repo root and anchor
+  # ``apps/api/src`` onto sys.path, so mounting the repo root at
+  # /repo is enough.
+  seed:
+    # Reuse the api-built image (alembic + python deps + curl already present).
+    image: aicustomer-api
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SERVICE_NAME: ai-customer-api
+      SERVICE_VERSION: ${SERVICE_VERSION:-dev}
+      GIT_SHA: ${GIT_SHA:-unknown}
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@postgres:5432/aicustomer
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
+      PYTHONPATH: /repo/apps/api/src
+    volumes:
+      - ../apps/api/src:/repo/apps/api/src:ro
+      - ../tests/e2e/scripts:/repo/tests/e2e/scripts:ro
+    command:
+      - sh
+      - -c
+      - "python -u /repo/tests/e2e/scripts/seed.py && python -u /repo/tests/e2e/scripts/seed_budget.py"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
   api:
     build:
@@ -88,6 +159,8 @@ services:
         condition: service_started
       minio:
         condition: service_healthy
+      seed:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   web:
@@ -95,6 +168,10 @@ services:
       context: ../apps/web
       dockerfile: Dockerfile
       args:
+        # Browser-side base URL: the SPA hits /api/v1/ which nginx
+        # proxies to api:8000 inside the compose network (see
+        # apps/web/nginx.conf). For external browser access (port
+        # mapping 8080:80), this stays as localhost:8080.
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
     ports:
       - "8080:80"
@@ -107,19 +184,28 @@ services:
   # http://minio:9000 and uses MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
   # as the access/secret keys. Production swaps this for real AWS S3
   # by overriding OBJECT_STORE_* env vars — no code change required.
+  #
+  # cleanstart/minio is a hardened drop-in replacement for minio/minio
+  # (Docker Hub rate-limits the official image when pulling via certain
+  # registries in CN). Runs as root because the named ``minio-data``
+  # volume is created owned by root by default — without this, MinIO
+  # fails at startup with "file access denied" on /data.
   minio:
-    image: minio/minio:latest
+    image: cleanstart/minio:latest
+    user: "0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "29000:9000"
+      - "29001:9001"
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # cleanstart/minio ships wget (no curl, no bash) — use wget
+      # to probe the standard MinIO liveness endpoint.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
