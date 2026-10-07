@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI) -> Any:
     # collection exists. Failures are logged at WARNING (the hook
     # itself never raises) so a flaky Qdrant at boot doesn't block
     # the API; uploads will get a 503 instead of crashing.
-    await ensure_image_collection(await get_qdrant_client())
+    await ensure_image_collection(get_qdrant_client())
     yield
     # Close the embedding client's singleton AsyncOpenAI so its HTTPX pool
     # is released; safe even if embed_texts was never called (no-op).
