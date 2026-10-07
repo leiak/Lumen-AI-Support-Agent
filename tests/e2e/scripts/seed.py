@@ -56,6 +56,12 @@ from auth.password import hash_password  # noqa: E402
 from channel.enums import ChannelStatus, ChannelType  # noqa: E402
 from channel.models import Channel  # noqa: E402
 from conversation.enums import ConversationStatus, MessageRole  # noqa: E402
+# ticket.models MUST be imported before conversation.models so that the
+# ``conversations.ticket_id`` ForeignKey resolves against the tickets
+# table at ORM flush time. Importing conversation first triggers
+# ``sqlalchemy.exc.NoReferencedTableError: Foreign key associated with
+# column 'conversations.ticket_id' could not find table 'tickets'``.
+from ticket import models as ticket_models  # noqa: E401,F401,E402  -- needed for FK resolution
 from conversation.models import Conversation, Message  # noqa: E402
 from core.database import get_session, reset_engine, reset_sessionmaker  # noqa: E402
 from core.id_gen import new_id  # noqa: E402
