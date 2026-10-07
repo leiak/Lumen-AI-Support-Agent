@@ -396,6 +396,14 @@ monthly cap. See `docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design`.
 | **Pack A** — `run_budget_cleanup()` (13-month retention, LIMIT 10000) | shipped |
 | **Pack A** — arq cron `budget_cleanup_task` at 02:00 UTC daily | shipped |
 | **Pack A** — `POST /admin/budget/cleanup` super-admin manual trigger | shipped |
+| **Pack B** — `tenant_budget_credits` table (immutable audit log) | shipped |
+| **Pack B** — `CreditService` (grant + sum_for_period, UTC-month-bound) | shipped |
+| **Pack B** — `effective_cap = hard_cap_tokens + sum(credits for period)` | shipped |
+| **Pack B** — `POST/GET /admin/tenants/{tid}/credits` super-admin endpoints | shipped |
+| **Pack B** — `PerModelBreakdownCache` (in-process 30s TTL) + `PerModelService` | shipped |
+| **Pack B** — `?breakdown=true` query on snapshot endpoint | shipped |
+| **Pack B** — `TenantBudgetRateLimited` exception + post-mortem gate | shipped |
+| **Pack B** — `LLM_BUDGET_GATE_TOTAL` metric + FastAPI handler → HTTP 429 | shipped |
 
 #### M4.D known tech debt (post Pack A)
 
