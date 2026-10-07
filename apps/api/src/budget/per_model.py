@@ -147,9 +147,15 @@ class PerModelService:
         cached = self._cache.get(tenant_id, period)
         if cached is not None:
             return cached
+        # LLMUsage.created_at is TIMESTAMP WITHOUT TIME ZONE — strip tzinfo
+        # before the WHERE clause so asyncpg doesn't reject the bind value
+        # with "can't subtract offset-naive and offset-aware datetimes".
+        # We keep the UTC anchor for the period month boundary computation,
+        # then drop tz for the comparison (matches budget/repository.py's
+        # refresh path which uses the same trick).
         period_start = datetime.strptime(period + "-01", "%Y-%m-%d").replace(
             tzinfo=timezone.utc
-        )
+        ).replace(tzinfo=None)
         result = await self._session.execute(
             select(
                 LLMUsage.provider,
