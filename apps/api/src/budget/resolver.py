@@ -199,7 +199,7 @@ class BudgetResolver:
 
         Pack B follow-up: when a ``precheck_cache`` is wired in, the
         ``(snap, effective_cap)`` result is held for
-        ``tenant_budget_precheck_cache_ttl_s`` (default 5s) so a hot
+        ``tenant_budget_precheck_cache_ttl_seconds`` (default 5s) so a hot
         tenant with no new ``llm_usage`` rows between turns pays zero
         DB round-trips for the pre-check. ``_post_record`` invalidates
         the entry on every successful token consumption.

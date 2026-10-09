@@ -32,8 +32,12 @@ class PrecheckCache:
         key = (tenant_id, period)
         now = time.monotonic()
         cached = self._store.get(key)
-        if cached is not None and (now - cached[0]) < self._ttl:
-            return cached[1]
+        if cached is not None:
+            if (now - cached[0]) < self._ttl:
+                return cached[1]
+            # Stale entry — drop it before reloading so the dict doesn't
+            # accumulate expired tuples across month boundaries.
+            del self._store[key]
         value = await loader()
         self._store[key] = (now, value)
         return value

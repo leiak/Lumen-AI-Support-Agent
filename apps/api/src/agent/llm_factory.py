@@ -94,7 +94,7 @@ def _build_budget_snapshot_cache() -> TenantBudgetSnapshotCache:
 def _build_precheck_cache() -> PrecheckCache:
     """Construct the per-process ``PrecheckCache`` singleton (Pack B follow-up).
 
-    TTL driven by ``tenant_budget_precheck_cache_ttl_s`` (default 5s).
+    TTL driven by ``tenant_budget_precheck_cache_ttl_seconds`` (default 5s).
     Hot tenants with no new ``llm_usage`` rows between turns pay zero
     DB round-trips for the pre-check; ``_post_record`` invalidates the
     entry on every successful write.
@@ -103,7 +103,7 @@ def _build_precheck_cache() -> PrecheckCache:
     if _precheck_cache is None:
         settings = get_settings()
         _precheck_cache = PrecheckCache(
-            ttl_seconds=settings.tenant_budget_precheck_cache_ttl_s,
+            ttl_seconds=settings.tenant_budget_precheck_cache_ttl_seconds,
         )
     return _precheck_cache
 
