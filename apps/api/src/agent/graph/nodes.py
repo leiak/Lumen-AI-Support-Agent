@@ -205,7 +205,7 @@ def make_retrieve_node(
                 error_type=type(exc).__name__,
             )
             return {"rag_messages": []}
-        except Exception:
+        except Exception as exc:
             # Defence-in-depth safety net — should NEVER fire
             # because RAGService already swallows its own
             # exceptions, but if a regression sneaks in we
@@ -213,12 +213,12 @@ def make_retrieve_node(
             # log + fallback helper keeps the bare-except shape
             # consistent across the agent graph. PII-safe:
             # no exc_info, no repr, no customer text.
-            from agent.graph._safe import safe_respond
+            from agent.graph._safe import log_and_return
 
-            return safe_respond(
-                fn=lambda: {"rag_messages": []},
+            return log_and_return(
                 fallback={"rag_messages": []},
                 event="agent.graph.retrieve_failed_unexpected",
+                exc=exc,
                 tenant_id=state["tenant_id"],
                 conversation_id=state["conversation_id"],
             )
@@ -468,7 +468,7 @@ def make_llm_node(
                 "escalated": False,
                 "tool_iterations": iterations,
             }
-        except Exception:
+        except Exception as exc:
             # Defence-in-depth safety net — should NEVER fire
             # because the typed set above covers every documented
             # LLM-client error mode, but if a regression sneaks
@@ -477,20 +477,16 @@ def make_llm_node(
             # bare-except shape consistent across the agent
             # graph. PII-safe: no exc_info, no repr, no
             # customer text.
-            from agent.graph._safe import safe_respond
+            from agent.graph._safe import log_and_return
 
-            return safe_respond(
-                fn=lambda: {
-                    "final_text": FALLBACK_MESSAGE,
-                    "escalated": False,
-                    "tool_iterations": iterations,
-                },
+            return log_and_return(
                 fallback={
                     "final_text": FALLBACK_MESSAGE,
                     "escalated": False,
                     "tool_iterations": iterations,
                 },
                 event="agent.graph.llm_failed_unexpected",
+                exc=exc,
                 tenant_id=tenant_id,
                 conversation_id=state["conversation_id"],
             )

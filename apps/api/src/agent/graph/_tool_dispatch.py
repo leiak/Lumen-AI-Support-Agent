@@ -355,7 +355,7 @@ async def dispatch_tool_calls(
                 iterations,
                 current_response,
             )
-        except Exception:
+        except Exception as exc:
             # Defence-in-depth safety net — should NEVER fire
             # because the typed set above covers every documented
             # LLM-client error mode, but if a regression sneaks
@@ -364,25 +364,16 @@ async def dispatch_tool_calls(
             # bare-except shape consistent across the agent
             # graph. PII-safe: no exc_info, no repr, no
             # customer text.
-            #
-            # ``iterations`` is a while-loop variable (mutated
-            # via ``iterations += 1`` above); the default-arg
-            # binding in the lambda snapshots the value at
-            # closure-creation time and silences B023.
-            from agent.graph._safe import safe_respond
+            from agent.graph._safe import log_and_return
 
-            terminal = safe_respond(
-                fn=lambda iterations=iterations: {
-                    "final_text": FALLBACK_MESSAGE,
-                    "escalated": False,
-                    "tool_iterations": iterations,
-                },
+            terminal = log_and_return(
                 fallback={
                     "final_text": FALLBACK_MESSAGE,
                     "escalated": False,
                     "tool_iterations": iterations,
                 },
                 event="agent.graph.llm_failed_unexpected",
+                exc=exc,
                 tenant_id=tenant_id,
                 conversation_id=conversation_id,
             )
