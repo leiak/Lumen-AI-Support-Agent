@@ -303,47 +303,51 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 - `POST /api/v1/tickets/{ticket_id}/transition` — 状态机迁移 (`200` 成功 / `404` 缺失 / `409 Conflict` 非法迁移)
 - `GET /api/v1/tickets/{ticket_id}/events` — 工单审计事件日志 (按时间倒序;空列表 = `200 []`)
 
-## 已知技术债 / Stage 10+ 关注点
+## 已知技术债 — 分类索引
 
-1. **`_reset_db_singletons` autouse fixture** 在多个集成测试文件重复 — Stage 10 集中到 `apps/api/tests/conftest.py`
-2. ~~**`require_admin` / `require_agent_or_admin` 历史 inline 副本**~~ — Stage 8.1 已整合到 `auth/dependencies.py`
-3. ~~**真实 OpenAI M1 阈值校准** — `make eval-rag-real` 路径待 Stage 10 实施~~ — Stage 10.3 完成 (`eval-rag-real` 现在跑真实 Doubao embedding,校准 `DEFAULT_SCORE_THRESHOLD=0.45`)
-4. **多模态 RAG** — `_log_ocr_todo_once` 留待 Stage 7+ 接 vision model
-5. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
-6. ~~**第二 tool / 工具循环** — 当前 `tool_calls[:1]` first-wins,第二个 tool 时改 loop-until-no-tool-calls~~ — Stage 12 已替换为完整 tool loop(最多 5 轮)
-7. ~~**LLM 流式已到引擎层未接 WS** — provider/client 流式已实现,客户会话 `message.delta` 帧待接入~~ — Stage 10.1 完成 (`src/channel/inbound.py` 已有 `_broadcast_ai_delta` / `_stream_delta`,2 个 E2E 测试覆盖)
-8. **业务指标当前无 tenant_id label** — Stage 11.3 故意不加避免 Prometheus 基数爆炸;按需租户维度走 `llm_usage` 表(账单路径)
-9. **demo mp4 留 presenter** — Stage 11.5 自动化脚本只产 11 张 PNG;mp4 需要 presenter + 音频,自动化做不出
-10. **Plan 10.4 LLM/tracing spans 留 M3** — M1 close-out 只做 request_id 贯穿(Stage 11.2);OpenTelemetry 留到 M3 LLM Gateway
-11. **Plan 10.7 K8s manifests 留 M3/M4** — M1 docker-compose 单区域部署够用
-12. **`search_internal_kb` 只查 KB 文本** — Stage 12 只检索 Qdrant 文本块;Stage 12.5/M2.B 接 vision/多模态(图/PDF 图表)
-13. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(M2.A 之前用 `/inbox/{id}` 旁边 panel 占位,`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
-14. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批用真实 AI 回复跑 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
-15. **M2.B 占位** — 邮件渠道 + 多模态 + 历史会话挖掘;预计 4-6 周
-16. ~~**Stage 16 SES inbound webhook 用 `X-Tenant-ID` header 路由** — header 可被伪造;生产应改 SNS 签名 / SigV4 / 收件人反查 (`Channel.config_json.tenant_id`) 任一方式**~~ — M3 tech-debt #16完成 (webhook 通过 `Channel.config_json["address"]` 反查 `parsed.to_address` 解析 `tenant_id`;`X-Tenant-ID` header 不再用于解析,仅在与解析结果不符时记 WARNING `email.inbound.header_tenant_mismatch`;SES 5xx 重试路径 + 重复 `message_id` 也修复(`EmailInboundResult.is_duplicate` + `conversation_id` 返回);`default_tenant_id` config 字段保留向后兼容,webhook 已不读)
-17. ~~**Stage 18 admin KB drafts API 未鉴权** — `tenant_id` / `reviewer_id` 当前是 query 参数,生产必须改 JWT `Depends(get_current_user)`,从 claims 读 tenant + reviewer(`apps/api/src/admin/api.py`)~~ — M3 tech-debt #17 完成 (4 endpoints `Depends(require_admin)`,`tenant_id` / `reviewer_id` 从 JWT claims 读,17 admin tests)
-18. ~~**PDF 文本切片未索引到 `kb_vectors`** — Stage 17 仅图片向量入 `kb_image_vectors`;PDF 的 text chunks 当前只记录计数,不留 Qdrant 向量(待 M3 接 text + image 双索引)~~ — M3 tech-debt #18 完成 (PDF text chunks 入 `article_chunks` Qdrant collection,`source_type="pdf_text"` + `page_num` + `chunk_index` + `text`,`MultimodalRetriever` RRF 检索可见)
-19. ~~**Vision embedding 仅 Doubao** — `DoubaoVisionEmbedder` 是唯一视觉编码器;OpenAI CLIP / Anthropic Claude Vision / 开源 SigLIP 适配器待 M3 多模型路由**~~ — M3 tech-debt #19完成 (`vision_provider` env 选择 `doubao` / `openai_clip` / `voyage`,默认 Doubao;新加 `OpenAIVisionEmbedder` (768-dim) + `VoyageVisionEmbedder` (1024-dim) + `get_vision_embedder(settings)` 工厂;每个 provider 写独立 Qdrant collection (`kb_image_vectors_doubao` / `_clip` / `_voyage`),`kb_image_vectors` 保留为 legacy alias 指向当前 provider collection;9 个 unit tests)
-20. ~~**KB 草稿 admin SPA UI 推迟到 M3** — Stage 18 后端 API + 数据模型完整(`/admin/kb-drafts` list/detail/approve/reject),admin 前端页面留 M3 实施(现阶段 admin 用 DB / curl 复核)**~~ — M3 tech-debt #20完成 (`/admin/kb-drafts` route 在现有 agent SPA 内,`AdminGuard` 包装 `AuthGuard`,`useIsAdmin` hook 读 JWT `role` claim;`DraftList` cards + `DraftDetailDialog` modal + status tabs (DRAFT/APPROVED/REJECTED);sidebar "KB 草稿" 入口仅 admin/owner 可见;13 个 Vitest tests)
+我们把已知技术债分成两类,目的不同:
+- **Known limitations** — 主动选择 / 推迟,暂无具体使用场景或依赖后续 milestone
+- **Tech debt follow-ups** — 已经识别 + 可执行,排在某个 milestone 的 backlog
 
-### M4.A — LLM Gateway Core (deferred to M4.B+)
+### Known limitations (intentional deferrals)
 
-21. **`qa/worker.py` shutdown() 缺 `aclose_all()` 直接测试覆盖** — Task 4 review Minor M2;`test_worker_llm_wiring` 覆盖了 `finally` 路径,但 `shutdown()` 路径未直接断言 `aclose_all()` 调用次数。M4.B+ 接 multi-worker shutdown 时补 integration test。
-22. **`qa/worker.py` 与 `history_mining/worker.py` `aclose_all()` 错误处理非对称** — Task 4 review Minor M1;`qa/worker.py` 在 `finally` 块中 `_log_warn` 后继续,`history_mining/worker.py` 捕获 `Exception` 后 `_log_warn`;两条路径行为略不同,统一到单点 (e.g. `_safe_aclose_all(gateway)` 助手) 留 M4.B+。
-23. **`history_mining/worker.py` 缺 gateway lifecycle 非对称注释** — Task 4 review Minor M3;`qa/worker.py` 在 `process_tenant` 内 per-tenant 构建 + 关闭,`history_mining/worker.py` 是 outer scope 构建 + outer finally 关闭;两者生命周期不同,需要在 `history_mining/worker.py` 头部补一段说明为什么不需要 per-tenant 重建 (单进程 Sunday worker,低并发,缓存无收益)。
-24. **`_default_llm_client_factory` per-call `httpx.AsyncClient` 构造** — Task 5 文档化 M4.C 延后;`agent/llm_factory.py` 每次 graph turn 都新建 `httpx.AsyncClient`,连接池不跨 turn 复用。M4.C 接 provider HTTP pool caching (按 provider 缓存 client,acquire/release 模式)。
+1. **`_reset_db_singletons` autouse fixture** 在多个集成测试文件重复 — 集中到 `apps/api/tests/conftest.py` 待 follow-up
+2. **多模态 RAG** — `_log_ocr_todo_once` 留待 vision model 接入
+3. **跨并发 ContextVar 测试** — 当前 asyncio 单 task 假设,worker pool 共享 task 时需加 `asyncio.gather` 回归
+4. **业务指标当前无 tenant_id label** — 故意不加避免 Prometheus 基数爆炸;按需租户维度走 `llm_usage` 表(账单路径)
+5. **demo mp4 留 presenter** — 自动化脚本只产 PNG;mp4 需要 presenter + 音频,自动化做不出
+6. **Plan 10.4 LLM/tracing spans 留 M3** — M1 close-out 只做 request_id 贯穿;OpenTelemetry 留到 M3 LLM Gateway
+7. **Plan 10.7 K8s manifests 留 M3/M4** — docker-compose 单区域部署够用
+8. **`search_internal_kb` 只查 KB 文本** — 当前只检索 Qdrant 文本块;vision/多模态(图/PDF 图表)待 M2.B
+9. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
+10. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
+11. **`stream_chat()` skips fallback** — 设计选择 (mid-stream switch 不可靠);M4.B+ 视客户用例再考虑
+12. **No per-step budget** — `attempt_timeout_s` 单一值应用到所有 step;Deferred
+13. **No chain-warm metrics** — 只 success/failure 计数,无滚动延迟 / 错误率
+14. **No explicit cache invalidation on admin write** — ≤ 60s TTL,操作员在 TTL 窗口内看到旧配置
+15. **Fernet key rotation** — master key 启动时加载一次;rotation 需要 restart + re-encrypt + update env,无 zero-downtime rotation
+16. **No audit log** — `tenant_llm_configs` 更新无审计
+17. **No per-tenant fallback chain** — chain 是 project-wide
+18. **`enabled=FALSE` semantics** — 当前 "skip in resolver"
+19. **No per-tenant model override** — model 是 project-default per provider
+20. **Demo / staging seeding** — demo tenant 必须通过 admin API
+21. **Post-mortem gate observes after chain exhausted** — 不 preempt mid-chain retries;pre-flight rejection 需更深的 M4.B `FallbackResolver` 耦合
+22. **Non-UTC anchored tenants see breakdown drift on month-boundary days** — `PerModelBreakdown` 按 UTC month 聚合,snapshot 按 anchored month;修需要 `tz_name` 穿透到 `PerModelService`,出 Pack B scope
+23. **No non-LLM cost budget** — SES / SMS / KB retrieval / embedding 未计入 monthly cap
 
-### M4.B — LLM Gateway Fallback Resolver
+### Tech debt follow-ups (actionable, scheduled)
 
-See [[m4-b-progress]] for full scope.
-
-25. **`stream_chat()` skips fallback** — 设计选择 (mid-stream switch 不可靠);当客户端需要可靠 streaming 时,当前答案是"那一轮改调 `chat()`"。M4.B+ 可能引入 Redis-backed stream continuation(如出现具体客户用例)。
-26. **No per-step budget** — `attempt_timeout_s` 单一值应用到所有 step;某些团队想要按 step 不同的超时 (如 primary 长 / backup 短)。Deferred。
-27. **No chain-warm metrics** — 只统计每个 step 的 success/failure 计数,没有滚动延迟 / 错误率。M4.D (budget) 很可能需要这些。
-28. **Chain length hardcoded at 2** — env 格式支持 N (comma-separated),但 resolver 没有在 N>2 下用测试验证。N=2 是 brainstorming Q2 显式设计目标;N≥3 需额外 integration tests。
-
-29. **Spec §6.3 outcome vocabulary drift** — spec 列了 5 个 outcome (`success/provider_unavailable/output_invalid/rate_limited/timeout`);实现加了第 6 个 `other` 作为未映射异常类的 catch-all (defensive cardinality bound)。Spec 表需要更新;没有行为变更。(From Task 4 code quality Minor M2。)
-30. **Plan-level metric verification gap** — spec §7.2 #1 要求验证 `step=1` counter + `route_mode="fallback"`;spec §7.2 #3 要求验证 `lumen_llm_fallback_attempts_total{outcome="provider_unavailable"} ×2`。Plan Step 4.4 测试代码未包含;实现正确,如需显式 metric assertion 是 follow-up。(From Task 4 spec reviewer。)
+- [ ] **M4.A #24** — `_default_llm_client_factory` per-call `httpx.AsyncClient` 构造 (Task 7 of this plan: 改 per-`(base_url, headers)` 缓存)
+- [ ] **M4.C #4** — per-tenant fallback chain (chain 升级为 tenant-scoped)
+- [ ] **M4.C #6** — per-tenant model override (model 选择升级为 tenant-scoped)
+- [ ] **M4.D known #6** — Non-LLM cost budget (SES / SMS / KB / embedding 计入 cap)
+- [x] **M4.D known #3** (closed in Pack A) — snapshot inconsistency window — DONE
+- [x] **M4.D known #8** (closed in Pack B) — provider 429 integration — DONE
+- [ ] **Nitpick S1** — JWT secret validation hardening (Task 1 of this plan)
+- [ ] **Nitpick S2** — rate-limit fail-open observability (Task 3 of this plan)
+- [ ] **Nitpick S3** — X-Forwarded-For trust gate (Task 2 of this plan)
+- [ ] **Nitpick S4** — httpx connection pool caching (Task 7 of this plan)
+- [ ] **Nitpick S5** — budget pre-check short-circuit (Task 8 of this plan)
 
 ### M4.C — Tenant Resolver (BYOK)
 
@@ -359,20 +363,6 @@ cached with in-process LRU + TTL. See
 | `_default_llm_client_factory` async + strict mode | shipped |
 | `POST /admin/tenants/{id}/llm-configs` + `GET` | shipped |
 | `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` metric | shipped |
-
-#### M4.C known tech debt
-
-1. **No explicit cache invalidation on admin write** — admin POSTs do not
-   invalidate; operators see propagation within ≤ 60s (TTL window).
-   Follow-up: add Redis pub/sub (`admin.channel:tenant_llm_changed`).
-2. **Fernet key rotation** — master key is loaded once at startup.
-   Rotation requires (a) restart, (b) re-encrypt every row, (c) update env.
-   No zero-downtime rotation.
-3. **No audit log** — `tenant_llm_configs` updates are silent.
-4. **No per-tenant fallback chain** — chain is project-wide.
-5. **`enabled=FALSE` semantics** — currently "skip in resolver".
-6. **No per-tenant model override** — model is project-default per provider.
-7. **Demo / staging seeding** — demo tenant must be seeded via admin API.
 
 ### M4.D — Budget Layer
 
@@ -404,22 +394,6 @@ monthly cap. See `docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design`.
 | **Pack B** — `?breakdown=true` query on snapshot endpoint | shipped |
 | **Pack B** — `TenantBudgetRateLimited` exception + post-mortem gate | shipped |
 | **Pack B** — `LLM_BUDGET_GATE_TOTAL` metric + FastAPI handler → HTTP 429 | shipped |
-
-#### M4.D known tech debt (post Pack A)
-
-1. ~~**No automatic period reset job** — reset is lazy on next access; if a tenant goes silent for 2 months, the stale period row stays. Acceptable: rows accumulate ≤ 12/year/tenant.~~ **Closed in Pack A** (`apps/api/src/budget/cleanup.py` + arq cron `budget_cleanup_task` at 02:00 UTC daily + `POST /admin/budget/cleanup` super-admin endpoint; 13-month retention, LIMIT 10000 batched; 4 cleanup tests + 1 admin auth test pass).
-2. ~~**No top-up mechanism** — *Deferred to Pack B.* If a tenant hits hard cap mid-month, there's no manual credit / soft-raise escape hatch — admin must edit `tenant_budgets.hard_cap_tokens` directly.~~ **Closed in Pack B** (`TenantBudgetCredit` immutable audit log; `POST /admin/tenants/{tid}/credits` super-admin endpoint; `effective_cap = hard_cap_tokens + sum(credits for period)`; UTC-month-bound; 3 credits tests + 1 e2e test pass).
-3. ~~**Snapshot inconsistency window** — ≤ TTL (60s default). Within that window, a tenant could go slightly over the cap before being rejected.~~ **Closed in Pack A** (`BudgetResolver._pre_check` reads `tenant_budget_snapshots` directly from DB when `tenant_budget_pre_check_use_db=True` — the default; `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` increments before any provider HTTP). 1 resolver test + 1 e2e test pass.
-4. ~~**Soft-warn is per-period, not sticky** — fires once per period on threshold cross; if admin lowers the cap mid-period, the warn may re-fire or not fire correctly.~~ **Closed in Pack A** (`tenant_budget_snapshots.soft_warn_fired_at` records the fire timestamp; sticky across calls; `set_tokens_used(soft_warn_fired_at=None)` carry-over preserves existing timestamp; 1 resolver test + 1 e2e test pass).
-5. ~~**No per-model breakdown** — *Deferred to Pack B.* `tokens_used` aggregates all models for a tenant. If a tenant uses `claude-opus` + `claude-haiku`, the breakdown is opaque — the admin can only see total monthly tokens.~~ **Closed in Pack B** (`PerModelBreakdownCache` in-process 30s TTL; `PerModelService` lazy `GROUP BY` on `llm_usage`; `?breakdown=true` query param on snapshot endpoint; excludes `cached=True` rows; cache invalidated on `_post_record` + on `CreditService.grant`; 4 per-model tests + 1 e2e test pass).
-6. **No non-LLM cost budget** — *Deferred to Pack C.* Only LLM tokens are budgeted. SES email sends, SMS transactions, KB retrieval, embedding calls — none are tracked against the monthly cap.
-7. ~~**Snapshot refresh doesn't lock** — concurrent SUM() calls could double-insert. Mitigated by UNIQUE constraint + ON CONFLICT.~~ **Closed in Pack A** (`TenantBudgetSnapshotRepository.refresh()` acquires `pg_advisory_xact_lock(hashtext(tenant_id||':'||period))` — concurrent refreshes for same `(tenant, period)` serialize; 1 repository test passes).
-8. ~~**No provider 429 integration** — *Deferred to Pack B.* When a provider rate-limits mid-month, the resolver retries the chain (M4.B) but doesn't preempt based on budget. A tenant could rack up fallback retry overhead before `soft_warn_tokens` ever crosses.~~ **Closed in Pack B** (`TenantBudgetRateLimited` exception raised after provider chain raises 429 AND `effective_cap - tokens_used < tenant_budget_429_skip_threshold_tokens` (default 1000); `LLM_BUDGET_GATE_TOTAL` metric + FastAPI exception handler → HTTP 429 with structured body; post-mortem gate observes effective_cap semantics; 3 gate tests + 1 e2e test pass).
-
-**Known limitations (Pack B):**
-- **Post-mortem gate observes after chain exhausted** — does not preempt mid-chain retries. If a tenant's budget can only afford 1 retry but the chain tries 3, the gate fires after all 3 fail. Pre-flight rejection would require deeper M4.B FallbackResolver coupling.
-- **Non-UTC anchored tenants see breakdown / snapshot drift on month-boundary days** — `PerModelBreakdown` aggregates the UTC month while snapshot reflects the anchored month. Most tenants use the default UTC anchor; fixing requires threading `tz_name` through `PerModelService`. Out of Pack B scope.
-
 
 ## 仓库信息
 
