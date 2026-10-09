@@ -771,7 +771,7 @@ async def test_try_auto_create_ticket_calls_factory_and_creates(monkeypatch):
 
     factory_calls = []
 
-    def factory():
+    async def factory():
         factory_calls.append(())
         return fake_svc
 
@@ -803,7 +803,7 @@ async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
     fake_svc.create = AsyncMock()
 
     await service_module._try_auto_create_ticket(
-        factory=lambda: fake_svc,
+        factory=AsyncMock(return_value=fake_svc),
         tenant_id="t1",
         conversation_id="c1",
         content_text="Another message",
@@ -816,7 +816,7 @@ async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
 async def test_try_auto_create_ticket_handles_factory_returning_none():
     """Factory returning None (opt-out) -> no create call, no exception."""
     await service_module._try_auto_create_ticket(
-        factory=lambda: None,
+        factory=AsyncMock(return_value=None),
         tenant_id="t1",
         conversation_id="c1",
         content_text="msg",
@@ -827,7 +827,7 @@ async def test_try_auto_create_ticket_handles_factory_returning_none():
 @pytest.mark.asyncio
 async def test_try_auto_create_ticket_swallows_factory_construct_failure(caplog):
     """Factory raising -> WARNING logged, no exception bubbles up."""
-    def bad_factory():
+    async def bad_factory():
         raise RuntimeError("db down")
 
     with caplog.at_level("WARNING"):
@@ -865,7 +865,7 @@ async def test_try_auto_create_ticket_swallows_create_failure(caplog):
 
     with caplog.at_level("WARNING"):
         await service_module._try_auto_create_ticket(
-            factory=lambda: fake_svc,
+            factory=AsyncMock(return_value=fake_svc),
             tenant_id="t1",
             conversation_id="c1",
             content_text="msg",
@@ -882,7 +882,7 @@ async def test_try_auto_create_ticket_truncates_subject_to_120_chars():
     fake_svc.create = AsyncMock()
 
     await service_module._try_auto_create_ticket(
-        factory=lambda: fake_svc,
+        factory=AsyncMock(return_value=fake_svc),
         tenant_id="t1",
         conversation_id="c1",
         content_text=long_text,
@@ -899,6 +899,7 @@ def test_conversation_service_accepts_ticket_service_factory_kwarg():
     Task 6 review caught this — without this test, a future refactor that
     drops the kwarg would silently break the entire auto-create feature.
     """
-    factory = lambda: None
+    async def factory():
+        return None
     svc = ConversationService(ticket_service_factory=factory)
     assert svc._ticket_service_factory is factory

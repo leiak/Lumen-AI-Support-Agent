@@ -1,6 +1,7 @@
 """Tests for channel.inbound.process_inbound_envelope."""
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -394,3 +395,116 @@ async def test_process_inbound_swallows_broadcast_failure() -> None:
         await process_inbound_envelope(_envelope())
 
         assert mock_service.record_message.await_count == 2
+
+
+# ---- Task 11 / nitpick P2: async factory with one-session-per-call ----
+
+
+class _SessionCtx:
+    """Mock async-context-manager returned by the patched sessionmaker.
+
+    Matches the ``async with sm() as session`` usage shape so the
+    factory under test can drive its session lifecycle through the
+    normal ``__aenter__`` / ``__aexit__`` protocol.
+    """
+
+    def __init__(self, session: object) -> None:
+        self._s = session
+
+    def __call__(self) -> _SessionCtx:
+        # ``sm()`` must return a context manager; tests invoke it
+        # directly so this returns self.
+        return self
+
+    async def __aenter__(self) -> object:
+        return self._s
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_inbound_factory_one_session_per_call() -> None:
+    """The TicketService factory must be a coroutine function (awaitable)
+    and open exactly ONE fresh session per invocation.
+
+    Pre-refactor the factory was sync (``def _factory() -> TicketService``)
+    and only *constructed* a TicketService per call — but didn't give
+    callers a hook to scope the session to a single inbound message.
+    Post-refactor the factory is ``async``; callers ``await factory()``
+    inside the inbound handler scope so each customer message gets a
+    dedicated short-lived session. Connection-pool pressure at
+    >10k msg/min is the motivation (nitpick review 2026-10-09 / P2).
+
+    Three assertions:
+
+    1. ``asyncio.iscoroutinefunction(factory)`` — guarantees callers can
+       ``await factory()`` and each call yields an isolated session.
+    2. ``sm.assert_called_once()`` after one ``await factory()`` —
+       guarantees the sessionmaker is opened per-call (not once at
+       module import).
+    3. ``isinstance(svc, TicketService)`` — the returned object is
+       a TicketService as documented, not a coroutine or None.
+    """
+    from channel.inbound import _build_ticket_service_factory
+    from ticket.service import TicketService
+
+    factory = _build_ticket_service_factory()
+
+    # 1. Factory must be a coroutine function — sync factory would
+    #    silently drop the await and callers would get an unawaited
+    #    coroutine object (a runtime footgun).
+    assert asyncio.iscoroutinefunction(factory), (
+        "TicketService factory must be a coroutine function so callers "
+        "can ``await factory()`` once per inbound message."
+    )
+
+    # 2. Invocation must yield a real TicketService backed by a session.
+    with patch("core.database.get_sessionmaker") as mock_sm:
+        # ``get_sessionmaker()()`` invokes ``sm()`` once and returns
+        # the resulting ``AsyncSession`` — preserve that shape.
+        mock_session = AsyncMock()
+        mock_sm.return_value = lambda: mock_session
+
+        svc = await factory()
+
+        # 3. Returned object is a TicketService (not a coroutine, not None).
+        assert isinstance(svc, TicketService)
+        # sessionmaker was opened exactly once — one-session-per-call.
+        mock_sm.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_factory_opens_fresh_session_across_calls() -> None:
+    """Two awaited factory calls must each open an independent session —
+    never share a session across invocations. A shared session would
+    commit half-finished tickets across messages, violating tenant
+    isolation under load.
+    """
+    from channel.inbound import _build_ticket_service_factory
+    from ticket.service import TicketService
+
+    with patch("core.database.get_sessionmaker") as mock_sm:
+        # Each ``sm()()`` invocation returns a fresh ctx wrapping a
+        # distinct AsyncMock session, so we can assert they're distinct.
+        sessions: list[AsyncMock] = []
+
+        def fresh_session() -> _SessionCtx:
+            s = AsyncMock()
+            sessions.append(s)
+            return _SessionCtx(s)
+
+        mock_sm.return_value = lambda: fresh_session()
+
+        factory = _build_ticket_service_factory()
+        svc_a = await factory()
+        svc_b = await factory()
+
+        assert isinstance(svc_a, TicketService)
+        assert isinstance(svc_b, TicketService)
+        # Two calls -> two sessionmaker invocations -> two sessions.
+        assert mock_sm.call_count == 2
+        assert len(sessions) == 2
+        # Each session is distinct (sanity: the same object wasn't
+        # accidentally cached across invocations).
+        assert sessions[0] is not sessions[1]

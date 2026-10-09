@@ -24,7 +24,7 @@ channel adapters (Task 5.2), and the persistence layer
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, TYPE_CHECKING
 
@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 async def _try_auto_create_ticket(
     *,
-    factory: Callable[[], "TicketService | None"],
+    factory: Callable[[], Awaitable["TicketService | None"]],
     tenant_id: str,
     conversation_id: str,
     content_text: str,
@@ -58,12 +58,18 @@ async def _try_auto_create_ticket(
     lazily so tests that mock ``ConversationService`` never construct
     a real TicketService at kwargs time.
 
+    Factory is async (returns ``Awaitable[TicketService | None]``) so
+    the caller scope can await it once per inbound message — this is
+    the nitpick P2 fix that guarantees session-per-call at high
+    message rates. Tests that wire a synchronous factory must adapt
+    the factory to be ``async def`` (or an ``AsyncMock``).
+
     All exceptions are caught and logged at WARNING with opaque IDs
     only — a ticket-creation failure must NOT fail the customer
     message ingest (the customer's turn is the product).
     """
     try:
-        ticket_svc = factory()
+        ticket_svc = await factory()
     except Exception as exc:
         logger.warning(
             "conversation ticket factory construction failed",
@@ -120,19 +126,20 @@ class ConversationService:
         message_repo: MessageRepository | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
-        ticket_service_factory: Callable[[], "TicketService | None"] | None = None,
+        ticket_service_factory: Callable[[], Awaitable["TicketService | None"]] | None = None,
     ) -> None:
         self._repo = repo or ConversationRepository()
         self._message_repo = message_repo or MessageRepository()
         self._clock = clock or (lambda: datetime.now(UTC))
         # Optional auto-create hook for Tickets (Task 6, M2.A). Set
-        # to a callable that returns a ``TicketService`` (or None to
-        # opt out). The callable is invoked LAZILY inside
+        # to an async callable that returns a ``TicketService`` (or
+        # None to opt out). The callable is awaited LAZILY inside
         # ``record_message`` so tests that mock ``ConversationService``
         # don't pay the cost of constructing one — and so we don't
         # require a live DB to instantiate a service that might never
         # be used. ``channel.inbound`` wires this up; agent-reply /
-        # escalation paths leave it None.
+        # escalation paths leave it None. Async signature (Task 11 /
+        # nitpick P2) ensures session-per-call at high message rates.
         self._ticket_service_factory = ticket_service_factory
 
     # ---- Inbound / lookup ----
