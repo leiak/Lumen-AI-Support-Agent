@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable
 import redis.asyncio as aioredis
 from fastapi import Request
 
+from core.business_metrics import RATE_LIMIT_FAIL_OPEN_TOTAL
 from core.redis import get_redis
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,11 @@ async def check_tenant_lookup_rate_limit(
             results = await pipe.execute()
         count = int(results[0])
     except Exception as exc:
-        logger.warning("rate_limit.redis_unavailable error=%s", type(exc).__name__)
+        RATE_LIMIT_FAIL_OPEN_TOTAL.labels(check_name="tenant_lookup").inc()
+        logger.error(
+            "rate_limit.redis_unavailable error=%s; failing open",
+            type(exc).__name__,
+        )
         return True, 0
 
     if count > MAX_HITS_PER_WINDOW:

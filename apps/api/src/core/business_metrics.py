@@ -116,6 +116,22 @@ LLM_BUDGET_GATE_TOTAL = Counter(
 )
 
 
+# Nitpick S2 — rate-limit fail-open observability.
+#
+# ``auth.rate_limit.check_tenant_lookup_rate_limit`` deliberately fails
+# open when Redis is unavailable (read-only endpoint, security
+# degradation is preferable to hard outage). That decision is correct
+# in isolation but invisible in aggregate — without this counter an ops
+# alert cannot fire on sustained Redis loss. Label ``check_name`` keeps
+# the cardinality trivial (one row per rate-limit check function); as
+# more checks are added (e.g. login throttling) they get their own row.
+RATE_LIMIT_FAIL_OPEN_TOTAL = Counter(
+    "rate_limit_fail_open_total",
+    "Number of times a rate-limit check fell open due to backend unavailability",
+    ("check_name",),
+)
+
+
 # Stage 14 / Task 7 — real-time QA judge metrics.
 #
 # Cardinality budget (matches the docstring at the top of this file):
@@ -177,4 +193,5 @@ __all__ = [
     "LUMEN_QA_SCORES",
     "LUMEN_SLA_BREACHED",
     "MESSAGES_TOTAL",
+    "RATE_LIMIT_FAIL_OPEN_TOTAL",
 ]
