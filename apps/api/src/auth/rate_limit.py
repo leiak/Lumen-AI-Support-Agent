@@ -33,16 +33,26 @@ MAX_HITS_PER_WINDOW = 30
 
 
 def _client_ip(request: Request) -> str:
-    """Best-effort client IP.
+    """Best-effort client IP with explicit proxy-trust configuration.
 
-    We trust X-Forwarded-For only when an upstream proxy is known to
-    set it (the deployment is behind one in staging / production).
-    Falls back to the socket peer otherwise.
+    Reads ``TRUSTED_PROXY_HOPS`` from settings (default 0 = no trust).
+    When N=0, the ``X-Forwarded-For`` header is ignored entirely; we
+    fall back to the socket peer. When N>0, the rightmost N entries of
+    the header are treated as the trusted proxy chain, and the next
+    entry leftward is the originating client.
     """
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        # first entry is the originating client
-        return fwd.split(",", 1)[0].strip()
+    from core.config import get_settings
+
+    hops = get_settings().trusted_proxy_hops
+    if hops > 0:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            entries = [e.strip() for e in fwd.split(",") if e.strip()]
+            if len(entries) > hops:
+                return entries[-hops - 1]
+            # Header has fewer entries than trusted hops → trust the
+            # leftmost one (we know nothing more specific).
+            return entries[0]
     return request.client.host if request.client else "unknown"
 
 
