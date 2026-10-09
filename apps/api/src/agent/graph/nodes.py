@@ -205,20 +205,23 @@ def make_retrieve_node(
                 error_type=type(exc).__name__,
             )
             return {"rag_messages": []}
-        except Exception as exc:
+        except Exception:
             # Defence-in-depth safety net — should NEVER fire
             # because RAGService already swallows its own
             # exceptions, but if a regression sneaks in we
-            # refuse to crash the AI auto-reply. Empty
-            # rag_messages + WARNING + error_type. PII-safe:
+            # refuse to crash the AI auto-reply. Centralized
+            # log + fallback helper keeps the bare-except shape
+            # consistent across the agent graph. PII-safe:
             # no exc_info, no repr, no customer text.
-            log.warning(
-                "agent.graph.retrieve_failed_unexpected",
+            from agent.graph._safe import safe_respond
+
+            return safe_respond(
+                fn=lambda: {"rag_messages": []},
+                fallback={"rag_messages": []},
+                event="agent.graph.retrieve_failed_unexpected",
                 tenant_id=state["tenant_id"],
                 conversation_id=state["conversation_id"],
-                error_type=type(exc).__name__,
             )
-            return {"rag_messages": []}
 
         if rag_context.chunk_count == 0 or not rag_context.system_message:
             return {"rag_messages": []}
@@ -465,23 +468,32 @@ def make_llm_node(
                 "escalated": False,
                 "tool_iterations": iterations,
             }
-        except Exception as exc:
+        except Exception:
             # Defence-in-depth safety net — should NEVER fire
             # because the typed set above covers every documented
             # LLM-client error mode, but if a regression sneaks
-            # in we refuse to crash the AI auto-reply. PII-safe:
-            # no exc_info, no repr, no customer text.
-            log.warning(
-                "agent.graph.llm_failed_unexpected",
+            # in we refuse to crash the AI auto-reply.
+            # Centralized log + fallback helper keeps the
+            # bare-except shape consistent across the agent
+            # graph. PII-safe: no exc_info, no repr, no
+            # customer text.
+            from agent.graph._safe import safe_respond
+
+            return safe_respond(
+                fn=lambda: {
+                    "final_text": FALLBACK_MESSAGE,
+                    "escalated": False,
+                    "tool_iterations": iterations,
+                },
+                fallback={
+                    "final_text": FALLBACK_MESSAGE,
+                    "escalated": False,
+                    "tool_iterations": iterations,
+                },
+                event="agent.graph.llm_failed_unexpected",
                 tenant_id=tenant_id,
                 conversation_id=state["conversation_id"],
-                error_type=type(exc).__name__,
             )
-            return {
-                "final_text": FALLBACK_MESSAGE,
-                "escalated": False,
-                "tool_iterations": iterations,
-            }
 
         # ---- Tool call loop (Stage 12 / Task 2) -------------------
         # The loop body is extracted into ``_tool_dispatch.py``
