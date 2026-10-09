@@ -25,12 +25,45 @@ from knowledge.startup import ensure_image_collection, ensure_qdrant_collection
 from llm_client.embeddings import aclose_default_client
 
 
+def _cors_startup_warnings(settings: Any) -> None:
+    """Log warnings for CORS misconfigurations that silently break
+    production deployments.
+
+    Called from the FastAPI lifespan so the warning appears in
+    container logs at boot time. Uses stdlib logging (not structlog)
+    so the standard pytest ``caplog`` fixture captures the record in
+    tests, and so the line shows up as a plain WARNING in container
+    logs without depending on the structlog processor chain.
+    """
+    import logging
+
+    from core.config import Environment
+
+    if settings.environment == Environment.PRODUCTION:
+        origins = settings.widget_allowed_origins_global
+        # localhost / 127.0.0.1 origins are fine for local dev but a
+        # strong signal that nobody overrode the .env.example default
+        # for production.
+        non_localhost = [
+            o for o in origins if "localhost" not in o and "127.0.0.1" not in o
+        ]
+        if not non_localhost:
+            logging.getLogger("startup.cors").warning(
+                "CORS allowlist contains only localhost origins; "
+                "production deployments MUST override "
+                "WIDGET_ALLOWED_ORIGINS_GLOBAL with the real host(s) "
+                "or the agent SPA will break silently.",
+                extra={"origins": origins},
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
     settings = get_settings()
     configure_logging()
     log = get_logger("startup")
     log.info("api.starting", environment=settings.environment, service=settings.service_name)
+    _cors_startup_warnings(settings)
     # Eagerly create the redis client pool so the first request doesn't pay
     # connection-setup latency. (The pool itself connects lazily on first command.)
     get_redis()
