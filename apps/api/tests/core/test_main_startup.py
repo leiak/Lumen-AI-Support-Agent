@@ -5,8 +5,14 @@ import pytest
 from core.config import get_settings, reset_settings
 
 
+@pytest.fixture
+def reset_settings_after_test():
+    yield
+    reset_settings()
+
+
 def test_cors_localhost_only_production_logs_warning(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch, reset_settings_after_test, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Production deployment with localhost-only CORS origins MUST log
     a WARNING at startup."""
