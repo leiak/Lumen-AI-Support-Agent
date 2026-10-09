@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from budget.cache import TenantBudgetSnapshotCache
 from budget.exceptions import TenantBudgetRateLimited
 from budget.models import TenantBudget
+from budget.precheck_cache import PrecheckCache
 from budget.repository import TenantBudgetSnapshotRepository
 from core.business_metrics import (
     LLM_BUDGET_GATE_TOTAL,
@@ -86,6 +87,7 @@ class BudgetResolver:
         snapshot_repo: TenantBudgetSnapshotRepository | None = None,
         credit_service: Any | None = None,
         per_model_cache: Any | None = None,
+        precheck_cache: PrecheckCache | None = None,
     ) -> None:
         self._inner = inner
         self._tenant_id = tenant_id
@@ -100,6 +102,11 @@ class BudgetResolver:
         # so we don't need to modify this constructor again when Task 4
         # wires the invalidate calls into _post_record.
         self._per_model_cache = per_model_cache
+        # Pack B follow-up — in-process 5s TTL cache for the pre-check
+        # cap-decision result. Hot tenants with no new llm_usage rows
+        # between turns pay zero DB round-trips. Optional for backward
+        # compatibility with Pack A test fixtures that don't pass one.
+        self._precheck_cache = precheck_cache
 
     def __call__(self, request: ChatRequest) -> Any:
         """Sync ``Resolver`` shim (M4.A protocol compatibility).
@@ -190,6 +197,13 @@ class BudgetResolver:
         (tech-debt #3). When False, falls back to the M4.D cache path
         (soft escape hatch for tenants that tolerate up-to-one-call overshoot).
 
+        Pack B follow-up: when a ``precheck_cache`` is wired in, the
+        ``(snap, effective_cap)`` result is held for
+        ``tenant_budget_precheck_cache_ttl_s`` (default 5s) so a hot
+        tenant with no new ``llm_usage`` rows between turns pays zero
+        DB round-trips for the pre-check. ``_post_record`` invalidates
+        the entry on every successful token consumption.
+
         Returns:
             ``(period, period_start)`` tuple for reuse by ``_post_record``.
 
@@ -200,29 +214,44 @@ class BudgetResolver:
             period, period_start = _current_period("UTC")
             return period, period_start
         period, period_start = _current_period(self._budget.period_anchor_tz)
-        settings = get_settings()
-        if settings.tenant_budget_pre_check_use_db:
-            # DB-direct path (Pack A #3): zero window between cap and rejection.
-            snap = await self._snapshot_repo.get_for_tenant_period(
-                self._tenant_id, period
-            )
-            if snap is None:
-                # No snapshot row yet — refresh via SUM(llm_usage) (which
-                # itself holds the advisory lock per Pack A #7).
-                snap = await self._snapshot_repo.refresh(
-                    tenant_id=self._tenant_id,
+
+        async def _load_cap_decision() -> tuple[Any, int]:
+            """Load the current snapshot + effective cap.
+
+            The tuple is the cache value — both fields are needed to
+            decide ``tokens_used >= effective_cap`` downstream.
+            """
+            settings = get_settings()
+            if settings.tenant_budget_pre_check_use_db:
+                # DB-direct path (Pack A #3): zero window between cap and rejection.
+                loaded = await self._snapshot_repo.get_for_tenant_period(
+                    self._tenant_id, period
+                )
+                if loaded is None:
+                    # No snapshot row yet — refresh via SUM(llm_usage) (which
+                    # itself holds the advisory lock per Pack A #7).
+                    loaded = await self._snapshot_repo.refresh(
+                        tenant_id=self._tenant_id,
+                        period=period,
+                        period_starts_at=period_start,
+                    )
+            else:
+                # Legacy cache path — preserved as soft escape hatch.
+                loaded = await self._snapshot_cache.get_or_load_async(
+                    self._tenant_id,
                     period=period,
                     period_starts_at=period_start,
                 )
-        else:
-            # Legacy cache path — preserved as soft escape hatch.
-            snap = await self._snapshot_cache.get_or_load_async(
-                self._tenant_id,
-                period=period,
-                period_starts_at=period_start,
+            # Pack B #2: effective_cap = hard_cap_tokens + sum(credits for period).
+            cap = await self._compute_effective_cap(period)
+            return loaded, cap
+
+        if self._precheck_cache is not None:
+            snap, effective_cap = await self._precheck_cache.get_or_load(
+                self._tenant_id, period, _load_cap_decision
             )
-        # Pack B #2: effective_cap = hard_cap_tokens + sum(credits for period).
-        effective_cap = await self._compute_effective_cap(period)
+        else:
+            snap, effective_cap = await _load_cap_decision()
         if snap.tokens_used >= effective_cap:
             LLM_TENANT_BUDGET_EXCEEDED_TOTAL.inc()
             raise TenantBudgetExceeded(
@@ -380,6 +409,12 @@ class BudgetResolver:
         # (older Pack A callers don't pass one) — guard with None-check.
         if self._per_model_cache is not None:
             self._per_model_cache.invalidate(self._tenant_id, period)
+        # Pack B follow-up — invalidate the pre-check cache so the next
+        # _pre_check re-loads (snap, effective_cap) and observes the new
+        # tokens_used total. Without this, a hot tenant could cache a
+        # stale "below cap" decision for the full TTL after a write.
+        if self._precheck_cache is not None:
+            await self._precheck_cache.invalidate(self._tenant_id, period)
 
 
 __all__ = ["BudgetResolver", "_current_period"]

@@ -16,6 +16,7 @@ counters; never message content or API keys.
 from __future__ import annotations
 
 from budget.cache import TenantBudgetSnapshotCache
+from budget.precheck_cache import PrecheckCache
 from budget.repository import (
     TenantBudgetRepository,
     TenantBudgetSnapshotRepository,
@@ -40,6 +41,7 @@ from llm_client.usage import UsageRecorder
 # fresh cipher / cache (e.g. after monkeypatching env).
 _tenant_cache: TenantLLMConfigCache | None = None
 _budget_snapshot_cache: TenantBudgetSnapshotCache | None = None
+_precheck_cache: PrecheckCache | None = None
 
 # Process-wide HTTP pool (nitpick S4 / tech-debt #24). Shared across
 # all LLM provider instances so the HTTPS connection pool + TLS
@@ -89,6 +91,23 @@ def _build_budget_snapshot_cache() -> TenantBudgetSnapshotCache:
     return _budget_snapshot_cache
 
 
+def _build_precheck_cache() -> PrecheckCache:
+    """Construct the per-process ``PrecheckCache`` singleton (Pack B follow-up).
+
+    TTL driven by ``tenant_budget_precheck_cache_ttl_s`` (default 5s).
+    Hot tenants with no new ``llm_usage`` rows between turns pay zero
+    DB round-trips for the pre-check; ``_post_record`` invalidates the
+    entry on every successful write.
+    """
+    global _precheck_cache
+    if _precheck_cache is None:
+        settings = get_settings()
+        _precheck_cache = PrecheckCache(
+            ttl_seconds=settings.tenant_budget_precheck_cache_ttl_s,
+        )
+    return _precheck_cache
+
+
 async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
     """Build a per-tenant ``LLMClient`` via ``TenantResolver`` (+ ``BudgetResolver`` if configured).
 
@@ -126,6 +145,7 @@ async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
             tenant_id=tenant_id,
             budget=budget,
             snapshot_cache=_build_budget_snapshot_cache(),
+            precheck_cache=_build_precheck_cache(),
         )
 
     return LLMClient(
@@ -194,6 +214,7 @@ def reset_http_pool() -> None:
 __all__ = [
     "_build_budget_snapshot_cache",
     "_build_http_pool",
+    "_build_precheck_cache",
     "_build_tenant_cache",
     "_default_llm_client_factory",
     "_resolve_default_model",

@@ -205,6 +205,12 @@ class Settings(BaseSettings):
         default=30,
         alias="TENANT_BUDGET_PER_MODEL_CACHE_TTL_SECONDS",
     )
+    # Pack B follow-up — in-process TTL for the budget pre-check short-circuit
+    # cache. 5s amortizes the per-turn DB round-trip without risk of a stale
+    # "below cap" decision (post_record invalidates the entry on every write).
+    tenant_budget_precheck_cache_ttl_s: float = Field(
+        default=5.0, alias="TENANT_BUDGET_PRECHECK_CACHE_TTL_S"
+    )
 
     # Stage 14 / Task 7 — real-time QA judge configuration.
     #
