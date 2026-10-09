@@ -1,3 +1,4 @@
+import re
 from typing import Literal, Self
 
 from pydantic import Field, model_validator
@@ -19,16 +20,24 @@ def _parse_csv(value: str | list[str] | None) -> list[str]:
         return [v.strip() for v in value if v and v.strip()]
     return [v.strip() for v in value.split(",") if v.strip()]
 
-# Known dev/test secret patterns. The actual .env example uses the second
-# one. Production must reject any of these to prevent the
-# classic "deployed with .env default" footgun.
-_KNOWN_DEV_SECRETS: frozenset[str] = frozenset(
-    {
-        "dev-secret",
-        "dev-secret-please-change-in-production-32chars",
-        "test-secret-32-chars-minimum-length",
-    }
+# Placeholder/dev/test patterns that must never reach production.
+# Match on substring (case-insensitive); explicit list to avoid surprising
+# legitimate keys that happen to contain the word "test".
+_PLACEHOLDER_PATTERNS: tuple[str, ...] = (
+    r"change.?me",
+    r"please.?change",
+    r"dev.?secret",
+    r"test.?secret",
+    r"example",
+    r"placeholder",
+    r"replace.?me",
+    r"your.?secret",
 )
+_PLACEHOLDER_RE = re.compile("|".join(_PLACEHOLDER_PATTERNS), re.IGNORECASE)
+
+# Minimum number of unique characters in a 32+ char secret.
+# 16 unique chars over 32 positions = ~100 bits of entropy worst case.
+_MIN_UNIQUE_CHARS = 16
 
 
 class Settings(BaseSettings):
@@ -348,8 +357,19 @@ class Settings(BaseSettings):
     def _validate_jwt_secret(self) -> Self:
         if len(self.jwt_secret) < 32:
             raise ValueError("JWT_SECRET must be at least 32 characters")
-        if self.environment == Environment.PRODUCTION and self.jwt_secret in _KNOWN_DEV_SECRETS:
-            raise ValueError("Refusing to use known dev/test secret in production")
+        if self.environment == Environment.PRODUCTION:
+            if _PLACEHOLDER_RE.search(self.jwt_secret):
+                raise ValueError(
+                    "JWT_SECRET looks like a placeholder/dev/example value. "
+                    "Generate a real secret with: "
+                    "python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+                )
+            if len(set(self.jwt_secret)) < _MIN_UNIQUE_CHARS:
+                raise ValueError(
+                    f"JWT_SECRET has only {len(set(self.jwt_secret))} unique "
+                    f"characters (min {_MIN_UNIQUE_CHARS}). Re-generate with "
+                    "python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+                )
         return self
 
 
