@@ -122,3 +122,19 @@ class UserRepository:
                 select(User).where(User.tenant_id == tenant_id)
             )
             return list(result.scalars().all())
+
+    async def update_password_hash(self, user_id: str, password_hash: str) -> None:
+        """Persist a new password hash for an existing user.
+
+        Used by the login path's transparent 12 -> 13 rounds upgrade:
+        after a successful verify, if the stored hash was made with an
+        older rounds value we re-hash and persist here. No-op if the
+        user was deleted concurrently (session.get returns None).
+        """
+        async with get_session() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                await session.rollback()
+                return
+            user.password_hash = password_hash
+            await session.commit()
