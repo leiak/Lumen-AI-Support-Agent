@@ -25,6 +25,7 @@ from core.business_metrics import LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL
 from core.config import get_settings
 from llm_client.client import LLMClient
 from llm_client.exceptions import TenantLlmNotConfigured
+from llm_client.http_pool import HttpClientPool
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import TenantLLMConfigRepository
 from llm_client.tenant_resolver import (
@@ -33,13 +34,18 @@ from llm_client.tenant_resolver import (
 )
 from llm_client.usage import UsageRecorder
 
-
 # Module-level singletons (per process). Tests reset via
 # ``agent.llm_factory._tenant_cache = None`` or
 # ``agent.llm_factory._budget_snapshot_cache = None`` when they need a
 # fresh cipher / cache (e.g. after monkeypatching env).
 _tenant_cache: TenantLLMConfigCache | None = None
 _budget_snapshot_cache: TenantBudgetSnapshotCache | None = None
+
+# Process-wide HTTP pool (nitpick S4 / tech-debt #24). Shared across
+# all LLM provider instances so the HTTPS connection pool + TLS
+# session are paid once per (base_url, headers) for the process
+# lifetime, not per turn.
+_http_pool: HttpClientPool | None = None
 
 
 def _build_tenant_cache() -> TenantLLMConfigCache:
@@ -143,9 +149,54 @@ def _resolve_default_model() -> str:
     return DEFAULT_MODEL
 
 
+def _build_http_pool() -> HttpClientPool:
+    """Lazily build the process-wide :class:`HttpClientPool` singleton.
+
+    Mirrors the lazy-init pattern used by :func:`_build_tenant_cache` /
+    :func:`_build_budget_snapshot_cache`: nothing happens until the
+    first LLM call, so a process that never talks to a provider
+    (e.g. an admin-only Arq worker) doesn't pay the construction cost.
+    """
+    global _http_pool
+    if _http_pool is None:
+        _http_pool = HttpClientPool()
+    return _http_pool
+
+
+async def aclose_http_pool() -> None:
+    """Close every cached client in the pool and drop the singleton.
+
+    Idempotent. Called from the FastAPI lifespan on shutdown so the
+    underlying TCP sockets are released; safe to call when the pool
+    was never built (no-op).
+
+    Symmetric with :func:`llm_client.embeddings.aclose_default_client`.
+    """
+    global _http_pool
+    if _http_pool is not None:
+        await _http_pool.aclose_all()
+        _http_pool = None
+
+
+def reset_http_pool() -> None:
+    """Test helper: drop the pool reference without closing clients.
+
+    Pairs with the conftest's ``_reset_singletons`` autouse fixture so
+    each pytest-asyncio test (each with its own event loop) starts
+    with a fresh pool. The previous pool's clients are abandoned to
+    the garbage collector — the loop that owned them is already
+    closing, so ``aclose()`` would be unsafe.
+    """
+    global _http_pool
+    _http_pool = None
+
+
 __all__ = [
     "_build_budget_snapshot_cache",
+    "_build_http_pool",
     "_build_tenant_cache",
     "_default_llm_client_factory",
     "_resolve_default_model",
+    "aclose_http_pool",
+    "reset_http_pool",
 ]

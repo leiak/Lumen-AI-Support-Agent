@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from starlette.responses import Response
 
+from agent.llm_factory import aclose_http_pool
 from budget.exceptions import TenantBudgetRateLimited
 from channel.enums import ChannelType
 from core.config import get_settings
@@ -81,6 +82,11 @@ async def lifespan(app: FastAPI) -> Any:
     # Close the embedding client's singleton AsyncOpenAI so its HTTPX pool
     # is released; safe even if embed_texts was never called (no-op).
     await aclose_default_client()
+    # Close every cached httpx.AsyncClient in the process-wide
+    # :class:`HttpClientPool` (nitpick S4). Providers fetched their
+    # client lazily via ``agent.llm_factory._build_http_pool()``;
+    # this drains the pool so the underlying TCP sockets are released.
+    await aclose_http_pool()
     await close_redis()
     await close_qdrant_client()
     log.info("api.shutdown")

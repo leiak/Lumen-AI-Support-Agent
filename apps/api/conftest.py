@@ -67,6 +67,7 @@ def _reset_singletons() -> None:
     SQLAlchemy engine and Redis client from a previous test would be
     reused on a closed loop, raising 'Event loop is closed'.
     """
+    from agent.llm_factory import reset_http_pool
     from core.database import reset_engine, reset_sessionmaker
     from core.qdrant import reset_qdrant_client
     from core.redis import reset_redis
@@ -75,5 +76,6 @@ def _reset_singletons() -> None:
     reset_sessionmaker()
     reset_redis()
     reset_qdrant_client()
+    reset_http_pool()
     yield
     # post-test cleanup happens naturally when the event loop closes

@@ -58,19 +58,37 @@ class AnthropicProvider(BaseProvider):
             raise ValueError("Anthropic API key required")
         self.api_key = api_key
         self.model = model
-        self._client = httpx.AsyncClient(
-            base_url="https://api.anthropic.com",
-            timeout=timeout,
-            headers={
-                "x-api-key": self.api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            },
-        )
+        # Client is owned by ``agent.llm_factory``'s process-wide
+        # :class:`HttpClientPool` (nitpick S4). We just stash the
+        # config and lazily fetch the pooled client on first call.
+        self._timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Return the pooled ``httpx.AsyncClient`` for this provider."""
+        if self._client is None:
+            from agent.llm_factory import _build_http_pool
+
+            self._client = await _build_http_pool().get_or_create(
+                base_url="https://api.anthropic.com",
+                headers={
+                    "x-api-key": self.api_key,
+                    "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+                client_timeout=httpx.Timeout(self._timeout),
+            )
+        return self._client
 
     async def aclose(self) -> None:
-        """Close the underlying httpx client. Call on shutdown."""
-        await self._client.aclose()
+        """No-op: the pool owns client lifetime.
+
+        ``HttpClientPool.aclose_all`` (called from the FastAPI lifespan
+        shutdown) closes every cached client. Per-provider ``aclose``
+        remains on the interface so ``LLMGateway.aclose_all`` can
+        iterate providers uniformly — see :mod:`llm_client.gateway`.
+        """
+        return None
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         system, messages = _convert_messages(request.messages)
@@ -88,7 +106,8 @@ class AnthropicProvider(BaseProvider):
             body["tools"] = request.tools
 
         try:
-            resp = await self._client.post(ANTHROPIC_API_URL, json=body)
+            client = await self._get_client()
+            resp = await client.post(ANTHROPIC_API_URL, json=body)
         except httpx.HTTPError as e:
             raise ProviderUnavailable(f"Anthropic network error: {e}") from e
 
@@ -164,7 +183,8 @@ class AnthropicProvider(BaseProvider):
         finish_reason = ""
 
         try:
-            stream_ctx = self._client.stream("POST", ANTHROPIC_API_URL, json=body)
+            client = await self._get_client()
+            stream_ctx = client.stream("POST", ANTHROPIC_API_URL, json=body)
             async with stream_ctx as resp:
                 if resp.status_code == 429:
                     raise RateLimited("Anthropic rate limited")

@@ -84,18 +84,38 @@ class OpenAIProvider(BaseProvider):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=timeout,
-            headers={
-                "Authorization": f"Bearer {api_key}" if api_key else "",
-                "Content-Type": "application/json",
-            },
-        )
+        # Client is owned by ``agent.llm_factory``'s process-wide
+        # :class:`HttpClientPool` (nitpick S4). We stash the config
+        # and lazily fetch the pooled client on first call. Per-base
+        # URL variations (Doubao, MiniMax, Ollama, BYOK proxies) each
+        # get their own pooled client keyed on ``(base_url, headers)``.
+        self._timeout = timeout
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Return the pooled ``httpx.AsyncClient`` for this provider."""
+        if self._client is None:
+            from agent.llm_factory import _build_http_pool
+
+            self._client = await _build_http_pool().get_or_create(
+                base_url=self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}" if self.api_key else "",
+                    "Content-Type": "application/json",
+                },
+                client_timeout=httpx.Timeout(self._timeout),
+            )
+        return self._client
 
     async def aclose(self) -> None:
-        """Close the underlying httpx client."""
-        await self._client.aclose()
+        """No-op: the pool owns client lifetime.
+
+        ``HttpClientPool.aclose_all`` (called from the FastAPI lifespan
+        shutdown) closes every cached client. Per-provider ``aclose``
+        remains on the interface so ``LLMGateway.aclose_all`` can
+        iterate providers uniformly — see :mod:`llm_client.gateway`.
+        """
+        return None
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         body: dict[str, Any] = {
@@ -113,7 +133,8 @@ class OpenAIProvider(BaseProvider):
             body["tool_choice"] = request.tool_choice
 
         try:
-            resp = await self._client.post("/chat/completions", json=body)
+            client = await self._get_client()
+            resp = await client.post("/chat/completions", json=body)
         except httpx.HTTPError as e:
             raise ProviderUnavailable(f"OpenAI network error: {e}") from e
 
@@ -172,7 +193,8 @@ class OpenAIProvider(BaseProvider):
         finish_reason = ""
 
         try:
-            stream_ctx = self._client.stream("POST", "/chat/completions", json=body)
+            client = await self._get_client()
+            stream_ctx = client.stream("POST", "/chat/completions", json=body)
             async with stream_ctx as resp:
                 if resp.status_code == 429:
                     raise RateLimited("OpenAI rate limited")
