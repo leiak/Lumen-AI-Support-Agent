@@ -18,10 +18,19 @@ first caller's loop wins; subsequent callers in the same loop reuse the
 bound client. Between tests the conftest's ``_reset_singletons`` fixture
 drops the module-level pool reference so the next test creates a fresh
 client on its own loop.
+
+Note: ``llm_client.embeddings.py`` is intentionally not migrated — it
+holds an ``openai.AsyncOpenAI`` singleton whose SDK manages its own
+internal httpx pool, so wrapping it in our pool would be a no-op.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import httpx
+
+_log = logging.getLogger("llm_client.http_pool")
 
 
 class HttpClientPool:
@@ -74,15 +83,30 @@ class HttpClientPool:
         return client
 
     async def aclose_all(self) -> None:
-        """Close every cached client. Idempotent; safe to call twice.
+        """Close every cached client. Idempotent and tolerant of
+        per-client close failures (broken socket, event loop closed) so
+        a single misbehaving client doesn't leak the others' TCP sockets
+        during teardown.
 
         Drain order: snapshot the values first so a closed client
-        cannot be returned to a concurrent caller between calls.
+        cannot be returned to a concurrent caller between calls, then
+        close concurrently with ``return_exceptions=True`` so one
+        failing client does not abort the rest. Matches the defensive
+        pattern in :meth:`llm_client.gateway.LLMGateway.aclose_all`.
         """
         clients = list(self._clients.values())
         self._clients.clear()
-        for client in clients:
-            await client.aclose()
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(c.aclose() for c in clients), return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                _log.warning(
+                    "llm_client.http_pool.aclose_failed",
+                    error_type=type(result).__name__,
+                )
 
 
 __all__ = ["HttpClientPool"]
