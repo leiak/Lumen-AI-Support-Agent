@@ -48,11 +48,12 @@ def _client_ip(request: Request) -> str:
         fwd = request.headers.get("x-forwarded-for")
         if fwd:
             entries = [e.strip() for e in fwd.split(",") if e.strip()]
-            if len(entries) > hops:
-                return entries[-hops - 1]
-            # Header has fewer entries than trusted hops → trust the
-            # leftmost one (we know nothing more specific).
-            return entries[0]
+            if entries:
+                if len(entries) > hops:
+                    return entries[-hops - 1]
+                # Header has fewer entries than trusted hops → trust the
+                # leftmost one (we know nothing more specific).
+                return entries[0]
     return request.client.host if request.client else "unknown"
 
 

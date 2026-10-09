@@ -62,3 +62,29 @@ def test_client_ip_uses_rightmost_n_hops(
     }
     req = Request(scope)
     assert _client_ip(req) == "1.2.3.4"
+
+
+def test_client_ip_falls_back_to_leftmost_when_header_shorter_than_hops(
+    monkeypatch: pytest.MonkeyPatch, reset_settings_after_test
+) -> None:
+    """When the header has fewer entries than TRUSTED_PROXY_HOPS, fall
+    back to the leftmost (most specific) entry — we can't trust the
+    proxy chain fully, but the leftmost is still better than the socket
+    peer behind a misconfigured proxy."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:y@localhost:5432/z")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("JWT_SECRET", "xK3mF9pL2qR8tN5vW7yA1bC4dE6gH0iJ")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "3")
+    reset_settings()
+    from fastapi import Request
+
+    # Header has only 2 entries, but we trust 3 hops. The rightmost 2
+    # are proxy chain, but we don't have a 3rd proxy — so we trust the
+    # leftmost ("1.2.3.4") as the originating client.
+    scope = {
+        "type": "http",
+        "headers": [(b"x-forwarded-for", b"1.2.3.4, 10.0.0.1")],
+        "client": ("9.9.9.9", 12345),
+    }
+    req = Request(scope)
+    assert _client_ip(req) == "1.2.3.4"

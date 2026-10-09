@@ -256,7 +256,7 @@ class Settings(BaseSettings):
     # direct-internet deployments). Walk the rightmost N entries from
     # the header and use the next entry leftward as the originating
     # client. Default 0 = ignore the header entirely (safe default).
-    trusted_proxy_hops: int = Field(default=0, alias="TRUSTED_PROXY_HOPS")
+    trusted_proxy_hops: int = Field(default=0, ge=0, alias="TRUSTED_PROXY_HOPS")
 
     # Stage 17 / M2.B — multimodal KB (PNG/JPG/WebP/PDF) foundation.
     #
