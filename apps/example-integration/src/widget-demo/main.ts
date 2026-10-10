@@ -41,3 +41,13 @@ window.addEventListener('load', () => {
     }
   }, 1500);
 });
+
+// Load the SDK AFTER the config is set. A static <script async> in
+// index.html has a race: the SDK IIFE may run before this module
+// finishes evaluating, see window.LumenAICustomerConfig as undefined,
+// and throw. Injecting the tag here guarantees the config is in place
+// first.
+const sdk = document.createElement('script');
+sdk.src = './lumen-widget.js';
+sdk.async = false;
+document.body.appendChild(sdk);
