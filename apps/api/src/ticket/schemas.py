@@ -78,4 +78,24 @@ class TicketEventOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-__all__ = ["TicketOut", "TicketTransitionIn", "TicketEventOut"]
+class SlaPolicyRead(BaseModel):
+    """Public representation of an SLA policy (admin listing endpoint).
+
+    Powers ``GET /api/v1/admin/tenants/{tenant_id}/sla-policies`` — one row
+    per priority bucket. Read-only; policies are configured by tenant admins
+    out-of-band (seed script / DB migration), so we do not expose create /
+    update endpoints here.
+    """
+
+    id: str
+    name: str
+    priority: TicketPriority
+    first_response_minutes: int
+    resolution_minutes: int
+    business_hours_only: bool
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+__all__ = ["TicketOut", "TicketTransitionIn", "TicketEventOut", "SlaPolicyRead"]

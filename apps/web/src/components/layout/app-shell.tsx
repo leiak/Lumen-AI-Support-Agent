@@ -1,5 +1,14 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { Inbox, BookOpen, Settings, LogOut, FileSearch } from 'lucide-react';
+import {
+  Inbox,
+  BookOpen,
+  Settings,
+  LogOut,
+  FileSearch,
+  Timer,
+  Wallet,
+  Ticket,
+} from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/api-client';
@@ -20,6 +29,9 @@ const navItems: NavItem[] = [
 ];
 
 const adminNavItems: NavItem[] = [
+  { to: '/admin/sla-policies', label: 'SLA 策略', icon: Timer },
+  { to: '/admin/budget', label: '预算', icon: Wallet },
+  { to: '/admin/tickets', label: '工单', icon: Ticket },
   { to: '/admin/kb-drafts', label: 'KB 草稿', icon: FileSearch },
 ];
 

@@ -53,6 +53,8 @@ from knowledge.models import (
     KbArticleDraft,
     KnowledgeBase,
 )
+from ticket.models import SlaPolicy
+from ticket.schemas import SlaPolicyRead
 
 from admin.repository import (
     AdminTenantBudgetRepository,
@@ -388,6 +390,46 @@ async def reject_kb_draft(
         },
     )
     return {"draft_id": draft_id, "status": "REJECTED"}
+
+
+@router.get(
+    "/tenants/{tenant_id}/sla-policies",
+    response_model=list[SlaPolicyRead],
+)
+async def list_sla_policies(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> list[SlaPolicyRead]:
+    """List the tenant's SLA policies (one per priority bucket).
+
+    Read-only; policies are configured by tenant admins out-of-band
+    (seed script / DB migration). Returns rows ordered by priority
+    (P0 → P3) so the admin SPA can render them as a stable table.
+
+    Auth: requires admin JWT. Cross-tenant access returns 404
+    (anti-enumeration) — mirrors the kb-drafts / llm-configs /
+    budget pattern in this module.
+
+    Status codes
+    ------------
+    * 200 — list (possibly empty) of policies, ordered by priority.
+    * 401 — missing / invalid bearer token (raised by require_admin).
+    * 403 — token is not admin / owner role (raised by require_admin).
+    * 404 — claims['tenant_id'] != path ``tenant_id`` (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: don't reveal that the target tenant exists
+        # to an admin of a different tenant. Same response as a real
+        # unknown tenant.
+        raise HTTPException(status_code=404, detail="not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        result = await session.execute(
+            select(SlaPolicy)
+            .where(SlaPolicy.tenant_id == tenant_id)
+            .order_by(SlaPolicy.priority)
+        )
+        return [SlaPolicyRead.model_validate(p) for p in result.scalars()]
 
 
 # ---------------------------------------------------------------------------
