@@ -5,7 +5,7 @@
   "description": "Three demo entry points (Widget / REST / Webhook) for Lumen AI Support Agent",
   "type": "module",
   "scripts": {
-    "widget": "vite src/widget-demo",
+    "widget": "vite",
     "api-client:login": "tsx src/api-client/cli.ts login",
     "api-client:queue": "tsx src/api-client/cli.ts queue",
     "api-client:claim": "tsx src/api-client/cli.ts claim",
@@ -17,7 +17,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "type-check": "tsc --noEmit",
-    "build": "vite build src/widget-demo"
+    "build": "vite build"
   },
   "dependencies": {
     "fastify": "^4.28.1"
