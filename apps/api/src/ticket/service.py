@@ -28,7 +28,7 @@ contents.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from core.logging import get_logger
 from ticket.enums import TicketPriority, TicketStatus
@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 
-class TicketNotFound(Exception):
+class TicketNotFound(Exception):  # noqa: N818
     """Raised when a ticket lookup returns ``None`` (missing or cross-tenant).
 
     The API layer maps this to ``404``. Using a single exception
@@ -58,7 +58,7 @@ class TicketService:
     def __init__(
         self,
         repo: TicketRepository,
-        conv_repo: "ConversationRepository | None" = None,
+        conv_repo: ConversationRepository | None = None,
         *,
         sla_policy_default_minutes: int = 60,
     ) -> None:
@@ -80,7 +80,7 @@ class TicketService:
         subject: str,
         category: str | None = None,
         priority: TicketPriority = TicketPriority.P2,
-    ) -> "Ticket":
+    ) -> Ticket:
         """Create a NEW ticket with an SLA deadline.
 
         SLA deadline is the **first-response** deadline — derived
@@ -134,7 +134,7 @@ class TicketService:
         actor_type: str,
         actor_id: str | None,
         tenant_id: str,
-    ) -> "Ticket":
+    ) -> Ticket:
         """Validate, load, mutate, audit, and log a state change.
 
         Order of operations matters:
@@ -213,7 +213,7 @@ class TicketService:
         tenant_id: str,
         conversation_id: str,
         subject: str,
-    ) -> "Ticket":
+    ) -> Ticket:
         """Return the ticket attached to ``conversation_id`` or create one.
 
         Tenant-scoped: a conversation_id that belongs to another

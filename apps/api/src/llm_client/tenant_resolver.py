@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from llm_client.types import ChatRequest, ChatResponse
 
 
-class _NoChainConfigured(Exception):
+class _NoChainConfigured(Exception):  # noqa: N818
     """Internal-but-exported sentinel: tenant has a single provider, no fallback chain.
 
     :meth:`TenantResolver.ainvoke` raises when the inner resolver is a
@@ -297,14 +297,14 @@ class TenantResolver:
     ``LLMClient`` can use its own retry loop on the single provider.
     """
 
-    def __init__(self, *, gateway: "LLMGateway") -> None:
+    def __init__(self, *, gateway: LLMGateway) -> None:
         self._gateway = gateway
         self._delegate = gateway.default_resolver
 
-    def __call__(self, request: "ChatRequest") -> Any:
+    def __call__(self, request: ChatRequest) -> Any:
         return self._delegate(request)
 
-    async def ainvoke(self, request: "ChatRequest") -> "ChatResponse":
+    async def ainvoke(self, request: ChatRequest) -> ChatResponse:
         if hasattr(self._delegate, "ainvoke"):
             return await self._delegate.ainvoke(request)
         raise _NoChainConfigured()
@@ -312,8 +312,8 @@ class TenantResolver:
 
 __all__ = [
     "TenantLLMConfigCache",
-    "TenantResolver",
     "TenantLlmNotConfigured",
+    "TenantResolver",
     "_NoChainConfigured",
     "build_tenant_resolver",
 ]

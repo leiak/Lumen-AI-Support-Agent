@@ -644,7 +644,7 @@ async def delete_tenant_llm_config(
     if claims.get("tenant_id") != tenant_id:
         raise HTTPException(status_code=404, detail="not found")
     try:
-        deleted = await AdminTenantLLMConfigRepository().delete(
+        await AdminTenantLLMConfigRepository().delete(
             tenant_id=tenant_id, provider_name=provider_name,
         )
     except ValueError as e:

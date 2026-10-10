@@ -16,12 +16,12 @@ Submodules:
 * :mod:`knowledge.multimodal.embedder` — Vision embedder + Doubao.
 """
 from knowledge.multimodal.blocks import (
-    _extract_html_blocks,
-    _extract_html_blocks_from_soup,
-    _extract_markdown_blocks,
-    _log_ocr_todo_once,
-    _scan_markdown_image_src,
-    _strip_markdown_images,
+    _extract_html_blocks,  # noqa: F401
+    _extract_html_blocks_from_soup,  # noqa: F401
+    _extract_markdown_blocks,  # noqa: F401
+    _log_ocr_todo_once,  # noqa: F401
+    _scan_markdown_image_src,  # noqa: F401
+    _strip_markdown_images,  # noqa: F401
     enrich_blocks,
     strip_markdown_blocks,
 )

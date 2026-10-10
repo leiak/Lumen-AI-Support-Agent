@@ -12,7 +12,7 @@ Closure properties:
 from ticket.enums import TicketStatus
 
 
-class InvalidTransition(Exception):
+class InvalidTransition(Exception):  # noqa: N818
     """Raised when a status transition violates the state machine."""
 
 

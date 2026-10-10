@@ -53,7 +53,7 @@ newer embedding model" operations).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -127,7 +127,7 @@ async def history_mining_worker(ctx: dict[str, Any]) -> dict[str, int]:
         lookback_days = settings.history_mining_lookback_days
         min_cluster_size = settings.history_mining_min_cluster_size
         max_cluster_size = settings.history_mining_max_cluster_size
-        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
 
         sm = get_sessionmaker()
         async with sm() as session:
@@ -170,7 +170,7 @@ async def history_mining_worker(ctx: dict[str, Any]) -> dict[str, int]:
                     gateway=gateway,
                 )
                 drafts_total += drafts_n
-            except Exception as exc:  # noqa: BLE001 — per-tenant isolation
+            except Exception as exc:
                 # Per-tenant failure MUST NOT kill the rest of the run.
                 logger.warning(
                     "history_mining.tenant_failed",
@@ -203,7 +203,7 @@ async def _process_tenant(
     messages: list[tuple[str, str]],  # (msg_id, content_text)
     min_cluster_size: int,
     max_cluster_size: int,
-    gateway: "LLMGateway",
+    gateway: LLMGateway,
 ) -> int:
     """Cluster tenant's questions + generate drafts. Returns drafts created.
 
@@ -227,7 +227,7 @@ async def _process_tenant(
     texts = [content for _, content in messages]
     try:
         emb_result = await embed_texts(texts=texts, tenant_id=tenant_id)
-    except Exception as exc:  # noqa: BLE001 — graceful degradation
+    except Exception as exc:
         logger.warning(
             "history_mining.embedding_failed",
             extra={
@@ -351,8 +351,8 @@ class WorkerSettings:
     requires the attribute; the empty list is correct.
     """
 
-    functions: list = []
-    cron_jobs = [
+    functions: list = []  # noqa: RUF012
+    cron_jobs: list = [  # noqa: RUF012
         cron(
             history_mining_worker,
             hour=MIN_HOUR_UTC,

@@ -10,7 +10,8 @@ cluster size + error class.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -68,7 +69,9 @@ class KBDraftGenerator:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You generate KB article drafts from customer question clusters.",
+                        "content": (
+                            "You generate KB article drafts from customer question clusters."
+                        ),
                     },
                     {"role": "user", "content": prompt},
                 ],

@@ -417,7 +417,7 @@ async def upload_article(
     file: Annotated[UploadFile, File(...)],
     title: Annotated[str | None, Form()] = None,
     source_uri: Annotated[str | None, Form()] = None,
-    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,  # noqa: RUF013
 ) -> ArticleOut:
     """Create a new article by uploading a file (Task 6.10).
 
@@ -503,7 +503,7 @@ async def reupload_article(
     file: Annotated[UploadFile, File(...)],
     title: Annotated[str | None, Form()] = None,
     source_uri: Annotated[str | None, Form()] = None,
-    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,  # noqa: RUF013
 ) -> ReindexResultOut:
     """Replace an article's contents by uploading a new file.
 

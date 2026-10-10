@@ -54,14 +54,14 @@ class LLMGateway:
     def __init__(
         self,
         *,
-        providers: dict[str, "BaseProvider"],
+        providers: dict[str, BaseProvider],
         default_provider_name: str | None = None,
         default_fallback_chain: list[tuple[str, str]] | None = None,
         attempt_timeout_s: float | None = None,
     ) -> None:
         if not providers:
             raise RuntimeError("LLMGateway needs at least one provider")
-        self._providers: dict[str, "BaseProvider"] = dict(providers)
+        self._providers: dict[str, BaseProvider] = dict(providers)
         if default_provider_name is None:
             # First insertion order (Python 3.7+ dict guarantee). This
             # matches the M1 / M3 factory behavior: MiniMax is preferred
@@ -118,7 +118,7 @@ class LLMGateway:
         )
 
     @property
-    def providers(self) -> MappingProxyType[str, "BaseProvider"]:
+    def providers(self) -> MappingProxyType[str, BaseProvider]:
         """Read-only view of the registered providers."""
         return MappingProxyType(self._providers)
 
@@ -132,7 +132,7 @@ class LLMGateway:
         """The auto-routing resolver. Default ``provider_resolver`` value."""
         return self._resolver
 
-    def resolve(self, request: "ChatRequest") -> "BaseProvider":
+    def resolve(self, request: ChatRequest) -> BaseProvider:
         """Resolve ``request`` to a provider via the prefix router.
 
         Raises :class:`llm_client.resolvers.UnknownModelError` if the
@@ -179,7 +179,7 @@ class LLMGateway:
         results = await asyncio.gather(
             *(c[1] for c in closes), return_exceptions=True
         )
-        for (provider_name, _), result in zip(closes, results):
+        for (provider_name, _), result in zip(closes, results, strict=False):
             if isinstance(result, BaseException):
                 log.warning(
                     "llm_client.aclose_failed",

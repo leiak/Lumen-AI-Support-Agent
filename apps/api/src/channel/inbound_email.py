@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -140,7 +140,7 @@ async def handle_email_inbound(
                 # First email in thread — create conversation. opened_at
                 # and last_activity_at are NOT NULL on the model (mirror
                 # service.py:179-190 pattern).
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 conversation = Conversation(
                     id=new_id(),
                     tenant_id=tenant_id,
@@ -250,7 +250,7 @@ async def handle_email_inbound(
                 subject=subject,
                 body_text=ai_content,
                 in_reply_to=parsed.message_id,
-                references=parsed.references + [parsed.message_id],
+                references=[*parsed.references, parsed.message_id],
             )
         except EmailSendError as send_err:
             # SES down — message is durably persisted; outbound retry

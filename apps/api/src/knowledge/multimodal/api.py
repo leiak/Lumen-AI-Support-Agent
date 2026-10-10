@@ -42,11 +42,11 @@ and never appears in any log payload — operators can join
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from qdrant_client.models import PointStruct
 
 from auth.dependencies import get_current_user
 from core.config import get_settings
@@ -61,7 +61,6 @@ from knowledge.multimodal.storage import ObjectStoreError, get_object_store
 from knowledge.qdrant_client import DEFAULT_COLLECTION
 from knowledge.startup import ensure_image_collection, get_image_collection_name
 from llm_client.embeddings import EmbeddingError, embed_texts
-from qdrant_client.models import PointStruct
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/kb-articles", tags=["kb-multimodal"])
@@ -132,7 +131,7 @@ async def upload_multimodal(
     file: Annotated[UploadFile, File(...)],
     kb_slug: Annotated[str, Form(min_length=1, max_length=64)],
     title: Annotated[str, Form(min_length=1, max_length=2000)],
-    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,
+    claims: Annotated[dict[str, Any], Depends(get_current_user)] = None,  # noqa: RUF013
 ) -> dict[str, Any]:
     """Upload image or PDF. Embeds + indexes. Returns article id.
 
@@ -335,7 +334,7 @@ async def upload_multimodal(
                 },
             )
             for idx, (page_num, text, vec) in enumerate(
-                zip(text_chunk_pages, text_chunks, embed_result.vectors)
+                zip(text_chunk_pages, text_chunks, embed_result.vectors, strict=False)
             )
         ]
 

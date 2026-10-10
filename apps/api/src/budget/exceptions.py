@@ -8,7 +8,7 @@ rate-limiting — do not retry, surface as HTTP 429.
 from __future__ import annotations
 
 
-class TenantBudgetRateLimited(Exception):
+class TenantBudgetRateLimited(Exception):  # noqa: N818
     """Raised by BudgetResolver post-mortem gate after observing 429.
 
     Attributes:

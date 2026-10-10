@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.database import get_session
+from core.logging import get_logger
 from knowledge.models import KnowledgeBase
 from knowledge.repository import KnowledgeBaseRepository
 from knowledge.retriever import (
@@ -55,8 +56,6 @@ from knowledge.retriever import (
     retrieve_chunks,
 )
 from llm_client.embeddings import EmbeddingError
-
-from core.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -486,6 +485,8 @@ class RAGService:
         # ---- fan-out retrieval across scoped KBs ------------------
         from knowledge.retriever import (
             EmbeddingError as _RetrieverEmbeddingError,
+        )
+        from knowledge.retriever import (
             KnowledgeBaseNotFoundError,
             retrieve_chunks,
         )
@@ -585,6 +586,8 @@ class RAGService:
             return {}
         # Local imports so the module remains importable in unit
         # tests that mock the lower-level surfaces.
+        from sqlalchemy import select
+
         from knowledge.models import Article
 
         async with get_session() as session:

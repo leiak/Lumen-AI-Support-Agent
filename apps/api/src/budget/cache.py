@@ -34,7 +34,9 @@ class TenantBudgetSnapshotCache:
     ) -> None:
         self._ttl_s = ttl_s
         self._maxsize = maxsize
-        self._cache: OrderedDict[tuple[str, str], tuple[float, TenantBudgetSnapshot]] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, str], tuple[float, TenantBudgetSnapshot]] = (
+            OrderedDict()
+        )
         self._repo = repo or TenantBudgetSnapshotRepository()
 
     def get(

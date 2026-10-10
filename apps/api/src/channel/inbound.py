@@ -85,7 +85,7 @@ def _build_ticket_service_factory() -> Callable[..., TicketService]:
 # The shared process-wide connection table. Imported by reference (not
 # instantiated here) so that widget.ws.router — which owns the connection
 # lifecycle — and this module broadcast into the *same* set of sockets.
-from widget.ws.manager import manager as _wsm
+from widget.ws.manager import manager as _wsm  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

@@ -75,13 +75,13 @@ class S3ObjectStore:
 
         For MinIO (dev with explicit ``endpoint_url``), uses the endpoint URL.
         For AWS S3 (production, boto3 auto-resolves to ``*.amazonaws.com``),
-        uses virtual-hosted–style URL.
+        uses virtual-hosted-style URL.
         """
         endpoint = (self._client.meta.endpoint_url or "").rstrip("/")
         if endpoint and ".amazonaws.com" not in endpoint:
-            # Custom endpoint (e.g. MinIO) — path-style URL is fine.
+            # Custom endpoint (e.g. MinIO) - path-style URL is fine.
             return f"{endpoint}/{self._bucket}/{key}"
-        # Real AWS S3 — virtual-hosted–style URL (canonical form).
+        # Real AWS S3 - virtual-hosted-style URL (canonical form).
         region = self._client.meta.region_name or "us-east-1"
         return f"https://{self._bucket}.s3.{region}.amazonaws.com/{key}"
 

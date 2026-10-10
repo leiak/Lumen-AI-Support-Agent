@@ -87,7 +87,7 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 #
 # Three buckets keep ``LUMEN_QA_SCORES{dimension, bucket}`` cardinality
-# bounded at 3 dimensions × 3 buckets = 9 series (well under Prometheus'
+# bounded at 3 dimensions * 3 buckets = 9 series (well under Prometheus'
 # 100k cap). Boundaries are inclusive on the lower side and exclusive on
 # the upper side, matching the convention used by Stage 10's RAG eval
 # suite.
@@ -239,7 +239,7 @@ async def qa_judge_task(ctx: dict[str, Any], message_id: str) -> None:
                 error_type=type(exc).__name__,
             )
             return
-        except Exception as exc:  # noqa: BLE001 — best-effort worker
+        except Exception as exc:
             # Map exception types to the documented
             # ``LUMEN_QA_FAILURES`` reason labels to keep metric
             # cardinality bounded (see business_metrics.py:71).
@@ -443,7 +443,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     if judge is not None:
         try:
             await judge.llm.aclose()
-        except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+        except Exception as exc:
             log.warning(
                 "qa.worker.shutdown_flush_failed",
                 error_type=type(exc).__name__,
@@ -451,7 +451,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         if judge.gateway is not None:
             try:
                 await judge.gateway.aclose_all()
-            except Exception as exc:  # noqa: BLE001 — shutdown is best-effort
+            except Exception as exc:
                 log.warning(
                     "qa.worker.shutdown_aclose_failed",
                     error_type=type(exc).__name__,
@@ -484,8 +484,8 @@ class WorkerSettings:
     environment in a future iteration.
     """
 
-    functions = [qa_judge_task]
-    cron_jobs = [
+    functions: list = [qa_judge_task]  # noqa: RUF012
+    cron_jobs: list = [  # noqa: RUF012
         cron(qa_sla_alert_worker, minute={0}),
         cron(budget_cleanup_task, hour={2}, minute={0}),
     ]
@@ -517,8 +517,8 @@ def build_arq_redis() -> ArqRedis:
 
 __all__ = [
     "WorkerSettings",
-    "build_arq_redis",
     "budget_cleanup_task",
+    "build_arq_redis",
     "qa_judge_task",
     "qa_sla_alert_worker",
 ]

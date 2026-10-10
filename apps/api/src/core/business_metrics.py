@@ -28,7 +28,7 @@ The label space stays small:
 
 * ``role``: 5 fixed values from :class:`conversation.enums.MessageRole`
 * ``provider``: ``anthropic`` / ``openai`` (any future adapter adds one)
-* ``model``: 5–10 model names in practice
+* ``model``: 5-10 model names in practice
 * ``route_mode``: ``auto`` / ``pinned`` / ``unknown_model`` /
   ``resolver_error`` (4 enum values)
 * ``outcome``: ``success`` / ``rate_limited`` / ``invalid_request`` /
@@ -72,7 +72,7 @@ LLM_TOKENS_TOTAL = Counter(
 #   step:     0-based index in the chain
 #   outcome:  success / provider_unavailable / output_invalid /
 #             rate_limited / timeout
-# Cardinality ≈ providers × models × chain_length × 5 outcomes.
+# Cardinality ≈ providers * models * chain_length * 5 outcomes.
 LLM_FALLBACK_ATTEMPTS_TOTAL = Counter(
     "lumen_llm_fallback_attempts_total",
     "Per-step fallback chain attempts, by provider / model / step / outcome.",
@@ -189,8 +189,8 @@ __all__ = [
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",
     "LUMEN_QA_FLAGGED",
-    "LUMEN_QA_SCORE_LATENCY",
     "LUMEN_QA_SCORES",
+    "LUMEN_QA_SCORE_LATENCY",
     "LUMEN_SLA_BREACHED",
     "MESSAGES_TOTAL",
     "RATE_LIMIT_FAIL_OPEN_TOTAL",
