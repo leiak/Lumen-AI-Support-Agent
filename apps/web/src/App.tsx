@@ -4,6 +4,7 @@ import { AppShell } from '@/components/layout/app-shell';
 import { AdminGuard } from '@/components/auth/admin-guard';
 import { AuthGuard } from '@/components/auth/auth-guard';
 import { AdminKbDraftsPage } from '@/pages/admin-kb-drafts';
+import { AdminLLMConfigsPage } from '@/pages/admin-llm-configs';
 import { AdminSlaPoliciesPage } from '@/pages/admin-sla-policies';
 import { AdminBudgetPage } from '@/pages/admin-budget';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
@@ -70,6 +71,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminKbDraftsPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/llm-configs"
+          element={
+            <AdminGuard>
+              <AdminLLMConfigsPage />
             </AdminGuard>
           }
         />

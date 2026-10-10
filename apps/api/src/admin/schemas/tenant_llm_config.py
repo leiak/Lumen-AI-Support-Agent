@@ -48,4 +48,25 @@ class TenantLLMConfigRead(BaseModel):
     updated_at: datetime
 
 
-__all__ = ["TenantLLMConfigCreate", "TenantLLMConfigRead"]
+class TenantLLMConfigUpdate(BaseModel):
+    """Request body for PATCH /admin/tenants/{tenant_id}/llm-configs/{provider_name}.
+
+    Tier 1 Task 1.3: lets the admin SPA toggle ``enabled`` and adjust
+    ``base_url`` WITHOUT requiring the operator to re-submit the API
+    key. The encrypted key is preserved across the update — only the
+    mutable sidecar fields change. Leaving a field out (or sending
+    ``None`` for ``base_url``) is a no-op for that field.
+    """
+
+    enabled: bool | None = Field(
+        default=None,
+        description="Toggle on/off. Omit to keep current value.",
+    )
+    base_url: str | None = Field(
+        default=None, max_length=512,
+        description="Override for provider base URL. Pass an empty string "
+        "to clear. Omit to keep current value.",
+    )
+
+
+__all__ = ["TenantLLMConfigCreate", "TenantLLMConfigRead", "TenantLLMConfigUpdate"]

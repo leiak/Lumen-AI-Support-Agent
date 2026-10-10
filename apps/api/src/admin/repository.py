@@ -39,8 +39,9 @@ from llm_client.tenant_config_models import (
 )
 
 from admin.schemas.budget import TenantBudgetCreate
-from admin.schemas.tenant_llm_config import TenantLLMConfigCreate
+from admin.schemas.tenant_llm_config import TenantLLMConfigCreate, TenantLLMConfigUpdate
 from core.config import get_settings
+from llm_client.tenant_config_models import TenantLLMConfig
 from tenant.repository import TenantRepository
 
 
@@ -93,6 +94,50 @@ class AdminTenantLLMConfigRepository:
         if tenant is None:
             raise ValueError(f"unknown tenant: {tenant_id!r}")
         return await self._inner.list_by_tenant(tenant_id, enabled_only=False)
+
+    async def update(
+        self,
+        *,
+        tenant_id: str,
+        provider_name: str,
+        payload: TenantLLMConfigUpdate,
+    ) -> TenantLLMConfig | None:
+        """Update ``enabled`` and/or ``base_url`` without rotating the key.
+
+        Tier 1 Task 1.3. Returns ``None`` when no row matches (the
+        API layer maps that to 404 — same anti-enumeration shape as
+        the upsert path). The encrypted API key is preserved across
+        the update.
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        # Translate ``base_url == ""`` (frontend-friendly clear) into
+        # ``None`` (DB NULL). Empty string isn't a valid base URL.
+        base_url = payload.base_url
+        if base_url == "":
+            base_url = None
+        # ``enabled`` is bool | None in the schema; pass through as-is.
+        return await self._inner.update(
+            tenant_id=tenant_id,
+            provider_name=provider_name,
+            enabled=payload.enabled,
+            base_url=base_url,
+        )
+
+    async def delete(self, *, tenant_id: str, provider_name: str) -> bool:
+        """Remove the (tenant, provider) row. Idempotent.
+
+        Tier 1 Task 1.3. Returns ``True`` if a row was deleted, ``False``
+        if there was nothing to delete. The API layer translates that
+        to 204 / 404 the same way as other resources.
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.delete_by_tenant_provider(
+            tenant_id=tenant_id, provider_name=provider_name,
+        )
 
 
 class AdminTenantBudgetRepository:

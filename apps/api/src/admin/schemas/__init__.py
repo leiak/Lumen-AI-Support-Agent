@@ -9,6 +9,7 @@ from admin.schemas.budget import (
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
+    TenantLLMConfigUpdate,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "TenantBudgetUsageRead",
     "TenantLLMConfigCreate",
     "TenantLLMConfigRead",
+    "TenantLLMConfigUpdate",
 ]

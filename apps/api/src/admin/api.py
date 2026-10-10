@@ -39,7 +39,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -60,6 +60,7 @@ from admin.schemas.budget import (
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
+    TenantLLMConfigUpdate,
 )
 from auth.dependencies import require_admin
 from budget.cleanup import run_budget_cleanup
@@ -545,6 +546,112 @@ async def list_tenant_llm_configs(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 Task 1.3 — LLM config mutation endpoints.
+#
+# PATCH /api/v1/admin/tenants/{tenant_id}/llm-configs/{provider_name}
+#   toggle ``enabled`` and/or adjust ``base_url`` without rotating the
+#   plaintext API key. The encrypted key is preserved across the call.
+#
+# DELETE /api/v1/admin/tenants/{tenant_id}/llm-configs/{provider_name}
+#   remove the (tenant, provider) row. Idempotent — the operator can
+#   always re-add the provider with POST afterwards.
+#
+# Both endpoints follow the same anti-enumeration + 404 pattern as
+# the POST / GET pair above.
+# ---------------------------------------------------------------------------
+
+
+@router.patch(
+    "/tenants/{tenant_id}/llm-configs/{provider_name}",
+    response_model=TenantLLMConfigRead,
+)
+async def patch_tenant_llm_config(
+    tenant_id: str,
+    provider_name: str,
+    payload: TenantLLMConfigUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantLLMConfigRead:
+    """Update ``enabled`` and/or ``base_url`` for an existing provider config.
+
+    Tier 1 Task 1.3. The plaintext API key is NEVER touched — only the
+    mutable sidecar fields. Response shape matches GET: the API key is
+    excluded entirely (not even the Fernet ciphertext).
+
+    Auth: requires admin JWT. Cross-tenant access returns 404.
+
+    Status codes
+    ------------
+    * 200 — updated.
+    * 404 — tenant does not exist OR cross-tenant OR no row for the
+      (tenant, provider) pair. Same code for all three cases — see
+      ``Anti-enumeration`` note below.
+    * 422 — ``base_url`` too long (Pydantic).
+
+    Anti-enumeration
+    ----------------
+    The three 404 paths (unknown tenant / cross-tenant / unknown
+    provider) all return the same body so an attacker can't probe
+    which (tenant, provider) pairs exist.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        # cross-tenant: same 404 as the unknown-tenant / unknown-
+        # provider branches below.
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        row = await AdminTenantLLMConfigRepository().update(
+            tenant_id=tenant_id,
+            provider_name=provider_name,
+            payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return TenantLLMConfigRead(
+        provider_name=row.provider_name,
+        base_url=row.base_url,
+        enabled=row.enabled,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.delete(
+    "/tenants/{tenant_id}/llm-configs/{provider_name}",
+    status_code=204,
+)
+async def delete_tenant_llm_config(
+    tenant_id: str,
+    provider_name: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> Response:
+    """Remove the (tenant, provider) LLM config row.
+
+    Tier 1 Task 1.3. Idempotent — ``False`` (no row to delete) is
+    treated the same as ``True`` (success) and returns 204. The
+    anti-enumeration gate mirrors PATCH above: unknown tenant /
+    cross-tenant / unknown provider all collapse to the same 404.
+
+    Status codes
+    ------------
+    * 204 — deleted (or nothing to delete — still 204).
+    * 404 — tenant does not exist OR cross-tenant. Same code for
+      both. The PATCH path also collapses unknown provider here.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        deleted = await AdminTenantLLMConfigRepository().delete(
+            tenant_id=tenant_id, provider_name=provider_name,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    # Idempotent: True (deleted) and False (nothing to delete) both
+    # return 204. Only tenant-existence failures surface as 404.
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

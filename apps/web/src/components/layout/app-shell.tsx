@@ -8,6 +8,7 @@ import {
   Timer,
   Wallet,
   Ticket,
+  Cpu,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -33,6 +34,7 @@ const adminNavItems: NavItem[] = [
   { to: '/admin/budget', label: '预算', icon: Wallet },
   { to: '/admin/tickets', label: '工单', icon: Ticket },
   { to: '/admin/kb-drafts', label: 'KB 草稿', icon: FileSearch },
+  { to: '/admin/llm-configs', label: 'LLM 配置', icon: Cpu },
 ];
 
 export function AppShell(): JSX.Element {
