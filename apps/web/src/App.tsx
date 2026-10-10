@@ -4,6 +4,10 @@ import { AppShell } from '@/components/layout/app-shell';
 import { AdminGuard } from '@/components/auth/admin-guard';
 import { AuthGuard } from '@/components/auth/auth-guard';
 import { AdminKbDraftsPage } from '@/pages/admin-kb-drafts';
+import { AdminSlaPoliciesPage } from '@/pages/admin-sla-policies';
+import { AdminBudgetPage } from '@/pages/admin-budget';
+import { AdminTicketsPage } from '@/pages/admin-tickets';
+import { AdminTicketDetailPage } from '@/pages/admin-ticket-detail';
 import { LoginPage } from '@/pages/login';
 import { InboxPage } from '@/pages/inbox';
 import { InboxDetailPage } from '@/pages/inbox-detail';
@@ -29,6 +33,38 @@ export function App(): JSX.Element {
         <Route path="/kb/:kbId" element={<KbDetailPage />} />
         <Route path="/kb/:kbId/articles/:articleId" element={<ArticleDetailPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route
+          path="/admin/sla-policies"
+          element={
+            <AdminGuard>
+              <AdminSlaPoliciesPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/budget"
+          element={
+            <AdminGuard>
+              <AdminBudgetPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/tickets"
+          element={
+            <AdminGuard>
+              <AdminTicketsPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/tickets/:id"
+          element={
+            <AdminGuard>
+              <AdminTicketDetailPage />
+            </AdminGuard>
+          }
+        />
         <Route
           path="/admin/kb-drafts"
           element={
