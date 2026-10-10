@@ -1,0 +1,37 @@
+{
+  "name": "@lumen/example-integration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Three demo entry points (Widget / REST / Webhook) for Lumen AI Support Agent",
+  "type": "module",
+  "scripts": {
+    "widget": "vite src/widget-demo",
+    "api-client:login": "tsx src/api-client/cli.ts login",
+    "api-client:queue": "tsx src/api-client/cli.ts queue",
+    "api-client:claim": "tsx src/api-client/cli.ts claim",
+    "api-client:reply": "tsx src/api-client/cli.ts reply",
+    "api-client:suggest": "tsx src/api-client/cli.ts suggest",
+    "webhook:start": "tsx src/webhook-sender/server.ts",
+    "webhook:simulate": "tsx src/webhook-sender/server.ts --simulate-once",
+    "seed": "tsx scripts/extend-seed.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "type-check": "tsc --noEmit",
+    "build": "vite build src/widget-demo"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0",
+    "vite-plugin-static-copy": "^1.0.6",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@9.15.4"
+}
