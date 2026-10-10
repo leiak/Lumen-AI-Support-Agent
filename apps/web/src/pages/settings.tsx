@@ -1,15 +1,20 @@
+import { useState } from 'react';
 import { AxiosError } from 'axios';
 import { RefreshCw } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { BrandingPlaceholder } from '@/components/settings/branding-placeholder';
+import { ChannelCreateDialog } from '@/components/settings/channel-create-dialog';
+import { ChannelEditDialog } from '@/components/settings/channel-edit-dialog';
 import { ChannelListCard } from '@/components/settings/channel-list-card';
 import { TenantInfoCard } from '@/components/settings/tenant-info-card';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { deleteChannel } from '@/lib/channels';
 import { useCurrentUser } from '@/lib/use-current-user';
 import {
   listChannels,
+  type Channel,
   type TenantOut,
 } from '@/lib/settings';
 
@@ -17,7 +22,6 @@ interface FetchErrorPayload {
   detail?: string | Array<{ msg?: string }>;
 }
 
-/** Convert an unknown thrown value into a UI-safe Chinese error string. */
 function extractErrorMessage(error: unknown): string {
   if (error instanceof AxiosError) {
     const payload = error.response?.data as FetchErrorPayload | undefined;
@@ -38,21 +42,21 @@ function extractErrorMessage(error: unknown): string {
 const SETTINGS_QUERY_KEY = ['settings'] as const;
 
 /**
- * Settings page wiring. M1 is intentionally read-only: it shows the
- * caller's tenant identity, the channels registered for this tenant, and
- * a placeholder for branding controls (which become editable in M2).
+ * Settings page — tenant identity, channels (full CRUD), branding placeholder.
  *
- * Tenant shape: the M1 backend doesn't yet expose `GET /api/v1/tenants/me`.
- * We derive the tenant id + name from `useCurrentUser()` (which reads
- * `GET /agents/me`) and only attempt the dedicated tenant call once that
- * endpoint ships — see `lib/settings.ts` for the forward-compatible
- * `TenantOut` schema.
+ * Channels: the unified `/api/v1/channels` API supports POST/GET/PATCH/DELETE.
+ * We use the read-only `listChannels` for the initial fetch, then layer
+ * mutations via `useMutation` + `qc.invalidateQueries(['settings','channels'])`
+ * so the card refetches after each successful create/edit/delete.
  *
- * Channels: fetched via `GET /api/v1/channels`. Admin-only at the route
- * level; the page mounts behind the workspace shell's admin gate.
+ * Tier 1 Task 1.2 (2026-10-10): the channel card was previously read-only;
+ * this page now wires create + edit dialogs and a window.confirm() delete.
  */
 export function SettingsPage(): JSX.Element {
   const { user } = useCurrentUser();
+  const qc = useQueryClient();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [editing, setEditing] = useState<Channel | null>(null);
 
   const channelsQuery = useQuery({
     queryKey: [...SETTINGS_QUERY_KEY, 'channels'],
@@ -60,14 +64,24 @@ export function SettingsPage(): JSX.Element {
     staleTime: 30_000,
   });
 
+  const deleteMut = useMutation({
+    mutationFn: (channelId: string) => deleteChannel(channelId),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [...SETTINGS_QUERY_KEY, 'channels'] });
+    },
+  });
+
   const handleRetry = (): void => {
     void channelsQuery.refetch();
   };
 
-  // Compose a synthetic TenantOut from the JWT-derived identity so the
-  // tenant-info card renders a coherent surface even before the
-  // dedicated endpoint ships. `created_at` / `plan` are unknown so we
-  // surface a neutral fallback that the card can render without breaking.
+  const handleDelete = (channel: Channel): void => {
+    if (!window.confirm(`禁用渠道 “${channel.name}”? 该渠道将停止接收新消息,但可后续在编辑中重新启用。`)) {
+      return;
+    }
+    deleteMut.mutate(channel.id);
+  };
+
   const tenant: TenantOut | null =
     user === null
       ? null
@@ -118,8 +132,21 @@ export function SettingsPage(): JSX.Element {
           isLoading
         />
       ) : (
-        <ChannelListCard channels={channelsQuery.data ?? []} />
+        <ChannelListCard
+          channels={channelsQuery.data ?? []}
+          onCreate={() => setCreateOpen(true)}
+          onEdit={setEditing}
+          onDelete={handleDelete}
+        />
       )}
+
+      <ChannelCreateDialog open={createOpen} onOpenChange={setCreateOpen} />
+      <ChannelEditDialog
+        channel={editing}
+        onOpenChange={(o) => {
+          if (!o) setEditing(null);
+        }}
+      />
 
       <BrandingPlaceholder />
     </div>
