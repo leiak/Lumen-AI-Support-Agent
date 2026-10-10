@@ -10,7 +10,6 @@ post-record. Period format is ``YYYY-MM`` (string for index locality).
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
@@ -43,8 +42,8 @@ class TenantBudget(Base):
         nullable=False,
         unique=True,
     )
-    soft_warn_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
-    hard_cap_tokens: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    soft_warn_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    hard_cap_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     period_anchor_tz: Mapped[str] = mapped_column(
         String(64), nullable=False, server_default="UTC"
     )
@@ -86,7 +85,7 @@ class TenantBudgetSnapshot(Base):
         server_default=func.now(),
         nullable=False,
     )
-    soft_warn_fired_at: Mapped[Optional[datetime]] = mapped_column(
+    soft_warn_fired_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )
@@ -127,4 +126,4 @@ class TenantBudgetCredit(Base):
     )
 
 
-__all__ = ["TenantBudget", "TenantBudgetSnapshot", "TenantBudgetCredit"]
+__all__ = ["TenantBudget", "TenantBudgetCredit", "TenantBudgetSnapshot"]

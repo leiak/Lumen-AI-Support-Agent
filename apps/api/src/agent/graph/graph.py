@@ -36,6 +36,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
+from qdrant_client import AsyncQdrantClient
 
 from agent.graph.nodes import (
     make_escalation_node,
@@ -53,7 +54,6 @@ from core.logging import get_logger
 from knowledge.rag_service import RAGService
 from knowledge.repository import KnowledgeBaseRepository
 from llm_client.client import LLMClient
-from qdrant_client import AsyncQdrantClient
 
 log = get_logger(__name__)
 

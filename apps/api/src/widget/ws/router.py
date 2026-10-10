@@ -19,7 +19,7 @@ from widget.ws.manager import manager
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/widget", tags=["widget-ws"])
 
-__all__ = ["manager", "router", "websocket_endpoint", "is_origin_allowed"]
+__all__ = ["is_origin_allowed", "manager", "router", "websocket_endpoint"]
 
 
 # ---------------------------------------------------------------------------

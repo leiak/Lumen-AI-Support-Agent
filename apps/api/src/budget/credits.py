@@ -43,7 +43,7 @@ class CreditService:
             singleton without changing this class.
     """
 
-    def __init__(self, session: "AsyncSession", per_model_cache: object) -> None:
+    def __init__(self, session: AsyncSession, per_model_cache: object) -> None:
         self._session = session
         self._per_model_cache = per_model_cache
 

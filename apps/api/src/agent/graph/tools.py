@@ -286,8 +286,8 @@ class SearchInternalKbArgs(BaseModel):
 
 def make_search_internal_kb_tool(
     *,
-    rag_service: "RAGService",
-    kb_repository: "KnowledgeBaseRepository",
+    rag_service: RAGService,
+    kb_repository: KnowledgeBaseRepository,
 ) -> BaseTool:
     """Build a configured ``search_internal_kb`` tool.
 
@@ -456,8 +456,8 @@ class SearchMultimodalKbArgs(BaseModel):
 
 def make_search_multimodal_kb_tool(
     *,
-    rag_service: "RAGService",
-    kb_repository: "KnowledgeBaseRepository",
+    rag_service: RAGService,
+    kb_repository: KnowledgeBaseRepository,
     qdrant_client: AsyncQdrantClient,
 ) -> BaseTool:
     """Build a configured ``search_multimodal_kb`` tool.

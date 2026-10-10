@@ -20,8 +20,8 @@ from core.logging import get_logger
 from knowledge.qdrant_client import (
     DEFAULT_COLLECTION,
     DEFAULT_DISTANCE,
-    vector_size_for_model,
     ensure_collection,
+    vector_size_for_model,
 )
 
 log = get_logger(__name__)

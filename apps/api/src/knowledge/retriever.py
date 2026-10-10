@@ -49,12 +49,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from core.logging import get_logger
 from knowledge.models import Chunk, KnowledgeBase
 from knowledge.qdrant_client import DEFAULT_COLLECTION, search_chunks
 from knowledge.repository import ChunkRepository, KnowledgeBaseRepository
 from llm_client.embeddings import EmbeddingError, embed_texts
-
-from core.logging import get_logger
 
 log = get_logger(__name__)
 

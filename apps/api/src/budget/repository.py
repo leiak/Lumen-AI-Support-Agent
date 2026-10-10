@@ -152,8 +152,9 @@ class TenantBudgetSnapshotRepository:
         do NOT block each other (different hashtext keys).
         """
         # Late import to avoid circular dep with llm_client.models
-        from llm_client.models import LLMUsage
         from sqlalchemy import text
+
+        from llm_client.models import LLMUsage
 
         # LLMUsage.created_at is TIMESTAMP WITHOUT TIME ZONE — strip tz if present
         # so asyncpg can bind the value without offset-naive/aware mismatch.

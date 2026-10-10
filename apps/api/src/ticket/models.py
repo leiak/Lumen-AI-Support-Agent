@@ -42,7 +42,6 @@ from typing import Any
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Enum as SAEnum,
     ForeignKey,
     Index,
     Integer,
@@ -51,6 +50,9 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     text,
+)
+from sqlalchemy import (
+    Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship

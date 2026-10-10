@@ -149,7 +149,7 @@ class EmailOutbound:
                         error_type="SES5xx",
                         attempts=attempt + 1,
                     )
-            except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            except (TimeoutError, httpx.HTTPError) as e:
                 err_label = "timeout" if isinstance(e, asyncio.TimeoutError) else "connect_error"
                 last_exc = EmailSendError(
                     f"SES network: {err_label}",

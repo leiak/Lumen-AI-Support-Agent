@@ -12,7 +12,7 @@ from agent.llm_factory import aclose_http_pool
 from budget.exceptions import TenantBudgetRateLimited
 from channel.enums import ChannelType
 from core.config import get_settings
-from core.health import aggregate_health, liveness, readiness
+from core.health import liveness, readiness
 from core.logging import configure_logging, get_logger
 from core.metrics import prometheus_metrics_middleware, render_metrics
 from core.qdrant import close_qdrant_client, get_qdrant_client
@@ -20,7 +20,6 @@ from core.redis import close_redis, get_redis
 from core.request_context import (
     bind_request_context,
     clear_request_context,
-    get_request_id,
 )
 from knowledge.startup import ensure_image_collection, ensure_qdrant_collection
 from llm_client.embeddings import aclose_default_client
@@ -223,10 +222,10 @@ async def metrics() -> Response:
 logger = get_logger("email")
 
 
+from admin.api import router as admin_router  # noqa: E402
 from agent.api import router as agents_router  # noqa: E402
 from agent.simple_responder import SimpleResponder  # noqa: E402
 from agent.ws import router as agents_ws_router  # noqa: E402
-from admin.api import router as admin_router  # noqa: E402
 from auth.api import router as auth_router  # noqa: E402
 from channel.api import router as channels_router  # noqa: E402
 from channel.feishu.webhook import router as feishu_webhook_router  # noqa: E402

@@ -15,6 +15,7 @@ def _postgres_reachable() -> bool:
     """
     try:
         from sqlalchemy import text
+
         from core.config import get_settings
         from core.database import get_engine
 

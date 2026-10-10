@@ -41,4 +41,4 @@ class TenantLLMConfigCipher:
         return self._fernet.decrypt(ciphertext).decode("utf-8")
 
 
-__all__ = ["TenantLLMConfigCipher", "InvalidToken"]
+__all__ = ["InvalidToken", "TenantLLMConfigCipher"]

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -114,7 +114,7 @@ class PerModelService:
 
     def __init__(
         self,
-        session: "AsyncSession",
+        session: AsyncSession,
         cache: PerModelBreakdownCache,
     ) -> None:
         self._session = session
@@ -154,7 +154,7 @@ class PerModelService:
         # then drop tz for the comparison (matches budget/repository.py's
         # refresh path which uses the same trick).
         period_start = datetime.strptime(period + "-01", "%Y-%m-%d").replace(
-            tzinfo=timezone.utc
+            tzinfo=UTC
         ).replace(tzinfo=None)
         result = await self._session.execute(
             select(

@@ -38,7 +38,6 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.dependencies import get_current_user
 from conversation.repository import ConversationRepository
@@ -196,4 +195,4 @@ async def list_ticket_events(
     return [TicketEventOut.model_validate(e) for e in events]
 
 
-__all__ = ["router", "get_ticket_service"]
+__all__ = ["get_ticket_service", "router"]

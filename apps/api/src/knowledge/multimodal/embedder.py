@@ -83,7 +83,7 @@ class DoubaoVisionEmbedder(VisionEmbedder):
         """Close the underlying :class:`httpx.AsyncClient`."""
         await self._client.aclose()
 
-    async def __aenter__(self) -> "DoubaoVisionEmbedder":
+    async def __aenter__(self) -> DoubaoVisionEmbedder:
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -167,7 +167,7 @@ class OpenAIVisionEmbedder(VisionEmbedder):
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "OpenAIVisionEmbedder":
+    async def __aenter__(self) -> OpenAIVisionEmbedder:
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -251,7 +251,7 @@ class VoyageVisionEmbedder(VisionEmbedder):
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "VoyageVisionEmbedder":
+    async def __aenter__(self) -> VoyageVisionEmbedder:
         return self
 
     async def __aexit__(self, *exc) -> None:

@@ -26,15 +26,14 @@ import asyncio
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from core.business_metrics import LLM_FALLBACK_ATTEMPTS_TOTAL
 from llm_client.exceptions import (
     AttemptRecord,
     FallbackChainExhausted,
-    InvalidRequest,
     OutputInvalid,
     ProviderUnavailable,
     RateLimited,
 )
-from core.business_metrics import LLM_FALLBACK_ATTEMPTS_TOTAL
 
 if TYPE_CHECKING:
     from llm_client.providers.base import BaseProvider
@@ -62,11 +61,11 @@ class PinnedResolver:
     with the request's caller-supplied model name (often wrong).
     """
 
-    def __init__(self, *, provider: "BaseProvider", model: str) -> None:
+    def __init__(self, *, provider: BaseProvider, model: str) -> None:
         self.provider = provider
         self.model = model
 
-    def __call__(self, request: "ChatRequest") -> "BaseProvider":
+    def __call__(self, request: ChatRequest) -> BaseProvider:
         return self.provider
 
 
@@ -96,13 +95,13 @@ class _PrefixResolver:
     def __init__(
         self,
         *,
-        providers: dict[str, "BaseProvider"],
+        providers: dict[str, BaseProvider],
         default_provider_name: str,
     ) -> None:
         self._providers = providers
         self._default_name = default_provider_name
 
-    def __call__(self, request: "ChatRequest") -> "BaseProvider":
+    def __call__(self, request: ChatRequest) -> BaseProvider:
         model_lower = request.model.lower()
         for prefix, name in _PREFIX_TABLE:
             if model_lower.startswith(prefix):
@@ -153,7 +152,7 @@ class FallbackResolver:
     def __init__(
         self,
         *,
-        steps: list["PinnedResolver"],
+        steps: list[PinnedResolver],
         attempt_timeout_s: float | None = None,
     ) -> None:
         if not steps:
@@ -172,7 +171,7 @@ class FallbackResolver:
         self.steps = list(steps)
         self._timeout = attempt_timeout_s
 
-    def __call__(self, request: "ChatRequest") -> "BaseProvider":
+    def __call__(self, request: ChatRequest) -> BaseProvider:
         """Return primary step's provider (M4.A protocol compatibility).
 
         This is a placeholder for callers that only need to know which
@@ -181,7 +180,7 @@ class FallbackResolver:
         """
         return self.steps[0].provider
 
-    async def ainvoke(self, request: "ChatRequest") -> "ChatResponse":
+    async def ainvoke(self, request: ChatRequest) -> ChatResponse:
         """Execute the chain; return first successful response.
 
         On transient failure of any step, record the attempt and move to

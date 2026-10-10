@@ -28,7 +28,7 @@ same period).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -44,8 +44,8 @@ from core.business_metrics import (
 )
 from core.config import get_settings
 from llm_client.exceptions import RateLimited, TenantBudgetExceeded
-from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.resolvers import Resolver
+from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.types import ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def _current_period(tz_name: str = "UTC") -> tuple[str, datetime]:
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
-        tz = timezone.utc
+        tz = UTC
     now = datetime.now(tz)
     period = now.strftime("%Y-%m")
     period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -385,7 +385,7 @@ class BudgetResolver:
         soft_warn_fired_at: datetime | None = snap.soft_warn_fired_at
         if fire_soft_warn:
             LLM_TENANT_BUDGET_SOFT_WARN_TOTAL.inc()
-            soft_warn_fired_at = datetime.now(timezone.utc)
+            soft_warn_fired_at = datetime.now(UTC)
             logger.warning(
                 "tenant_budget.soft_warn",
                 extra={

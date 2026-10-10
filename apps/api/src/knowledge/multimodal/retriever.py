@@ -46,7 +46,6 @@ diverging into a parallel collection layout.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from qdrant_client import AsyncQdrantClient

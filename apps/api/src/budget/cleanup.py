@@ -13,7 +13,7 @@ failure; the batched design means a mid-batch failure loses at most
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -35,7 +35,7 @@ def _cutoff_period(months_back: int) -> str:
     (dateutil is not a project dependency). Handles year boundaries
     correctly: months_back=14 in 2026-01 → (2024, 11).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     y, m = now.year, now.month - months_back
     while m <= 0:
         m += 12

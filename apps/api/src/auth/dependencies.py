@@ -7,7 +7,7 @@ place.
 """
 from typing import Annotated, Any
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException
 
 from auth.jwt import TokenError, decode_token
 from core.database import set_tenant_contextvar

@@ -1,5 +1,5 @@
 """Public re-exports for the knowledge base (RAG) package."""
-from knowledge.rag_service import RAGService, RagContext
+from knowledge.rag_service import RagContext, RAGService
 from knowledge.repository import (
     ArticleRepository,
     ChunkRepository,
