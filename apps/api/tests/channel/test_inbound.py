@@ -513,6 +513,38 @@ async def test_inbound_factory_opens_fresh_session_across_calls() -> None:
     assert not asyncio.iscoroutinefunction(factory)
 
 
+@pytest.mark.asyncio
+async def test_factory_cannot_be_awaited_muscle_memory_pin() -> None:
+    """The factory is sync. ``await factory(session)`` must raise
+    ``TypeError`` — not silently return a coroutine that hangs the
+    inbound hot path.
+
+    Guards against a contributor reverting to the pre-9eb9fe5
+    async-factory signature out of muscle memory. Before the
+    TicketService session-lifecycle fix, the factory was
+    ``Callable[[], Awaitable[TicketService]]`` and was awaited per
+    call — an unawaited coroutine was the bug that hid the missing
+    commit (the coroutine closed at GC, the implicit transaction
+    was rolled back, and the customer ticket never persisted). If
+    someone re-introduces the ``async def`` signature, this test
+    fails with a ``TypeError: object coroutine ... can't be used in
+    'await' expression`` *before* it gets to ``TypeError: object
+    TicketService can't be used in 'await' expression`` — either
+    way the pin breaks the build rather than silently regressing
+    production.
+    """
+    from channel.inbound import _build_ticket_service_factory
+
+    factory = _build_ticket_service_factory()
+    fake_session = MagicMock(name="fake_session")
+
+    with pytest.raises(TypeError):
+        # 8. Intentional await on sync result — the pin is exactly
+        # that this raises rather than silently hanging or returning
+        # an unawaited coroutine that closes at GC.
+        await factory(fake_session)  # type: ignore[top-level-await]
+
+
 # ---- Pre-existing-bug regression: auto-create-ticket must commit ----
 #
 # The factory historically opened an ``AsyncSession`` without ``async
@@ -621,14 +653,25 @@ async def test_ticket_auto_create_session_committed_via_get_session(
 
 
 @pytest.mark.asyncio
-async def test_ticket_auto_create_rolls_back_on_failure(
+async def test_ticket_auto_create_rolls_back_when_commit_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the auto-create work raises, ``get_session()`` must roll back.
+    """If ``session.commit()`` raises, ``get_session()`` must roll back.
 
     The bug fix uses ``core.database.get_session()`` which calls
     ``session.rollback()`` on the exception path. Without this, a
     partial flush would be left dangling on the connection.
+
+    Note: this test exercises the **commit-fails** branch of the
+    ``get_session()`` lifecycle — ``mock_session.commit`` raises
+    ``RuntimeError("commit boom")``. It does **not** exercise the
+    ``create()``-raises branch: the inner ``try/except`` inside
+    ``_try_auto_create_ticket`` (at ``service.py:117``) swallows
+    ``TicketService.create`` exceptions so the auto-create work
+    never reaches ``get_session()``'s ``except`` arm. To exercise
+    that branch directly, see ``test_factory_cannot_be_awaited_muscle_memory_pin``
+    (and the manual rollback path remains pinned here via the
+    commit-failure scenario).
 
     Companion to ``test_ticket_auto_create_session_committed_via_get_session``
     — pins BOTH the success AND the failure path of the same lifecycle.
