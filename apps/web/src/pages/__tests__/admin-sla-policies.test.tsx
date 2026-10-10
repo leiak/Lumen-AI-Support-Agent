@@ -24,6 +24,7 @@ vi.mock('@/lib/use-current-user', () => ({
 }));
 
 vi.mock('@/lib/api-client', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const actual = await vi.importActual<typeof import('@/lib/api-client')>(
     '@/lib/api-client',
   );

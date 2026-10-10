@@ -9,6 +9,7 @@ import { apiClient, JWT_STORAGE_KEY } from '@/lib/api-client';
 import { useCurrentUser } from '@/lib/use-current-user';
 
 vi.mock('@/lib/api-client', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const actual = await vi.importActual<typeof import('@/lib/api-client')>(
     '@/lib/api-client',
   );

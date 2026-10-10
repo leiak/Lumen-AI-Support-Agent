@@ -8,6 +8,7 @@ import { AdminKbDraftsPage } from '@/pages/admin-kb-drafts';
 import { apiClient } from '@/lib/api-client';
 
 vi.mock('@/lib/api-client', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const actual = await vi.importActual<typeof import('@/lib/api-client')>(
     '@/lib/api-client',
   );

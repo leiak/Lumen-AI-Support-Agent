@@ -7,6 +7,7 @@ import { AxiosError } from 'axios';
 
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { apiClient, JWT_STORAGE_KEY } from '@/lib/api-client';
+import type { Ticket } from '@/lib/tickets';
 import type * as ApiClient from '@/lib/api-client';
 import { useCurrentUser } from '@/lib/use-current-user';
 import type * as UseCurrentUser from '@/lib/use-current-user';
@@ -132,7 +133,7 @@ const sampleTickets = [
 ];
 
 /** Envelope wrapping ``sampleTickets`` for the new admin list endpoint. */
-function envelope(items = sampleTickets, total?: number) {
+function envelope(items: Ticket[] = sampleTickets as Ticket[], total?: number) {
   return { data: { items, total: total ?? items.length } };
 }
 
@@ -185,7 +186,7 @@ describe('AdminTicketsPage', () => {
     // exactly the rows the backend returns (no client-side join
     // fallback). Mirrors the live demo seed shape (1 P0 NEW + 1 P1
     // TRIAGED).
-    const twoTickets = [sampleTickets[0], sampleTickets[1]];
+    const twoTickets: Ticket[] = sampleTickets.slice(0, 2) as Ticket[];
     mockedGet.mockResolvedValue(envelope(twoTickets, 2));
 
     renderList();
@@ -202,7 +203,7 @@ describe('AdminTicketsPage', () => {
     mockedGet.mockResolvedValueOnce(envelope());
     // After filter change: server-side filter returns only the P0
     // in_progress row.
-    const filtered = [sampleTickets[0]];
+    const filtered: Ticket[] = sampleTickets.slice(0, 1) as Ticket[];
     mockedGet.mockResolvedValueOnce(envelope(filtered, 1));
 
     renderList();
@@ -228,7 +229,7 @@ describe('AdminTicketsPage', () => {
   it('filters by priority', async () => {
     // First request: all 3 rows. After filter: only the P2 row.
     mockedGet.mockResolvedValueOnce(envelope());
-    const filtered = [sampleTickets[2]];
+    const filtered: Ticket[] = sampleTickets.slice(2, 3) as Ticket[];
     mockedGet.mockResolvedValueOnce(envelope(filtered, 1));
     renderList();
 

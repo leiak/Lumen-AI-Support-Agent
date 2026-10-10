@@ -220,7 +220,7 @@ describe('SettingsPage — channel CRUD (Tier 1 Task 1.2)', () => {
     renderPage();
     await screen.findByTestId('channel-list');
     const user = userEvent.setup();
-    const feishuId = sampleChannels[0].id;
+    const feishuId = sampleChannels[0]!.id;
     await user.click(screen.getByTestId(`channel-row-edit-${feishuId}`));
     await screen.findByTestId('channel-edit-dialog');
     await user.clear(screen.getByTestId('channel-edit-name'));
@@ -241,7 +241,7 @@ describe('SettingsPage — channel CRUD (Tier 1 Task 1.2)', () => {
     renderPage();
     await screen.findByTestId('channel-list');
     const user = userEvent.setup();
-    const feishuId = sampleChannels[0].id;
+    const feishuId = sampleChannels[0]!.id;
     await user.click(screen.getByTestId(`channel-row-delete-${feishuId}`));
     await waitFor(() =>
       expect(apiClient.delete).toHaveBeenCalledWith(`/api/v1/channels/${feishuId}`),
@@ -255,7 +255,7 @@ describe('SettingsPage — channel CRUD (Tier 1 Task 1.2)', () => {
     renderPage();
     await screen.findByTestId('channel-list');
     const user = userEvent.setup();
-    const feishuId = sampleChannels[0].id;
+    const feishuId = sampleChannels[0]!.id;
     await user.click(screen.getByTestId(`channel-row-delete-${feishuId}`));
     expect(apiClient.delete).not.toHaveBeenCalled();
   });

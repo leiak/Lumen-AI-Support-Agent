@@ -10,6 +10,7 @@ import { useCurrentUser } from '@/lib/use-current-user';
 import type { BudgetUsage } from '@/lib/budget';
 
 vi.mock('@/lib/api-client', async () => {
+  // eslint-disable-next-line @typescript-eslint/consistent-type-imports
   const actual = await vi.importActual<typeof import('@/lib/api-client')>(
     '@/lib/api-client',
   );
