@@ -6,6 +6,7 @@ without a live database. Time is frozen via an injected clock.
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -760,6 +761,44 @@ async def test_claim_raises_not_claimable_for_already_claimed(
 # was never bound to the ConversationService attribute. These tests pin the
 # contract going forward so the next regression is caught at unit-test
 # time, not by a 500 in production.
+#
+# Post M2.A bug fix: the factory is a SYNC callable that accepts an
+# ``AsyncSession`` and returns a ``TicketService``. Session lifecycle is
+# owned by ``_try_auto_create_ticket`` itself via
+# ``core.database.get_session()``. Tests below monkeypatch
+# ``conversation.service.get_session`` to a no-op async context manager
+# so we don't need a live DB to exercise the auto-create logic.
+
+
+def _stub_get_session_with(
+    monkeypatch: pytest.MonkeyPatch, session: Any, commit_error: Exception | None = None
+) -> None:
+    """Patch ``conversation.service.get_session`` so it yields ``session``.
+
+    Mirrors the older :func:`_stub_sessionmaker_with` helper but for
+    the ``get_session`` (asynccontextmanager) helper that
+    ``_try_auto_create_ticket`` uses. ``commit_error`` lets a test
+    simulate a commit failure (the helper will raise it from the
+    commit call, exercising the rollback path).
+    """
+
+    @asynccontextmanager
+    async def fake_get_session() -> Any:
+        try:
+            yield session
+            if commit_error is not None:
+                raise commit_error
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+    monkeypatch.setattr(service_module, "get_session", fake_get_session)
+    # ``get_session()`` reads ``get_sessionmaker()``; keep that attr
+    # patched too so any legacy import path stays benign.
+    monkeypatch.setattr(
+        service_module, "get_sessionmaker", lambda: MagicMock()
+    )
 
 
 @pytest.mark.asyncio
@@ -769,11 +808,16 @@ async def test_try_auto_create_ticket_calls_factory_and_creates(monkeypatch):
     fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
     fake_svc.create = AsyncMock()
 
-    factory_calls = []
+    factory_calls: list[object] = []
 
-    async def factory():
-        factory_calls.append(())
+    def factory(session: object) -> MagicMock:
+        factory_calls.append(session)
         return fake_svc
+
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
 
     await service_module._try_auto_create_ticket(
         factory=factory,
@@ -783,6 +827,8 @@ async def test_try_auto_create_ticket_calls_factory_and_creates(monkeypatch):
     )
 
     assert len(factory_calls) == 1
+    # The session yielded by get_session() is the one we hand to the factory.
+    assert factory_calls[0] is session
     fake_svc.repo.get_for_conversation.assert_awaited_once_with(
         "c1", tenant_id="t1"
     )
@@ -791,10 +837,15 @@ async def test_try_auto_create_ticket_calls_factory_and_creates(monkeypatch):
         conversation_id="c1",
         subject="How do I reset my password?",
     )
+    # The session was committed (post-fix invariant — pre-fix it was
+    # never committed and the ticket silently rolled back).
+    session.commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
+async def test_try_auto_create_ticket_short_circuits_when_ticket_exists(
+    monkeypatch,
+):
     """Existing ticket for the conversation -> create is NOT called."""
     fake_svc = MagicMock()
     fake_svc.repo.get_for_conversation = AsyncMock(
@@ -802,8 +853,13 @@ async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
     )
     fake_svc.create = AsyncMock()
 
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
+
     await service_module._try_auto_create_ticket(
-        factory=AsyncMock(return_value=fake_svc),
+        factory=lambda s: fake_svc,
         tenant_id="t1",
         conversation_id="c1",
         content_text="Another message",
@@ -813,10 +869,15 @@ async def test_try_auto_create_ticket_short_circuits_when_ticket_exists():
 
 
 @pytest.mark.asyncio
-async def test_try_auto_create_ticket_handles_factory_returning_none():
+async def test_try_auto_create_ticket_handles_factory_returning_none(monkeypatch):
     """Factory returning None (opt-out) -> no create call, no exception."""
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
+
     await service_module._try_auto_create_ticket(
-        factory=AsyncMock(return_value=None),
+        factory=lambda s: None,
         tenant_id="t1",
         conversation_id="c1",
         content_text="msg",
@@ -825,10 +886,17 @@ async def test_try_auto_create_ticket_handles_factory_returning_none():
 
 
 @pytest.mark.asyncio
-async def test_try_auto_create_ticket_swallows_factory_construct_failure(caplog):
+async def test_try_auto_create_ticket_swallows_factory_construct_failure(
+    monkeypatch, caplog
+):
     """Factory raising -> WARNING logged, no exception bubbles up."""
-    async def bad_factory():
+    def bad_factory(session: object) -> object:
         raise RuntimeError("db down")
+
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
 
     with caplog.at_level("WARNING"):
         await service_module._try_auto_create_ticket(
@@ -857,15 +925,20 @@ async def test_try_auto_create_ticket_swallows_factory_construct_failure(caplog)
 
 
 @pytest.mark.asyncio
-async def test_try_auto_create_ticket_swallows_create_failure(caplog):
+async def test_try_auto_create_ticket_swallows_create_failure(monkeypatch, caplog):
     """ticket_svc.create raising -> WARNING logged, no exception bubbles up."""
     fake_svc = MagicMock()
     fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
     fake_svc.create = AsyncMock(side_effect=RuntimeError("FK violation"))
 
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
+
     with caplog.at_level("WARNING"):
         await service_module._try_auto_create_ticket(
-            factory=AsyncMock(return_value=fake_svc),
+            factory=lambda s: fake_svc,
             tenant_id="t1",
             conversation_id="c1",
             content_text="msg",
@@ -874,15 +947,20 @@ async def test_try_auto_create_ticket_swallows_create_failure(caplog):
 
 
 @pytest.mark.asyncio
-async def test_try_auto_create_ticket_truncates_subject_to_120_chars():
+async def test_try_auto_create_ticket_truncates_subject_to_120_chars(monkeypatch):
     """Subject passed to create is content_text[:120]; never logs the body."""
     long_text = "x" * 500
     fake_svc = MagicMock()
     fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
     fake_svc.create = AsyncMock()
 
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    _stub_get_session_with(monkeypatch, session)
+
     await service_module._try_auto_create_ticket(
-        factory=AsyncMock(return_value=fake_svc),
+        factory=lambda s: fake_svc,
         tenant_id="t1",
         conversation_id="c1",
         content_text=long_text,
@@ -898,8 +976,12 @@ def test_conversation_service_accepts_ticket_service_factory_kwarg():
 
     Task 6 review caught this — without this test, a future refactor that
     drops the kwarg would silently break the entire auto-create feature.
+
+    Post-bug-fix the factory is a sync callable that accepts an
+    AsyncSession; the test wires one to keep the regression guard
+    realistic.
     """
-    async def factory():
+    def factory(session: object) -> object:
         return None
     svc = ConversationService(ticket_service_factory=factory)
     assert svc._ticket_service_factory is factory

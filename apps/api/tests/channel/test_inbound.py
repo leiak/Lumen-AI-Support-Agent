@@ -424,87 +424,261 @@ class _SessionCtx:
 
 
 @pytest.mark.asyncio
-async def test_inbound_factory_one_session_per_call() -> None:
-    """The TicketService factory must be a coroutine function (awaitable)
-    and open exactly ONE fresh session per invocation.
+async def test_inbound_factory_builds_service_from_session() -> None:
+    """The TicketService factory is sync and accepts a session parameter.
 
-    Pre-refactor the factory was sync (``def _factory() -> TicketService``)
-    and only *constructed* a TicketService per call — but didn't give
-    callers a hook to scope the session to a single inbound message.
-    Post-refactor the factory is ``async``; callers ``await factory()``
-    inside the inbound handler scope so each customer message gets a
-    dedicated short-lived session. Connection-pool pressure at
-    >10k msg/min is the motivation (nitpick review 2026-10-09 / P2).
+    Post-bug-fix the factory no longer manages session lifecycle — it
+    simply constructs a ``TicketService`` from a caller-provided
+    ``AsyncSession``. The caller (``_try_auto_create_ticket``) owns
+    the session via ``core.database.get_session()``, so each inbound
+    customer message gets a dedicated short-lived session with proper
+    commit/rollback semantics (Task 11 / nitpick P2 invariant preserved
+    — session lifetime stays bounded to one customer message).
 
     Three assertions:
 
-    1. ``asyncio.iscoroutinefunction(factory)`` — guarantees callers can
-       ``await factory()`` and each call yields an isolated session.
-    2. ``sm.assert_called_once()`` after one ``await factory()`` —
-       guarantees the sessionmaker is opened per-call (not once at
-       module import).
-    3. ``isinstance(svc, TicketService)`` — the returned object is
-       a TicketService as documented, not a coroutine or None.
+    1. ``not asyncio.iscoroutinefunction(factory)`` — factory is sync;
+       callers must NOT ``await`` it (an unawaited sync call is fine,
+       but awaiting sync was the latent bug surface that hid the
+       missing commit). The session is opened by the caller, not here.
+    2. ``factory(session)`` returns a real ``TicketService`` whose
+       repository points at the caller-provided session (no hidden
+       session creation).
+    3. The factory does not touch ``core.database.get_sessionmaker``
+       — session lifecycle is the caller's responsibility now.
     """
     from channel.inbound import _build_ticket_service_factory
     from ticket.service import TicketService
 
     factory = _build_ticket_service_factory()
 
-    # 1. Factory must be a coroutine function — sync factory would
-    #    silently drop the await and callers would get an unawaited
-    #    coroutine object (a runtime footgun).
-    assert asyncio.iscoroutinefunction(factory), (
-        "TicketService factory must be a coroutine function so callers "
-        "can ``await factory()`` once per inbound message."
+    # 1. Factory is SYNC — the session is owned by the caller.
+    assert not asyncio.iscoroutinefunction(factory), (
+        "TicketService factory must be sync post-fix; callers now own "
+        "session lifecycle via core.database.get_session() and "
+        "factory() is not awaited."
     )
 
-    # 2. Invocation must yield a real TicketService backed by a session.
+    # 2. Invocation must yield a TicketService backed by the passed session.
+    session = MagicMock(name="session")
+    svc = factory(session)
+
+    assert isinstance(svc, TicketService)
+    # Service is backed by the caller-provided session — no hidden
+    # session creation means the caller's ``get_session()`` commit
+    # actually persists the ticket.
+    assert svc.repo.session is session
+    # 3. Factory must not touch the sessionmaker — session comes from
+    # the caller. (If it did, the caller's commit would not commit the
+    # factory's session, and the bug would still be there.)
     with patch("core.database.get_sessionmaker") as mock_sm:
-        # ``get_sessionmaker()()`` invokes ``sm()`` once and returns
-        # the resulting ``AsyncSession`` — preserve that shape.
-        mock_session = AsyncMock()
-        mock_sm.return_value = lambda: mock_session
-
-        svc = await factory()
-
-        # 3. Returned object is a TicketService (not a coroutine, not None).
-        assert isinstance(svc, TicketService)
-        # sessionmaker was opened exactly once — one-session-per-call.
-        mock_sm.assert_called_once()
+        factory(MagicMock(name="other_session"))
+        mock_sm.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_inbound_factory_opens_fresh_session_across_calls() -> None:
-    """Two awaited factory calls must each open an independent session —
-    never share a session across invocations. A shared session would
-    commit half-finished tickets across messages, violating tenant
-    isolation under load.
+    """Two factory invocations with two distinct sessions must yield
+    two distinct ``TicketService`` instances backed by those sessions.
+
+    Post-fix the factory is sync and accepts the session as a
+    parameter (Task 11's "one session per call" invariant is now
+    enforced at the *caller* side via ``core.database.get_session()``).
+    This test pins that the factory doesn't accidentally cache a
+    session across invocations — passing ``session_a`` yields a
+    service backed by ``session_a``, and ``session_b`` yields a
+    service backed by ``session_b``.
     """
     from channel.inbound import _build_ticket_service_factory
     from ticket.service import TicketService
 
-    with patch("core.database.get_sessionmaker") as mock_sm:
-        # Each ``sm()()`` invocation returns a fresh ctx wrapping a
-        # distinct AsyncMock session, so we can assert they're distinct.
-        sessions: list[AsyncMock] = []
+    factory = _build_ticket_service_factory()
 
-        def fresh_session() -> _SessionCtx:
-            s = AsyncMock()
-            sessions.append(s)
-            return _SessionCtx(s)
+    session_a = MagicMock(name="session_a")
+    session_b = MagicMock(name="session_b")
 
-        mock_sm.return_value = lambda: fresh_session()
+    svc_a = factory(session_a)
+    svc_b = factory(session_b)
 
-        factory = _build_ticket_service_factory()
-        svc_a = await factory()
-        svc_b = await factory()
+    assert isinstance(svc_a, TicketService)
+    assert isinstance(svc_b, TicketService)
+    # Different sessions -> different services (identity check is
+    # robust to changes in TicketService.__eq__ semantics).
+    assert svc_a is not svc_b
+    # Each service carries the session it was handed.
+    assert svc_a.repo.session is session_a
+    assert svc_b.repo.session is session_b
+    # The factory is sync (not a coroutine function); sessions are
+    # owned by the caller, not the factory.
+    assert not asyncio.iscoroutinefunction(factory)
 
-        assert isinstance(svc_a, TicketService)
-        assert isinstance(svc_b, TicketService)
-        # Two calls -> two sessionmaker invocations -> two sessions.
-        assert mock_sm.call_count == 2
-        assert len(sessions) == 2
-        # Each session is distinct (sanity: the same object wasn't
-        # accidentally cached across invocations).
-        assert sessions[0] is not sessions[1]
+
+# ---- Pre-existing-bug regression: auto-create-ticket must commit ----
+#
+# The factory historically opened an ``AsyncSession`` without ``async
+# with``, so ``TicketService.create()`` flushed but the transaction
+# was rolled back when the session was GC'd. M2.A's auto-create-ticket
+# feature was silently broken — customer tickets never persisted in
+# production. The fix moved session ownership to the caller
+# (``_try_auto_create_ticket``) which wraps the work in
+# ``core.database.get_session()`` — the existing helper that commits
+# on clean exit and rolls back on exception.
+
+
+@pytest.mark.asyncio
+async def test_ticket_auto_create_session_committed_via_get_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: M2.A's auto-create-ticket must persist.
+
+    When the inbound customer-message hook (``_try_auto_create_ticket``)
+    runs the ``ticket_service_factory``, the session must go through
+    proper lifecycle — ``__aenter__`` + ``__aexit__`` via
+    ``core.database.get_session()``, with ``session.commit()`` invoked
+    on the clean path. Without this, the ``TicketRepository.create``
+    flush silently rolls back at GC and the customer never gets a
+    ticket in production.
+
+    Pins BOTH:
+
+    * ``get_session()`` is invoked (the caller is wrapping the work).
+    * The yielded session's ``commit()`` is awaited.
+
+    If a future refactor drops the ``async with get_session()``
+    wrapping at the caller side, this test fails.
+    """
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from conversation import service as conv_service_module
+
+    mock_session = MagicMock(spec=AsyncSession)
+    mock_session.commit = AsyncMock()
+    mock_session.rollback = AsyncMock()
+
+    # Track session lifecycle so we can assert the proper protocol was
+    # followed even if commit() is async-mocked.
+    lifecycle_calls: list[str] = []
+
+    @asynccontextmanager
+    async def fake_get_session() -> object:
+        lifecycle_calls.append("aenter")
+        try:
+            yield mock_session
+            await mock_session.commit()
+            lifecycle_calls.append("commit")
+        except Exception:
+            await mock_session.rollback()
+            lifecycle_calls.append("rollback")
+            raise
+        finally:
+            lifecycle_calls.append("aexit")
+
+    # Patch get_session where conversation.service reads it.
+    monkeypatch.setattr(conv_service_module, "get_session", fake_get_session)
+    # ``get_session()`` historically used ``get_sessionmaker()``; keep
+    # both attrs patched so the legacy import path (if any is left in
+    # the module) stays benign.
+    monkeypatch.setattr(
+        conv_service_module, "get_sessionmaker", lambda: MagicMock()
+    )
+
+    # Custom sync factory — accepts the session and returns the fake
+    # service so we can assert the auto-create work ran. (We don't use
+    # ``_build_ticket_service_factory`` here because that builds a
+    # real ``TicketService`` against the (mocked) session.)
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
+    fake_svc.create = AsyncMock()
+
+    def factory(session: object) -> MagicMock:
+        return fake_svc
+
+    await conv_service_module._try_auto_create_ticket(
+        factory=factory,  # type: ignore[arg-type]
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text="I need help with my account",
+    )
+
+    # Auto-create work actually ran.
+    fake_svc.repo.get_for_conversation.assert_awaited_once_with(
+        "c1", tenant_id="t1"
+    )
+    fake_svc.create.assert_awaited_once()
+
+    # Session went through the proper lifecycle via get_session().
+    assert "aenter" in lifecycle_calls, (
+        "expected the session to enter get_session(); "
+        "caller likely dropped the async with get_session() wrap"
+    )
+    assert "commit" in lifecycle_calls, (
+        "expected session.commit() to be invoked on the clean path; "
+        "ticket create silently rolled back"
+    )
+    mock_session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ticket_auto_create_rolls_back_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the auto-create work raises, ``get_session()`` must roll back.
+
+    The bug fix uses ``core.database.get_session()`` which calls
+    ``session.rollback()`` on the exception path. Without this, a
+    partial flush would be left dangling on the connection.
+
+    Companion to ``test_ticket_auto_create_session_committed_via_get_session``
+    — pins BOTH the success AND the failure path of the same lifecycle.
+    """
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from conversation import service as conv_service_module
+
+    mock_session = MagicMock(spec=AsyncSession)
+    mock_session.commit = AsyncMock(side_effect=RuntimeError("commit boom"))
+    mock_session.rollback = AsyncMock()
+
+    rollback_invoked = False
+
+    @asynccontextmanager
+    async def fake_get_session() -> object:
+        try:
+            yield mock_session
+            await mock_session.commit()
+        except Exception:
+            nonlocal rollback_invoked
+            rollback_invoked = True
+            await mock_session.rollback()
+            raise
+
+    monkeypatch.setattr(conv_service_module, "get_session", fake_get_session)
+    monkeypatch.setattr(
+        conv_service_module, "get_sessionmaker", lambda: MagicMock()
+    )
+
+    # Custom sync factory — auto-create work raises to exercise the
+    # rollback path.
+    fake_svc = MagicMock()
+    fake_svc.repo.get_for_conversation = AsyncMock(return_value=None)
+    fake_svc.create = AsyncMock(side_effect=RuntimeError("FK violation"))
+
+    def factory(session: object) -> MagicMock:
+        return fake_svc
+
+    # Should NOT propagate (the caller swallows and logs WARNING).
+    await conv_service_module._try_auto_create_ticket(
+        factory=factory,  # type: ignore[arg-type]
+        tenant_id="t1",
+        conversation_id="c1",
+        content_text="msg",
+    )
+
+    assert rollback_invoked, (
+        "expected get_session() to invoke session.rollback() on the "
+        "exception path; the half-flushed ticket was left dangling"
+    )

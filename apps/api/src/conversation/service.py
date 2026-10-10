@@ -24,11 +24,12 @@ channel adapters (Task 5.2), and the persistence layer
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.exceptions import ConversationNotClaimableError
@@ -46,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 async def _try_auto_create_ticket(
     *,
-    factory: Callable[[], Awaitable["TicketService | None"]],
+    factory: Callable[[AsyncSession], TicketService],
     tenant_id: str,
     conversation_id: str,
     content_text: str,
@@ -54,58 +55,90 @@ async def _try_auto_create_ticket(
     """Best-effort ticket auto-create hook invoked from ``record_message``.
 
     Pulled out of ``ConversationService.record_message`` so the
-    customer-inbound hot path stays readable. The factory is invoked
-    lazily so tests that mock ``ConversationService`` never construct
-    a real TicketService at kwargs time.
+    customer-inbound hot path stays readable. The factory is a sync
+    constructor that accepts an ``AsyncSession`` and returns a
+    ``TicketService``. **Session lifecycle is owned by THIS function**
+    via :func:`core.database.get_session` — an
+    ``asynccontextmanager`` that wraps ``sessionmaker()`` with explicit
+    ``commit()`` on clean exit and ``rollback()`` on exception. This
+    separation is what fixes the pre-existing M2.A production bug
+    (the factory historically opened a session without ``async with``,
+    so ``TicketService.create()`` flushed but the transaction was
+    rolled back at GC — customer tickets never persisted).
 
-    Factory is async (returns ``Awaitable[TicketService | None]``) so
-    the caller scope can await it once per inbound message — this is
-    the nitpick P2 fix that guarantees session-per-call at high
-    message rates. Tests that wire a synchronous factory must adapt
-    the factory to be ``async def`` (or an ``AsyncMock``).
+    The factory is invoked lazily inside the ``async with`` block so
+    tests that mock ``ConversationService`` never construct a real
+    ``TicketService`` at kwargs-evaluation time. The session is
+    opened at call time (NOT at factory-construction time) so each
+    customer message gets a dedicated short-lived session with proper
+    commit/rollback — preserving the Task 11 / nitpick P2 invariant
+    that prevents connection-pool pressure at >10k msg/min.
 
     All exceptions are caught and logged at WARNING with opaque IDs
     only — a ticket-creation failure must NOT fail the customer
     message ingest (the customer's turn is the product).
     """
     try:
-        ticket_svc = await factory()
-    except Exception as exc:
+        async with get_session() as session:
+            try:
+                ticket_svc = factory(session)
+            except Exception as exc:
+                logger.warning(
+                    "conversation ticket factory construction failed",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "tenant_id": tenant_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                # ``get_session()`` rolls back on the exception path;
+                # the bare ``return`` re-raises nothing here because
+                # the bare factory construction failure did not touch
+                # any rows.
+                return
+            try:
+                existing = await ticket_svc.repo.get_for_conversation(
+                    conversation_id, tenant_id=tenant_id
+                )
+                if existing is not None:
+                    return
+                # ``subject`` is the first 120 chars of the customer
+                # message — PII; we pass it to ``TicketService.create``
+                # only and never log it. The existing ``ticket_created``
+                # log line in ``TicketService.create`` carries opaque
+                # IDs only.
+                subject = (content_text or "Customer inquiry")[:120]
+                await ticket_svc.create(
+                    tenant_id=tenant_id,
+                    conversation_id=conversation_id,
+                    subject=subject,
+                )
+                # ``get_session()`` commits on clean exit (success path).
+            except Exception as exc:
+                # ``get_session()`` rolls back on the exception path;
+                # we still log WARNING with opaque IDs only.
+                logger.warning(
+                    "conversation ticket auto-create failed",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "tenant_id": tenant_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+                return
+    except Exception:
+        # Defensive: ``get_session()`` itself failed (e.g. sessionmaker
+        # backend down). The inner try blocks above already handle
+        # factory / auto-create failures; this catches the outer
+        # get_session / aenter / aexit failures so a DB outage cannot
+        # propagate to the inbound path.
         logger.warning(
-            "conversation ticket factory construction failed",
+            "conversation ticket auto-create session management failed",
             extra={
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
-                "error_type": type(exc).__name__,
             },
-        )
-        return
-    if ticket_svc is None:
-        return
-    try:
-        existing = await ticket_svc.repo.get_for_conversation(
-            conversation_id, tenant_id=tenant_id
-        )
-        if existing is not None:
-            return
-        # ``subject`` is the first 120 chars of the customer message —
-        # PII; we pass it to ``TicketService.create`` only and never
-        # log it. The existing ``ticket_created`` log line in
-        # ``TicketService.create`` carries opaque IDs only.
-        subject = (content_text or "Customer inquiry")[:120]
-        await ticket_svc.create(
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            subject=subject,
-        )
-    except Exception as exc:
-        logger.warning(
-            "conversation ticket auto-create failed",
-            extra={
-                "conversation_id": conversation_id,
-                "tenant_id": tenant_id,
-                "error_type": type(exc).__name__,
-            },
+            exc_info=True,
         )
 
 # Default and hard-cap page sizes used by the service layer for tenant /
@@ -126,20 +159,22 @@ class ConversationService:
         message_repo: MessageRepository | None = None,
         *,
         clock: Callable[[], datetime] | None = None,
-        ticket_service_factory: Callable[[], Awaitable["TicketService | None"]] | None = None,
+        ticket_service_factory: Callable[[AsyncSession], TicketService] | None = None,
     ) -> None:
         self._repo = repo or ConversationRepository()
         self._message_repo = message_repo or MessageRepository()
         self._clock = clock or (lambda: datetime.now(UTC))
         # Optional auto-create hook for Tickets (Task 6, M2.A). Set
-        # to an async callable that returns a ``TicketService`` (or
-        # None to opt out). The callable is awaited LAZILY inside
-        # ``record_message`` so tests that mock ``ConversationService``
-        # don't pay the cost of constructing one — and so we don't
-        # require a live DB to instantiate a service that might never
-        # be used. ``channel.inbound`` wires this up; agent-reply /
-        # escalation paths leave it None. Async signature (Task 11 /
-        # nitpick P2) ensures session-per-call at high message rates.
+        # to a sync callable that accepts an ``AsyncSession`` and
+        # returns a ``TicketService``. **Session lifecycle is NOT
+        # the factory's responsibility** — the caller
+        # (``_try_auto_create_ticket``) wraps the work in
+        # ``core.database.get_session()``, an ``asynccontextmanager``
+        # with explicit commit/rollback semantics. This separation is
+        # what fixes the pre-existing M2.A production bug where the
+        # factory opened a session without ``async with`` and the
+        # ticket transaction silently rolled back at GC. ``channel.inbound``
+        # wires this up; agent-reply / escalation paths leave it None.
         self._ticket_service_factory = ticket_service_factory
 
     # ---- Inbound / lookup ----

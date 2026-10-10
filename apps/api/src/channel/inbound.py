@@ -23,59 +23,63 @@ carry only ``conversation_id`` + ``text``; the bubble is keyed by
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 
 from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
-from core.logging import get_logger
 from qa.worker import build_arq_redis
 from ticket.repository import TicketRepository
 from ticket.service import TicketService
 
 
-def _build_ticket_service_factory() -> Callable[[], Awaitable[TicketService]]:
-    """Build a lazy ``TicketService`` factory for the customer-inbound hot path.
+def _build_ticket_service_factory() -> Callable[..., TicketService]:
+    """Build a sync ``TicketService`` factory for the customer-inbound hot path.
 
     The factory is invoked from inside
     :meth:`ConversationService.record_message` only when a customer
-    message is being recorded. Each invocation opens its own
-    short-lived DB session via :func:`core.database.get_sessionmaker`
-    so the ticket creation commits independently of the message insert
-    — a ticket-creation failure must NOT fail the customer message
-    ingest (the customer's turn is the product).
+    message is being recorded. The factory itself is a pure
+    constructor — it accepts the ``AsyncSession`` as a parameter and
+    returns the ``TicketService`` with that session injected into its
+    repository. **It does NOT manage session lifecycle.**
 
-    Async signature: callers MUST ``await factory()``. The coroutine
-    form ensures the session is opened AFTER the caller's task is
-    scheduled (not at module import), and guarantees session-per-call
-    semantics — the nitpick P2 fix that prevents connection-pool
-    pressure at >10k msg/min.
+    Session ownership
+    -----------------
 
-    Returns a coroutine function rather than a pre-built
-    ``TicketService`` because ``TicketRepository`` requires a session
-    at construction time; deferring construction until the first
-    customer message means we don't open a DB session at module
-    import / process start.
+    The caller (``conversation.service._try_auto_create_ticket``) is
+    responsible for opening and closing the session via
+    :func:`core.database.get_session`. That helper is an
+    ``asynccontextmanager`` that wraps ``sessionmaker()`` with explicit
+    commit-on-clean-exit and rollback-on-exception semantics. This
+    separation of concerns was added to fix a pre-existing M2.A
+    production bug where the factory opened a session without
+    ``async with`` — ``TicketService.create()`` flushed but the
+    transaction was rolled back when the session was GC'd, so M2.A's
+    auto-create-ticket feature was silently broken (customer tickets
+    never persisted).
+
+    Sync signature: callers MUST NOT ``await factory()`` (an unawaited
+    coroutine was the latent footgun that hid the missing commit).
+    The factory is invoked inside the caller's
+    ``async with get_session() as session:`` block, so each customer
+    message still gets a dedicated short-lived session with proper
+    commit/rollback — preserving the Task 11 / nitpick P2 invariant
+    that prevents connection-pool pressure at >10k msg/min.
     """
-    async def _factory_async() -> TicketService:
-        # ``get_sessionmaker()()`` returns an ``AsyncSession`` (per
-        # ``sqlalchemy.ext.asyncio.async_sessionmaker`` semantics).
-        # ``TicketService.create`` will call ``repo.create`` (which
-        # flushes) — when the session is later closed (by the
-        # ``TicketRepository`` lifecycle or finalisation path) the
-        # commit fires and the ticket is durable. Each call gets a
-        # fresh session because we call ``get_sessionmaker()()`` at
-        # invocation time, not at factory-build time.
-        from core.database import get_sessionmaker
-
-        session = get_sessionmaker()()
+    def _factory(session: object) -> TicketService:
+        # ``TicketRepository`` requires a session at construction
+        # time; deferring that construction here (instead of
+        # injecting a session at module import) is what keeps
+        # ``channel.inbound`` from opening a DB connection until the
+        # first customer message arrives. The caller passes the
+        # session — we just wrap it.
         return TicketService(
-            repo=TicketRepository(session),
+            repo=TicketRepository(session),  # type: ignore[arg-type]
             sla_policy_default_minutes=60,
         )
 
-    return _factory_async
+    return _factory
 
 
 # The shared process-wide connection table. Imported by reference (not
