@@ -50,3 +50,46 @@ def test_conversation_has_ticket_id() -> None:
 
     cols = {c.name for c in Conversation.__table__.columns}
     assert "ticket_id" in cols
+
+
+def test_saenum_columns_use_lowercase_values() -> None:
+    """Regression: SAEnum columns must round-trip lowercase PG ENUM values.
+
+    The PG types ``ticket_priority`` and ``ticket_status`` were created
+    by the alembic migration with lowercase values (``{new, triaged,
+    in_progress, ...}`` and ``{P0, P1, P2, P3}``). Without
+    ``values_callable``, SAEnum sends ``Enum.name`` (uppercase) on
+    write and fails with ``LookupError: 'in_progress' is not among
+    the defined enum values`` on read — every ORM round-trip on
+    ``Ticket.priority`` / ``Ticket.status`` / ``SlaPolicy.priority``
+    was broken. This test pins the fix: each enum column must
+    declare ``values_callable`` so the column treats the enum
+    members by their lowercase ``.value``.
+    """
+    from sqlalchemy import Enum as SAEnum
+
+    # (column, enum_cls, must_contain_literal) — the literal
+    # check is the one that actually verifies the fix (proves the
+    # column maps to the *PG-side* value, not just any enum member).
+    cases = [
+        (Ticket.__table__.c.priority, TicketPriority, "P0"),
+        (Ticket.__table__.c.status, TicketStatus, "in_progress"),
+        (SlaPolicy.__table__.c.priority, TicketPriority, "P2"),
+    ]
+    for col, enum_cls, expected_literal in cases:
+        assert isinstance(col.type, SAEnum), (
+            f"{col} must be SAEnum-backed so PG ENUM types are honored"
+        )
+        assert col.type.values_callable is not None, (
+            f"{col} must declare values_callable — without it SAEnum "
+            "emits Enum.name (uppercase) and PG rejects it"
+        )
+        resolved = col.type.values_callable(enum_cls)
+        assert resolved == [e.value for e in enum_cls], (
+            f"{col}.values_callable should return each enum's .value "
+            f"(lowercase); got {resolved!r}"
+        )
+        assert expected_literal in resolved, (
+            f"{col} must resolve to {expected_literal!r} to match the "
+            f"PG ENUM literal; resolved={resolved!r}"
+        )

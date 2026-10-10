@@ -111,12 +111,22 @@ class Ticket(Base):
     subject: Mapped[str] = mapped_column(Text, nullable=False)
     category: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority: Mapped[TicketPriority] = mapped_column(
-        SAEnum(TicketPriority, name="ticket_priority", create_type=False),
+        SAEnum(
+            TicketPriority,
+            name="ticket_priority",
+            create_type=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
         nullable=False,
         default=TicketPriority.P2,
     )
     status: Mapped[TicketStatus] = mapped_column(
-        SAEnum(TicketStatus, name="ticket_status", create_type=False),
+        SAEnum(
+            TicketStatus,
+            name="ticket_status",
+            create_type=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
         nullable=False,
         default=TicketStatus.NEW,
     )
@@ -219,7 +229,12 @@ class SlaPolicy(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[TicketPriority] = mapped_column(
-        SAEnum(TicketPriority, name="ticket_priority", create_type=False),
+        SAEnum(
+            TicketPriority,
+            name="ticket_priority",
+            create_type=False,
+            values_callable=lambda x: [e.value for e in x],
+        ),
         nullable=False,
     )
     first_response_minutes: Mapped[int] = mapped_column(Integer, nullable=False)

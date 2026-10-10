@@ -42,7 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.dependencies import get_current_user
 from conversation.repository import ConversationRepository
-from core.database import get_session
+from core.database import get_sessionmaker
 from ticket.repository import TicketRepository
 from ticket.schemas import TicketEventOut, TicketOut, TicketTransitionIn
 from ticket.service import TicketNotFound, TicketService
@@ -56,33 +56,35 @@ router = APIRouter(prefix="/api/v1/tickets", tags=["tickets"])
 # ---------------------------------------------------------------------------
 
 
-def get_ticket_service(
-    session: Annotated[AsyncSession, Depends(get_session)],
+async def get_ticket_service(
     claims: Annotated[dict[str, Any], Depends(get_current_user)],
-) -> TicketService:
+) -> Any:
     """Per-request ``TicketService`` with the CANCELLED-cleanup hook wired.
 
-    Wires ``ConversationRepository()`` into the service so that
-    transitioning to ``CANCELLED`` NULLs ``conversations.ticket_id``
-    atomically with the ticket status update (otherwise deleting the
-    ticket later would trip the RESTRICT FK declared on the
-    back-pointer — see Task 4 design notes).
+    Generator dep: opens a fresh ``AsyncSession`` for the request, hands
+    the wired ``TicketService`` to the route, and runs the
+    ``async with`` cleanup on the way out (commit on clean exit,
+    rollback on exception — same semantics as ``core.database.get_session``
+    used directly).
 
-    FastAPI's DI cache reuses the same ``session`` for both deps in
-    the same request, so the status update + ticket_id NULL write
-    commit together (or roll back together) — the session-threading
-    fix from Task 5.
+    The earlier pattern (``Depends(get_session)``) was a misuse —
+    ``get_session`` is an ``@asynccontextmanager``, not a session
+    factory, so FastAPI's DI was receiving the context-manager object
+    and failing to ``__aiter__`` it (``_AsyncGeneratorContextManager
+    object is not an async iterator``). Switching to a generator dep
+    that calls ``get_sessionmaker()()`` is the standard FastAPI recipe
+    for "yield a session for one request".
     """
-    # Bind the tenant contextvar so any downstream repository call
-    # (e.g. ``ConversationRepository.clear_ticket_id``) sees the
-    # caller's tenant. ``get_current_user`` already sets this; we
-    # don't re-set to avoid a duplicate token.
-    del claims  # tenant_id is read from the JWT contextvar set by get_current_user
-    return TicketService(
-        repo=TicketRepository(session),
-        conv_repo=ConversationRepository(),
-        sla_policy_default_minutes=60,
-    )
+    # tenant_id is read from the JWT contextvar set by get_current_user;
+    # the parameter is only here to enforce auth ordering.
+    del claims
+    sm = get_sessionmaker()
+    async with sm() as session:
+        yield TicketService(
+            repo=TicketRepository(session),
+            conv_repo=ConversationRepository(),
+            sla_policy_default_minutes=60,
+        )
 
 
 # ---------------------------------------------------------------------------
