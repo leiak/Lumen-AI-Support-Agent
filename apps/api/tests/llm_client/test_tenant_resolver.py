@@ -137,7 +137,7 @@ def test_single_provider_tenant_ainvoke_raises_no_chain() -> None:
 
 
 def test_chain_tenant_ainvoke_delegates() -> None:
-    primary = _make_provider("minimax")
+    _primary = _make_provider("minimax")
     fallback = MagicMock(spec=["__call__", "ainvoke"])
     fallback.ainvoke = AsyncMock(return_value="response")
     gateway = MagicMock()

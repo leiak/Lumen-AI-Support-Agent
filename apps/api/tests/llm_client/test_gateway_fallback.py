@@ -8,7 +8,7 @@ import pytest
 from llm_client.gateway import LLMGateway
 from llm_client.provider_registry import parse_fallback_chain_env
 from llm_client.providers.base import BaseProvider
-from llm_client.resolvers import FallbackResolver, PinnedResolver, _PrefixResolver
+from llm_client.resolvers import FallbackResolver, _PrefixResolver
 from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
 

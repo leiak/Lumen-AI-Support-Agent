@@ -161,8 +161,8 @@ def _mock_object_store() -> MagicMock:
 async def test_upload_image_indexes_single_chunk(
     app_client: AsyncClient, tenant_factory: Tenant, auth_headers
 ):
-    """Upload PNG → 1 image chunk → 201."""
-    fake_embedding = [0.1] * 1024
+    """Upload PNG -> 1 image chunk -> 201."""
+    _fake_embedding = [0.1] * 1024
     with patch(
         "knowledge.multimodal.api.get_vision_embedder",
         return_value=_mock_embedder(),
@@ -547,7 +547,7 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
         )
 
     # 3. Mock vision embedder (1024-dim is the real DoubaoVisionEmbedder default).
-    fake_image_vector = [0.1] * 1024
+    _fake_image_vector = [0.1] * 1024
 
     # 4. Generate a small multi-page PDF via the reportlab fixture.
     #    ``make_table_pdf`` writes to disk (takes a ``path: str``),
@@ -588,7 +588,8 @@ async def test_pdf_text_chunks_indexed_to_article_chunks(
     ]
     assert article_chunks_calls, (
         "expected at least one upsert to article_chunks; "
-        f"got collections: {[c.kwargs.get('collection_name') for c in qdrant_mock.upsert.call_args_list]}"
+        "got collections: "
+        f"{[c.kwargs.get('collection_name') for c in qdrant_mock.upsert.call_args_list]}"
     )
 
     # 7. Assert payload shape — every article_chunks point carries
@@ -724,8 +725,8 @@ async def test_pdf_text_retrievable_via_search_multimodal_kb(
 
     # 6. Assert: the retriever surfaced the PDF text chunk.
     assert len(hits) >= 1, (
-        f"retriever returned no hits; the PDF text chunk was "
-        f"written but is not queryable"
+        "retriever returned no hits; the PDF text chunk was "
+        "written but is not queryable"
     )
     top = hits[0]
     # Text chunks from the article_chunks collection carry

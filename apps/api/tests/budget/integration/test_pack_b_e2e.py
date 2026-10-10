@@ -8,7 +8,7 @@ testcontainer — matches the convention from
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,7 +22,6 @@ from core.business_metrics import LLM_BUDGET_GATE_TOTAL
 from core.id_gen import new_id
 from llm_client.exceptions import RateLimited
 from llm_client.models import LLMUsage
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -68,7 +67,7 @@ async def test_e2e_credit_grant_then_breakdown_then_gate(
         4. No post_record (no tokens billed because inner raised 429).
     """
     tenant_id = "tenant-e2e-packb"
-    period = datetime.now(timezone.utc).strftime("%Y-%m")
+    period = datetime.now(UTC).strftime("%Y-%m")
 
     budget = TenantBudget(
         id=new_id(),
@@ -82,7 +81,7 @@ async def test_e2e_credit_grant_then_breakdown_then_gate(
         tenant_id=tenant_id,
         period=period,
         tokens_used=0,
-        last_refreshed_at=datetime.now(timezone.utc),
+        last_refreshed_at=datetime.now(UTC),
     )
     db_session.add(budget)
     db_session.add(snap)
@@ -104,7 +103,7 @@ async def test_e2e_credit_grant_then_breakdown_then_gate(
                 request_id="r",
                 cached=False,
                 metadata_json={},
-                created_at=datetime.now(timezone.utc),
+                created_at=datetime.now(UTC),
             )
         )
     await db_session.flush()

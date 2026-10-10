@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
-from llm_client.client import LLMClient, ROUTE_FALLBACK
+from llm_client.client import ROUTE_FALLBACK, LLMClient
 from llm_client.exceptions import (
     FallbackChainExhausted,
     ProviderUnavailable,
@@ -83,7 +83,7 @@ def test_chat_propagates_chain_exhausted_without_internal_retry() -> None:
 def test_chat_does_not_retry_chain_exhausted_even_with_max_retries_5() -> None:
     """LLMClient.chat's retry loop must NOT run when the resolver has ainvoke.
 
-    Otherwise max_retries=5 × chain_length=2 = up to 10 attempts.
+    Otherwise max_retries=5 * chain_length=2 = up to 10 attempts.  # noqa: RUF002
     """
     primary = _stub_provider("minimax")
     real = FallbackResolver(steps=[PinnedResolver(provider=primary, model="MiniMax-M3")])

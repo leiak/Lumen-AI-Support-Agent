@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
-from typing import Tuple
 
 import pytest
 from fastapi import FastAPI
@@ -45,10 +44,7 @@ from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
 from ticket.api import router as ticket_router
-from ticket.enums import TicketStatus
 from ticket.models import Ticket, TicketEvent
-from ticket.repository import TicketRepository
-
 
 # ---------------------------------------------------------------------------
 # Singleton reset (autouse)
@@ -209,7 +205,7 @@ async def sample_ticket(
 @pytest.fixture
 async def sample_ticket_with_events(
     tenant_factory: Callable[..., AsyncIterator[Tenant]],
-) -> AsyncIterator[Tuple[Ticket, list[TicketEvent]]]:
+) -> AsyncIterator[tuple[Ticket, list[TicketEvent]]]:
     """Yield a NEW ticket plus 3 audit events (created, commented, status_changed).
 
     Used by ``test_get_events_returns_ordered_desc`` — events are
@@ -271,10 +267,10 @@ async def sample_ticket_with_events(
 
 
 __all__ = [
+    "_auth_headers",
+    "async_client",
     "sample_ticket",
     "sample_ticket_with_events",
-    "async_client",
-    "tenant_factory",
     "second_tenant_factory",
-    "_auth_headers",
+    "tenant_factory",
 ]

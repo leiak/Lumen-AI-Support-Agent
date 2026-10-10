@@ -14,9 +14,10 @@ DB migration), so this suite focuses on:
 from __future__ import annotations
 
 import pytest
+from httpx import AsyncClient
+
 from core.database import get_sessionmaker
 from core.id_gen import new_id
-from httpx import AsyncClient
 from tenant.models import Tenant
 from tests.admin.conftest import auth_headers
 from ticket.models import SlaPolicy

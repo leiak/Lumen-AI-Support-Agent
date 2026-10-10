@@ -11,7 +11,7 @@ Marked ``@pytest.mark.integration`` so the default selector
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -31,7 +31,6 @@ from llm_client.types import ChatRequest, ChatResponse
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -63,7 +62,7 @@ def _reset_db_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 async def async_client_app() -> AsyncGenerator[AsyncClient, None]:
     """Yield an httpx client wired to the FULL FastAPI app."""
-    from main import app  # noqa: PLC0415 — import-after-fixture for fast collection
+    from main import app
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -142,7 +141,7 @@ async def test_e2e_pack_a_no_overshoot_under_concurrent_calls(
         try:
             await resolver.ainvoke(MagicMock(spec=ChatRequest))
         except TenantBudgetExceeded:
-            rejected_at.append(datetime.now(tz=timezone.utc))
+            rejected_at.append(datetime.now(tz=UTC))
             break
 
     assert len(rejected_at) == 1
@@ -237,7 +236,7 @@ async def test_e2e_cleanup_admin_endpoint_requires_jwt(
 
 
 __all__ = [
+    "test_e2e_cleanup_admin_endpoint_requires_jwt",
     "test_e2e_pack_a_no_overshoot_under_concurrent_calls",
     "test_e2e_soft_warn_fires_once_under_load",
-    "test_e2e_cleanup_admin_endpoint_requires_jwt",
 ]

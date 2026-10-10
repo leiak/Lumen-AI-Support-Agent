@@ -951,8 +951,8 @@ async def test_graph_escalation_node_is_trivial_passthrough() -> None:
 # ----- Stage 7.4: state-machine polish + metrics -------------------------
 
 
-import contextlib
-import io
+import contextlib  # noqa: E402
+import io  # noqa: E402
 
 
 class _StructlogCapture:

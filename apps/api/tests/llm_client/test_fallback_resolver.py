@@ -141,7 +141,7 @@ def test_timeout_triggers_fallback() -> None:
 # ---- non-trigger exception ----
 
 
-def test_invalid_request_does_NOT_trigger_fallback() -> None:
+def test_invalid_request_does_NOT_trigger_fallback() -> None:  # noqa: N802
     primary = _stub_provider("minimax")
     backup = _stub_provider("anthropic")
     primary.chat.side_effect = InvalidRequest("bad schema")

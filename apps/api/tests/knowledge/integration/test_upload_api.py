@@ -35,7 +35,7 @@ from core.database import get_session
 from core.id_gen import new_id
 from core.qdrant import get_qdrant_client
 from knowledge.api import router as knowledge_router
-from knowledge.enums import ArticleSourceType, ArticleStatus
+from knowledge.enums import ArticleStatus
 from knowledge.models import (
     Article,
     ArticleVersion,
@@ -261,7 +261,7 @@ async def test_upload_text_file_creates_article(
     _patch_embed(monkeypatch)
     await _ensure_collection_ready()
     kb = await _kb_factory(tenant_id=tenant_factory.id, slug="upload-text")
-    payload = "hello world this is a test document with some words\n".encode("utf-8")
+    payload = b"hello world this is a test document with some words\n"
 
     async with AsyncClient(
         transport=ASGITransport(app=_build_app()), base_url="http://test"
@@ -297,7 +297,9 @@ async def test_upload_text_file_creates_article(
         rows = list((await session.execute(stmt)).scalars().all())
     assert len(rows) == 1
     assert rows[0].version_number == 1
-    assert rows[0].content_hash == hashlib.sha256(payload.decode("utf-8").encode("utf-8")).hexdigest()
+    assert rows[0].content_hash == (
+        hashlib.sha256(payload.decode("utf-8").encode("utf-8")).hexdigest()
+    )
 
     await _delete_qdrant_points_for_article(article_id=article_id)
 
@@ -321,14 +323,14 @@ async def test_upload_markdown_file_with_code_block(
     await _ensure_collection_ready()
     kb = await _kb_factory(tenant_id=tenant_factory.id, slug="upload-md")
     md_payload = (
-        "# Heading\n\n"
-        "Some prose that talks about a thing.\n\n"
-        "```python\n"
-        "def greet(name):\n"
-        "    return f'hi {name}'\n"
-        "```\n\n"
-        "And some trailing prose after the code.\n"
-    ).encode("utf-8")
+        b"# Heading\n\n"
+        b"Some prose that talks about a thing.\n\n"
+        b"```python\n"
+        b"def greet(name):\n"
+        b"    return f'hi {name}'\n"
+        b"```\n\n"
+        b"And some trailing prose after the code.\n"
+    )
 
     async with AsyncClient(
         transport=ASGITransport(app=_build_app()), base_url="http://test"

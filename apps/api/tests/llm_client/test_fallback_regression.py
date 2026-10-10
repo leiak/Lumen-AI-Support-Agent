@@ -16,7 +16,7 @@ side-effect-free.
 import asyncio
 from unittest.mock import AsyncMock, create_autospec
 
-from llm_client.client import LLMClient, ROUTE_AUTO, ROUTE_PINNED
+from llm_client.client import ROUTE_AUTO, ROUTE_PINNED, LLMClient
 from llm_client.exceptions import ProviderUnavailable
 from llm_client.gateway import LLMGateway
 from llm_client.providers.base import BaseProvider

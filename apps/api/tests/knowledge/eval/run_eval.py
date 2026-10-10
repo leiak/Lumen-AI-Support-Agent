@@ -108,6 +108,8 @@ _SRC_DIR = Path(__file__).resolve().parents[3] / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+from core.database import get_session  # noqa: E402
+from core.logging import get_logger  # noqa: E402
 from knowledge.enums import ArticleSourceType, ArticleStatus  # noqa: E402
 from knowledge.models import (  # noqa: E402
     Article,
@@ -122,17 +124,12 @@ from knowledge.qdrant_client import (  # noqa: E402
 from knowledge.repository import ArticleRepository, KnowledgeBaseRepository  # noqa: E402
 from knowledge.retriever import (  # noqa: E402
     KnowledgeBaseNotFoundError,
-    RetrievedChunk,
     retrieve_chunks,
 )
 from knowledge.worker import index_article  # noqa: E402
 from tenant.enums import TenantPlan  # noqa: E402
 from tenant.models import Tenant  # noqa: E402
 from tenant.repository import TenantRepository  # noqa: E402
-
-from core.database import get_session  # noqa: E402
-from core.id_gen import new_id  # noqa: E402
-from core.logging import get_logger  # noqa: E402
 
 log = get_logger(__name__)
 
@@ -375,9 +372,10 @@ async def _ensure_collection_ready(*, vector_size: int | None = None) -> None:
 
     ``vector_size`` is the *target* size for the collection. When the
     eval runs in ``--real-embeddings`` mode the caller passes the
-    configured model's dimension (via ``vector_size_for_model(get_settings().default_embedding_model)``)
+    configured model's dimension (via
+    ``vector_size_for_model(get_settings().default_embedding_model)``)
     so a freshly-created collection matches the vectors the live
-    ``embed_texts`` will produce. The mock mode keeps the historical
+    ``embed_texts`` will produce. The mock mode keeps the historical  # noqa: E501
     ``DEFAULT_VECTOR_SIZE = 1536`` fallback so legacy fixtures
     continue to work.
 
@@ -477,8 +475,9 @@ async def _cleanup_qdrant_for_tenant(*, tenant_id: str) -> int:
     article; for the eval we want a tenant-wide sweep, so we use
     a payload filter and let Qdrant batch the delete.
     """
-    from core.qdrant import get_qdrant_client
     from qdrant_client.http import models as qmodels
+
+    from core.qdrant import get_qdrant_client
 
     client = get_qdrant_client()
     flt = qmodels.Filter(
@@ -569,13 +568,13 @@ async def run_eval(
 
     # ---- 1. Load dataset ------------------------------------------------
     dataset_file = Path(dataset_path)
-    if not dataset_file.exists():
+    if not dataset_file.exists():  # noqa: ASYNC240
         raise FileNotFoundError(f"eval dataset not found: {dataset_path}")
-    dataset = json.loads(dataset_file.read_text(encoding="utf-8"))
+    dataset = json.loads(dataset_file.read_text(encoding="utf-8"))  # noqa: ASYNC240
     _validate_dataset(dataset)
 
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
 
     # ---- 2. Resolve embedding backend ---------------------------------
     # Both modes use the *configured* model's vector dim so the mock
@@ -750,7 +749,7 @@ async def run_eval(
 
     report = EvalReport(
         dataset_version=dataset["version"],
-        dataset_path=str(dataset_file.resolve()),
+        dataset_path=str(dataset_file.resolve()),  # noqa: ASYNC240
         embedding_mode=embedding_mode,
         total_queries=len(per_query),
         hit_rate_at_1=hit_rate_at_1,
@@ -973,7 +972,7 @@ def _compute_threshold_sweep(
         for r in standard_records:
             expected = set(r["expected_relevant_article_ids"])
             for aid, score in zip(
-                r["predicted_article_ids"], r["predicted_scores"]
+                r["predicted_article_ids"], r["predicted_scores"], strict=False
             ):
                 if score >= t:
                     n_kept += 1

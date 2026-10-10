@@ -20,7 +20,7 @@ for prior art). Tests 1-6 are pure-Python; tests 7-9 are
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -29,7 +29,6 @@ from budget.per_model import (
     PerModelBreakdownCache,
     PerModelService,
 )
-
 
 # ---------------------------------------------------------------------------
 # PerModelBreakdownCache unit tests (no DB).
@@ -102,11 +101,11 @@ def test_get_per_model_cache_reads_ttl_from_settings(monkeypatch) -> None:
     review: the setting was declared but never consumed — every call
     site used the hardcoded 30s default.
     """
-    from core.config import get_settings, reset_settings
     from budget.per_model import (
         get_per_model_cache,
         reset_per_model_cache,
     )
+    from core.config import reset_settings
 
     monkeypatch.setenv("TENANT_BUDGET_PER_MODEL_CACHE_TTL_SECONDS", "7")
     reset_settings()
@@ -158,8 +157,8 @@ async def _seed_usage(
     ``id`` is a fresh ULID per call; ULID generation uses ``core.id_gen.new_id``
     (the canonical helper used by every other seed in the project).
     """
-    from llm_client.models import LLMUsage
     from core.id_gen import new_id
+    from llm_client.models import LLMUsage
 
     row = LLMUsage(
         id=new_id(),
@@ -182,7 +181,7 @@ async def _seed_usage(
 @pytest.mark.asyncio
 async def test_get_breakdown_groups_by_provider_model(db_session: object) -> None:
     """GROUP BY (provider, model) sums prompt/completion tokens per group."""
-    period_start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    period_start = datetime(2026, 10, 1, tzinfo=UTC)
     await _seed_usage(
         db_session, tenant_id="t1", provider="openai", model="gpt-4o-mini",
         prompt=100, completion=50, created_at=period_start,
@@ -217,7 +216,7 @@ async def test_get_breakdown_groups_by_provider_model(db_session: object) -> Non
 @pytest.mark.asyncio
 async def test_get_breakdown_caches_within_ttl(db_session: object) -> None:
     """Second call within TTL returns cached value (new rows invisible)."""
-    period_start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    period_start = datetime(2026, 10, 1, tzinfo=UTC)
     await _seed_usage(
         db_session, tenant_id="t1", provider="openai", model="gpt-4o",
         prompt=10, completion=5, created_at=period_start,
@@ -244,7 +243,7 @@ async def test_get_breakdown_caches_within_ttl(db_session: object) -> None:
 @pytest.mark.asyncio
 async def test_get_breakdown_excludes_cached_rows(db_session: object) -> None:
     """LLMUsage.cached=True rows are excluded (cache hits aren't billable)."""
-    period_start = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    period_start = datetime(2026, 10, 1, tzinfo=UTC)
     await _seed_usage(
         db_session, tenant_id="t1", provider="openai", model="gpt-4o-mini",
         prompt=100, completion=50, created_at=period_start, cached=True,
@@ -256,13 +255,13 @@ async def test_get_breakdown_excludes_cached_rows(db_session: object) -> None:
 
 
 __all__ = [
-    "test_get_returns_none_on_miss",
-    "test_set_then_get_returns_cached",
-    "test_invalidate_drops_entry",
-    "test_ttl_expiry_evicts_entry",
-    "test_different_tenants_isolated",
     "test_different_periods_isolated",
-    "test_get_breakdown_groups_by_provider_model",
+    "test_different_tenants_isolated",
     "test_get_breakdown_caches_within_ttl",
     "test_get_breakdown_excludes_cached_rows",
+    "test_get_breakdown_groups_by_provider_model",
+    "test_get_returns_none_on_miss",
+    "test_invalidate_drops_entry",
+    "test_set_then_get_returns_cached",
+    "test_ttl_expiry_evicts_entry",
 ]

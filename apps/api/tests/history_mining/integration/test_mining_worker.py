@@ -22,8 +22,8 @@ HDBSCAN directly with deterministic numpy seeds.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -55,8 +55,8 @@ async def test_mining_worker_runs_end_to_end(sample_tenant: Tenant) -> None:
                     customer_external_id=f"customer-{i}",
                     status=ConversationStatus.CLOSED,
                     ai_handling=True,
-                    opened_at=datetime.now(timezone.utc) - timedelta(days=5),
-                    last_activity_at=datetime.now(timezone.utc) - timedelta(days=4),
+                    opened_at=datetime.now(UTC) - timedelta(days=5),
+                    last_activity_at=datetime.now(UTC) - timedelta(days=4),
                 )
             )
             session.add(
@@ -66,7 +66,7 @@ async def test_mining_worker_runs_end_to_end(sample_tenant: Tenant) -> None:
                     conversation_id=conv_id,
                     role=MessageRole.CUSTOMER,
                     content_text="How do I reset my password?",
-                    created_at=datetime.now(timezone.utc) - timedelta(days=5),
+                    created_at=datetime.now(UTC) - timedelta(days=5),
                 )
             )
             conv_ids.append(conv_id)
@@ -85,7 +85,7 @@ async def test_mining_worker_runs_end_to_end(sample_tenant: Tenant) -> None:
             total_tokens=10 * len(texts),
         )
 
-    fake_draft = KBDraft(
+    _fake_draft = KBDraft(
         title="Reset Password Guide",
         body="Settings > Account > Reset",
         suggested_tags=["password"],
@@ -136,8 +136,8 @@ async def test_mining_worker_creates_drafts_with_correct_tenant(
                     customer_external_id=f"c-{i}",
                     status=ConversationStatus.CLOSED,
                     ai_handling=True,
-                    opened_at=datetime.now(timezone.utc) - timedelta(days=5),
-                    last_activity_at=datetime.now(timezone.utc) - timedelta(days=4),
+                    opened_at=datetime.now(UTC) - timedelta(days=5),
+                    last_activity_at=datetime.now(UTC) - timedelta(days=4),
                 )
             )
             session.add(
@@ -147,7 +147,7 @@ async def test_mining_worker_creates_drafts_with_correct_tenant(
                     conversation_id=conv_id,
                     role=MessageRole.CUSTOMER,
                     content_text=f"Question {i}",
-                    created_at=datetime.now(timezone.utc) - timedelta(days=5),
+                    created_at=datetime.now(UTC) - timedelta(days=5),
                 )
             )
         await session.commit()

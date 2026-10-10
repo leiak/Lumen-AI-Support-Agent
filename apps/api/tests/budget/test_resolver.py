@@ -1,7 +1,7 @@
 """Tests for BudgetResolver pre-check + post-record behavior."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,7 +33,7 @@ def _make_snapshot(tenant_id: str, period: str, tokens_used: int) -> Any:
     s.period = period
     s.tokens_used = tokens_used
     s.id = "snap-id"
-    s.last_refreshed_at = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    s.last_refreshed_at = datetime(2026, 10, 1, tzinfo=UTC)
     s.soft_warn_fired_at = None  # Pack A #4: default to "not yet fired"
     return s
 
@@ -218,7 +218,7 @@ def test_current_period_honors_tz_name() -> None:
     # Verify tz is correctly set (Asia/Shanghai is +08:00)
     assert period_start.utcoffset() == timedelta(hours=8)
     # Same test for UTC
-    period_utf8, period_start_utc = _current_period("UTC")
+    _period_utf8, period_start_utc = _current_period("UTC")
     assert period_start_utc.utcoffset() == timedelta(0)
 
 
@@ -323,8 +323,9 @@ async def test_soft_warn_fires_once_per_period_sticky() -> None:
     Second call also crosses (would have fired under old logic) → does NOT fire
     because soft_warn_fired_at IS NOT NULL (sticky).
     """
-    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
     from datetime import datetime as _dt
+
+    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
 
     inner = MagicMock()
     inner.ainvoke = AsyncMock(side_effect=[
@@ -339,7 +340,7 @@ async def test_soft_warn_fires_once_per_period_sticky() -> None:
     snap_with_no_fire = _make_snapshot("t1", "2026-10", 99)
     snap_with_no_fire.soft_warn_fired_at = None
     snap_after_fire = _make_snapshot("t1", "2026-10", 149)
-    snap_after_fire.soft_warn_fired_at = _dt(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    snap_after_fire.soft_warn_fired_at = _dt(2026, 10, 15, 12, 0, tzinfo=UTC)
 
     repo = MagicMock()
     repo.get_for_tenant_period = AsyncMock(side_effect=[
@@ -390,8 +391,9 @@ async def test_pre_check_db_direct_when_setting_enabled_default() -> None:
 
 async def test_pre_check_cache_fallback_when_setting_disabled() -> None:
     """tenant_budget_pre_check_use_db=False → legacy cache path is used."""
-    from core.config import get_settings, reset_settings
     import os
+
+    from core.config import reset_settings
 
     os.environ["TENANT_BUDGET_PRE_CHECK_USE_DB"] = "false"
     reset_settings()
@@ -430,15 +432,16 @@ async def test_pre_check_cache_fallback_when_setting_disabled() -> None:
 
 async def test_soft_warn_does_not_fire_when_already_fired() -> None:
     """Pre-populated soft_warn_fired_at → cross threshold does NOT fire."""
-    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
     from datetime import datetime as _dt
+
+    from core.business_metrics import LLM_TENANT_BUDGET_SOFT_WARN_TOTAL
 
     inner = MagicMock()
     inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
     cache = MagicMock()
 
     snap = _make_snapshot("t1", "2026-10", 99)
-    snap.soft_warn_fired_at = _dt(2026, 10, 10, 0, 0, tzinfo=timezone.utc)
+    snap.soft_warn_fired_at = _dt(2026, 10, 10, 0, 0, tzinfo=UTC)
 
     repo = MagicMock()
     repo.get_for_tenant_period = AsyncMock(side_effect=[
@@ -460,7 +463,7 @@ async def test_soft_warn_does_not_fire_when_already_fired() -> None:
     # Carry-over: set_tokens_used receives the existing one, not None
     repo.set_tokens_used.assert_awaited_once()
     call_kwargs = repo.set_tokens_used.await_args.kwargs
-    assert call_kwargs["soft_warn_fired_at"] == _dt(2026, 10, 10, 0, 0, tzinfo=timezone.utc)
+    assert call_kwargs["soft_warn_fired_at"] == _dt(2026, 10, 10, 0, 0, tzinfo=UTC)
 
 
 async def test_post_record_carries_over_soft_warn_fired_at() -> None:
@@ -470,7 +473,7 @@ async def test_post_record_carries_over_soft_warn_fired_at() -> None:
     inner = MagicMock()
     inner.ainvoke = AsyncMock(return_value=_make_response(prompt_tokens=100, completion_tokens=50))
     cache = MagicMock()
-    existing_ts = _dt(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    existing_ts = _dt(2026, 10, 1, 12, 0, tzinfo=UTC)
     snap = _make_snapshot("t1", "2026-10", 100)  # already past soft_warn but no fire
     snap.soft_warn_fired_at = existing_ts  # but we previously fired
 

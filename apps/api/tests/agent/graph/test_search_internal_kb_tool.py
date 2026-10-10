@@ -9,8 +9,9 @@ These tests use ``MagicMock`` for both dependencies so the tool's
 ``rag_service.retrieve`` and ``kb_repository.find_by_slug`` interfaces
 here match the production contract that Stage 12 Task 2 will wire up.
 """
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from agent.graph.tools import (
     bind_escalation_context,
@@ -23,8 +24,12 @@ from agent.graph.tools import (
 def mock_rag_service():
     svc = MagicMock()
     svc.retrieve = AsyncMock(return_value=[
-        {"chunk_id": "c1", "article_title": "Password Reset", "score": 0.85, "content": "To reset..."},
-        {"chunk_id": "c2", "article_title": "Account Management", "score": 0.72, "content": "Navigate..."},
+        {
+            "chunk_id": "c1", "article_title": "Password Reset", "score": 0.85, "content": "To reset...",  # noqa: E501
+        },
+        {
+            "chunk_id": "c2", "article_title": "Account Management", "score": 0.72, "content": "Navigate...",  # noqa: E501
+        },
     ])
     return svc
 

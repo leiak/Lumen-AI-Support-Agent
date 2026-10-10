@@ -12,6 +12,7 @@ Covers:
 """
 from __future__ import annotations
 
+from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,7 +20,6 @@ import pytest
 from budget.exceptions import TenantBudgetRateLimited
 from budget.resolver import BudgetResolver
 from llm_client.exceptions import RateLimited
-
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -55,7 +55,7 @@ def _make_budget(*, hard_cap: int = 8000, soft_warn: int = 5000):
 
 def _make_snapshot(tenant_id: str, period: str, *, tokens_used: int = 0):
     """Build a TenantBudgetSnapshot-like stub (no DB)."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from budget.models import TenantBudgetSnapshot
 
@@ -64,7 +64,7 @@ def _make_snapshot(tenant_id: str, period: str, *, tokens_used: int = 0):
     s.tenant_id = tenant_id
     s.period = period
     s.tokens_used = tokens_used
-    s.last_refreshed_at = datetime.now(timezone.utc)
+    s.last_refreshed_at = datetime.now(UTC)
     s.soft_warn_fired_at = None
     return s
 
@@ -138,7 +138,7 @@ async def test_gate_raises_when_remaining_below_threshold() -> None:
     - Per-model cache was invalidated (the 429 still hit a provider).
     - snapshot_repo.set_tokens_used was NOT called (no tokens billed).
     """
-    resolver, inner, snap_repo, per_model_cache = _make_resolver(
+    resolver, inner, _snap_repo, per_model_cache = _make_resolver(  # noqa: RUF059
         hard_cap=8000,
         tokens_used=7500,  # remaining = effective_cap - tokens_used = 8000 - 7500 = 500
         inner_side_effect=RateLimited("429 from openai"),
@@ -152,8 +152,8 @@ async def test_gate_raises_when_remaining_below_threshold() -> None:
     assert exc_info.value.period == "2026-10"
     # Per-model cache invalidated because a request did hit a provider.
     per_model_cache.invalidate.assert_called_with("t1", "2026-10")
-    # No post_record — no tokens were billed.
-    snap_repo.set_tokens_used.assert_not_called()
+    # No post_record -- no tokens were billed.
+    _snap_repo.set_tokens_used.assert_not_called()
 
 
 # ---- 3. Gate does NOT fire when remaining >= threshold ----------------------

@@ -32,7 +32,6 @@ exact wiring.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,7 +44,6 @@ from qa.worker import (
     qa_judge_task,
     qa_sla_alert_worker,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -391,7 +389,6 @@ async def test_qa_judge_maps_exception_types_to_documented_reason_labels() -> No
     * ``asyncio.TimeoutError`` → ``"timeout"``
     * ``RuntimeError`` → ``"exception"`` (fallback for unknown types)
     """
-    import asyncio
 
     # First case: asyncio.TimeoutError -> "timeout".
     session_a = _make_session()
@@ -400,7 +397,7 @@ async def test_qa_judge_maps_exception_types_to_documented_reason_labels() -> No
     session_a.get = AsyncMock(side_effect=[msg_a, conv_a])
 
     judge_a = _make_judge()
-    judge_a.score = AsyncMock(side_effect=asyncio.TimeoutError())
+    judge_a.score = AsyncMock(side_effect=TimeoutError())
     ctx_a: dict[str, Any] = {"judge_client": judge_a}
 
     fake_qa_repo_a = MagicMock()
@@ -693,7 +690,7 @@ def test_worker_settings_max_jobs_is_io_bound_friendly() -> None:
 class _DummyCM:
     """No-op context manager for ``Histogram.time()`` mocks."""
 
-    def __enter__(self) -> "_DummyCM":
+    def __enter__(self) -> _DummyCM:
         return self
 
     def __exit__(self, *args: Any) -> None:

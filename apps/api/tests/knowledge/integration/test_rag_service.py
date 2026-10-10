@@ -34,7 +34,6 @@ from qdrant_client.http import models as qmodels
 
 from agent.simple_responder import SimpleResponder
 from channel.enums import ChannelStatus, ChannelType
-from channel.models import Channel
 from channel.repository import ChannelRepository
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation, Message
@@ -53,8 +52,7 @@ from knowledge.qdrant_client import (
     DEFAULT_VECTOR_SIZE,
     ensure_collection,
 )
-from knowledge.rag_service import RAGService, RagContext
-from knowledge.repository import KnowledgeBaseRepository
+from knowledge.rag_service import RagContext, RAGService
 from knowledge.worker import index_article
 from llm_client.types import ChatResponse
 from tenant.enums import TenantPlan
@@ -312,7 +310,7 @@ async def _delete_qdrant_points_for_article(*, article_id: str) -> None:
             points_selector=flt,
             wait=True,
         )
-    except Exception:
+    except Exception:  # noqa: S110 (best-effort cleanup)
         pass
 
 
@@ -532,7 +530,7 @@ async def test_build_context_embedding_failure_returns_empty(
         monkeypatch, exc=EmbeddingError("rate limit exhausted")
     )
     tenant = tenant_factory
-    kb = await _make_kb(tenant_id=tenant.id, slug="kb-embed-fail")
+    _kb = await _make_kb(tenant_id=tenant.id, slug="kb-embed-fail")
 
     rag = RAGService()
     ctx = await rag.build_context_for_query(

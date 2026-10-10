@@ -63,20 +63,19 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import select
 
 from agent import simple_responder as simple_responder_module
-from agent.simple_responder import RAGService, SimpleResponder
+from agent.simple_responder import RAGService
 from channel.enums import ChannelStatus, ChannelType
 from channel.inbound import process_inbound_envelope
 from channel.models import Channel
 from channel.repository import ChannelRepository
-from conversation.enums import ConversationStatus, MessageRole
-from conversation.models import Conversation, Message
+from conversation.enums import MessageRole
+from conversation.models import Message
 from conversation.repository import ConversationRepository, MessageRepository
 from core.database import get_session
 from core.id_gen import new_id
@@ -145,10 +144,9 @@ def _reset_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
     targets the test's empty connection table rather than a
     cross-test singleton.
     """
+    import channel.inbound as inbound_module
     from core.database import reset_engine, reset_sessionmaker
     from core.qdrant import reset_qdrant_client
-
-    import channel.inbound as inbound_module
     from widget.ws import manager as ws_manager_module
     from widget.ws import router as ws_router_module
 
@@ -425,7 +423,7 @@ def _install_stub_llm(
         # self._llm_client_factory(...)`` raises TypeError.
         _async_factory_returning(llm),
     )
-    return llm if isinstance(llm, _CapturingLLM) else llm  # type: ignore[return-value]
+    return llm if isinstance(llm, _CapturingLLM) else llm  # type: ignore[return-value]  # noqa: RUF034
 
 
 def _async_factory_returning(client: object) -> Any:
@@ -469,7 +467,7 @@ async def _delete_qdrant_points_for_article(*, article_id: str) -> None:
             points_selector=flt,
             wait=True,
         )
-    except Exception:
+    except Exception:  # noqa: S110 (best-effort cleanup, exception is non-actionable)
         pass
 
 

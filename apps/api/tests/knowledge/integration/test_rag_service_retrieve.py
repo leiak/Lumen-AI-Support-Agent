@@ -18,13 +18,10 @@ counts only (per the M1 PII contract).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator
 
 import pytest
 from qdrant_client.http import models as qmodels
 
-from channel.repository import ChannelRepository
-from channel.enums import ChannelStatus, ChannelType
 from core.database import get_session
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -44,7 +41,6 @@ from knowledge.worker import index_article
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-
 
 # ============================================================================
 # Fixtures / helpers
@@ -138,7 +134,7 @@ async def _delete_qdrant_points_for_article(*, article_id: str) -> None:
             points_selector=flt,
             wait=True,
         )
-    except Exception:  # best-effort
+    except Exception:  # best-effort  # noqa: S110
         pass
 
 

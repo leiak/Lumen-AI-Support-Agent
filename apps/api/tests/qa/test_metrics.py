@@ -30,7 +30,7 @@ def _counter_value(metric: Any, **labels: str) -> float:
     else:
         # Unlabelled metric (LUMEN_QA_FLAGGED).
         child = metric
-    return child._value.get()  # type: ignore[attr-defined]  # noqa: SLF001
+    return child._value.get()  # type: ignore[attr-defined]
 
 
 def test_lumen_qa_scores_increments() -> None:

@@ -13,8 +13,9 @@ def test_settings_has_no_default_tenant_id_field(
     the assertion holds even if a future refactor renames, aliases, or
     otherwise re-introduces the field under another name.
     """
-    from core.config import Settings
     import inspect
+
+    from core.config import Settings
 
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:y@localhost:5432/z")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")

@@ -19,6 +19,8 @@ Auth (M4.C follow-up, M4.D does not regress):
 """
 from __future__ import annotations
 
+from datetime import UTC
+
 import pytest
 from httpx import AsyncClient
 
@@ -410,9 +412,9 @@ async def test_get_credits_as_super_admin_returns_list(
 
         # Resolve the current UTC period so the query matches the rows the
         # POSTs just wrote.
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        current_period = datetime.now(timezone.utc).strftime("%Y-%m")
+        current_period = datetime.now(UTC).strftime("%Y-%m")
 
         resp = await async_client.get(
             f"/api/v1/admin/tenants/{tenant.id}/credits?period={current_period}",
@@ -574,19 +576,19 @@ async def test_get_usage_breakdown_cross_tenant_returns_404(
 
 
 __all__ = [
-    "test_post_creates_budget_row",
-    "test_post_upserts_existing_row",
+    "test_cleanup_endpoint_requires_jwt_auth",
+    "test_get_credits_as_per_tenant_admin_returns_404",
+    "test_get_credits_as_super_admin_returns_list",
     "test_get_returns_current_budget",
+    "test_get_usage_breakdown_cross_tenant_returns_404",
     "test_get_usage_returns_period_and_tokens_used",
     "test_get_usage_unknown_tenant_returns_404",
-    "test_post_without_token_returns_401",
-    "test_post_with_cross_tenant_admin_returns_404",
-    "test_cleanup_endpoint_requires_jwt_auth",
-    "test_post_credits_as_super_admin_returns_201",
-    "test_post_credits_as_per_tenant_admin_returns_404",
-    "test_get_credits_as_super_admin_returns_list",
-    "test_get_credits_as_per_tenant_admin_returns_404",
     "test_get_usage_with_breakdown_true_includes_breakdown",
     "test_get_usage_without_breakdown_omits_breakdown",
-    "test_get_usage_breakdown_cross_tenant_returns_404",
+    "test_post_creates_budget_row",
+    "test_post_credits_as_per_tenant_admin_returns_404",
+    "test_post_credits_as_super_admin_returns_201",
+    "test_post_upserts_existing_row",
+    "test_post_with_cross_tenant_admin_returns_404",
+    "test_post_without_token_returns_401",
 ]

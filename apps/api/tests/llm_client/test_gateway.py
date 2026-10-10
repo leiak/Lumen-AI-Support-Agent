@@ -83,7 +83,7 @@ def test_gateway_with_config_raises_for_unknown_provider() -> None:
         g.with_config(provider="openai", model="gpt-4o")
 
 
-def test_gateway_resolve_propagates_UnknownModelError() -> None:
+def test_gateway_resolve_propagates_UnknownModelError() -> None:  # noqa: N802
     a = _stub("anthropic")
     g = LLMGateway(providers={"anthropic": a}, default_provider_name="openai")
     with pytest.raises(UnknownModelError):
@@ -116,7 +116,6 @@ def test_gateway_providers_property_is_read_only_view() -> None:
 @pytest.mark.asyncio
 async def test_gateway_aclose_all_skips_provider_without_aclose() -> None:
     """A provider stub without an ``aclose`` method must not raise."""
-    from unittest.mock import create_autospec
     a = _stub("anthropic")
     # Strip aclose from one stub to exercise the getattr(..., None) branch
     if hasattr(a, "aclose"):

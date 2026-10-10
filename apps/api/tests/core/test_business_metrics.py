@@ -13,14 +13,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from conversation.enums import MessageRole as ConvMessageRole
+from conversation.repository import ConversationRepository, MessageRepository
+from conversation.service import ConversationService
 from core.business_metrics import (
     LLM_CALLS_TOTAL,
     LLM_TOKENS_TOTAL,
     MESSAGES_TOTAL,
 )
-from conversation.enums import MessageRole as ConvMessageRole
-from conversation.repository import ConversationRepository, MessageRepository
-from conversation.service import ConversationService
 from llm_client.client import LLMClient
 from llm_client.exceptions import ProviderUnavailable, RateLimited
 from llm_client.gateway import LLMGateway
@@ -44,7 +44,7 @@ def _counter_value(metric: Any, **labels: str) -> float:
     else:
         # Unlabelled metric (none in this module, but symmetric).
         child = metric
-    return child._value.get()  # type: ignore[attr-defined]  # noqa: SLF001
+    return child._value.get()  # type: ignore[attr-defined]
 
 
 # ---- Shared fixture: factory that wraps a fake provider in a gateway

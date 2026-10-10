@@ -19,19 +19,17 @@ credentials.
 """
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
-
 import pytest
 from cryptography.fernet import Fernet
 from pytest_httpx import HTTPXMock
 
 from agent import llm_factory as llm_factory_module
 from agent.llm_factory import _default_llm_client_factory
-from budget.resolver import BudgetResolver, _current_period
 from budget.repository import (
     TenantBudgetRepository,
     TenantBudgetSnapshotRepository,
 )
+from budget.resolver import BudgetResolver, _current_period
 from llm_client.exceptions import TenantBudgetExceeded
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import TenantLLMConfigRepository
@@ -39,7 +37,6 @@ from llm_client.types import ChatMessage, ChatRequest, MessageRole
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -359,6 +356,6 @@ async def test_e2e_month_rollover_resets_budget(
 
 __all__ = [
     "test_e2e_cap_blocks_provider_http",
-    "test_e2e_tenant_without_budget_passes_through",
     "test_e2e_month_rollover_resets_budget",
+    "test_e2e_tenant_without_budget_passes_through",
 ]

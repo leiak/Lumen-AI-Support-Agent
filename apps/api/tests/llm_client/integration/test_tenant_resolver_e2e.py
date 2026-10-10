@@ -42,7 +42,6 @@ from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -296,7 +295,7 @@ async def test_e2e_tenant_key_isolation(
 
 
 __all__ = [
+    "test_e2e_tenant_key_isolation",
     "test_e2e_tenant_key_used_in_anthropic_request",
     "test_e2e_tenant_not_configured_returns_error",
-    "test_e2e_tenant_key_isolation",
 ]

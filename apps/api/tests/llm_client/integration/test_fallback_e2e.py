@@ -19,7 +19,6 @@ from llm_client.exceptions import (
 from llm_client.gateway import LLMGateway
 from llm_client.providers.anthropic_provider import AnthropicProvider
 from llm_client.providers.openai_provider import OpenAIProvider
-from llm_client.resolvers import FallbackResolver
 from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
 

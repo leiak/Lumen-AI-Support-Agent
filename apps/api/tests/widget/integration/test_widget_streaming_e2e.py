@@ -168,7 +168,7 @@ async def test_widget_client_receives_streamed_message_deltas_then_complete(monk
         # Each delta must carry the conversation id and its chunk of text.
         # The iframe uses ``conversation_id`` as the streaming-bubble key
         # because the row id does not exist yet mid-stream.
-        for delta, expected_text in zip(deltas, chunks):
+        for delta, expected_text in zip(deltas, chunks, strict=False):
             assert delta["conversation_id"] == "conv_stream_1"
             assert delta["text"] == expected_text
 
@@ -237,7 +237,7 @@ async def test_widget_client_handles_streaming_callback_failure_gracefully(
                 # uses in nodes.py:358-366.
                 try:
                     await on_delta(chunk)
-                except Exception:
+                except Exception:  # noqa: S110 (user handlers must not break streaming)
                     pass
         return AgentResponse(content_text="".join(chunks), role=MessageRole.AI)
 

@@ -11,8 +11,8 @@ Revision ID: 14_kb_multimodal
 Revises: 13_email_thread
 Create Date: 2026-09-20
 """
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "14_kb_multimodal"
 down_revision = "13_email_thread"

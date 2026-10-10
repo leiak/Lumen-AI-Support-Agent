@@ -13,13 +13,19 @@ class TestTransitions:
         assert transition(TicketStatus.NEW, TicketStatus.CANCELLED) == TicketStatus.CANCELLED
 
     def test_triaged_to_in_progress(self):
-        assert transition(TicketStatus.TRIAGED, TicketStatus.IN_PROGRESS) == TicketStatus.IN_PROGRESS
+        assert transition(
+            TicketStatus.TRIAGED, TicketStatus.IN_PROGRESS
+        ) == TicketStatus.IN_PROGRESS
 
     def test_in_progress_to_waiting_customer(self):
-        assert transition(TicketStatus.IN_PROGRESS, TicketStatus.WAITING_CUSTOMER) == TicketStatus.WAITING_CUSTOMER
+        assert transition(
+            TicketStatus.IN_PROGRESS, TicketStatus.WAITING_CUSTOMER
+        ) == TicketStatus.WAITING_CUSTOMER
 
     def test_waiting_customer_back_to_in_progress(self):
-        assert transition(TicketStatus.WAITING_CUSTOMER, TicketStatus.IN_PROGRESS) == TicketStatus.IN_PROGRESS
+        assert transition(
+            TicketStatus.WAITING_CUSTOMER, TicketStatus.IN_PROGRESS
+        ) == TicketStatus.IN_PROGRESS
 
     def test_in_progress_to_resolved(self):
         assert transition(TicketStatus.IN_PROGRESS, TicketStatus.RESOLVED) == TicketStatus.RESOLVED

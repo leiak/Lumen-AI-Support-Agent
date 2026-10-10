@@ -16,11 +16,12 @@ Coverage:
 from __future__ import annotations
 
 import pytest
+from httpx import AsyncClient
+from sqlalchemy import select
+
 from core.database import get_sessionmaker
 from core.id_gen import new_id
-from httpx import AsyncClient
 from knowledge.models import Article, KbArticleDraft
-from sqlalchemy import select
 from tenant.models import Tenant
 from tests.admin.conftest import auth_headers
 

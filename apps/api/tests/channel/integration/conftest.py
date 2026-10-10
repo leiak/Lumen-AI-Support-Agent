@@ -31,7 +31,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from channel.enums import ChannelStatus, ChannelType
@@ -45,7 +44,6 @@ from core.database import (
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-
 
 # ---------------------------------------------------------------------------
 # Singleton reset (autouse)
@@ -81,7 +79,7 @@ async def async_client() -> AsyncIterator[AsyncClient]:
     application graph when running the rest of the suite (which uses
     per-suite sliced apps).
     """
-    from main import app  # noqa: PLC0415 — import-after-fixture for fast collection
+    from main import app
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

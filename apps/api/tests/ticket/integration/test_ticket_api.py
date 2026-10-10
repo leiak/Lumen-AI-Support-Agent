@@ -26,18 +26,15 @@ PII discipline:
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
 
 from conversation.repository import ConversationRepository
 from core.database import get_session
 from ticket.enums import TicketStatus
-from ticket.models import Ticket, TicketEvent
-
+from ticket.models import Ticket
 
 # ===========================================================================
 # GET /api/v1/tickets/{id}
@@ -229,7 +226,7 @@ async def test_get_events_returns_ordered_desc(
     assert len(body) >= 2
     timestamps = [e["created_at"] for e in body]
     # DESC: each timestamp must be >= the next.
-    for a, b in zip(timestamps, timestamps[1:]):
+    for a, b in zip(timestamps, timestamps[1:], strict=False):  # noqa: RUF007
         assert a >= b, f"events not in DESC order: {timestamps!r}"
 
 

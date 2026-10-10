@@ -4,8 +4,8 @@ Revision ID: 13_email_thread
 Revises: 12_ticket_tables
 Create Date: 2026-09-19
 """
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 revision = "13_email_thread"
 down_revision = "12_ticket_tables"

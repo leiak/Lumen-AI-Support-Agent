@@ -43,7 +43,7 @@ def _all_depends(dep_func) -> list:
     hints = get_type_hints(dep_func, include_extras=True)
     sig = inspect.signature(dep_func)
     deps: list = []
-    for name, param in sig.parameters.items():
+    for name, _param in sig.parameters.items():
         if name not in hints:
             continue
         ann = hints[name]
@@ -100,7 +100,7 @@ def test_get_ticket_service_does_not_inject_session_directly() -> None:
     ``get_sessionmaker()()`` *inside* the generator body, never
     via Depends.
     """
-    from core.database import get_session  # noqa: F401 — referenced only
+    from core.database import get_session
 
     deps = _all_depends(get_ticket_service)
     offending = [d for d in deps if d.dependency is get_session]

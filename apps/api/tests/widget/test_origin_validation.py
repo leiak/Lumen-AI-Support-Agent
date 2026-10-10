@@ -31,7 +31,8 @@ from channel.repository import ChannelRepository
 from core.config import reset_settings
 from core.id_gen import new_id
 from widget.tokens import create_widget_token
-from widget.ws.router import is_origin_allowed, router as ws_router
+from widget.ws.router import is_origin_allowed
+from widget.ws.router import router as ws_router
 
 # Snapshot the real ``is_origin_allowed`` at import time. The widget
 # test conftest later replaces it with a permissive test-only helper;
@@ -68,7 +69,6 @@ def _patch_origins(monkeypatch: pytest.MonkeyPatch) -> None:
     The default in ``Settings`` is fine, but using an explicit list here
     makes assertions about the result unambiguous.
     """
-    from core.config import Settings
 
     monkeypatch.setenv(
         "WIDGET_ALLOWED_ORIGINS_GLOBAL",

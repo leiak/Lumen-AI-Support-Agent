@@ -322,15 +322,15 @@ async def test_delete_removes_provider_config(
 
 
 __all__ = [
+    "test_delete_removes_provider_config",
+    "test_get_returns_404_for_unknown_tenant",
+    "test_get_returns_provider_names_without_keys",
+    "test_get_with_cross_tenant_admin_returns_404",
+    "test_get_without_token_returns_401",
+    "test_patch_toggles_enabled_preserves_key",
     "test_post_creates_row_with_encrypted_key",
     "test_post_upserts_existing_row",
-    "test_get_returns_provider_names_without_keys",
-    "test_get_returns_404_for_unknown_tenant",
-    "test_post_without_token_returns_401",
-    "test_post_with_non_admin_token_returns_403",
     "test_post_with_cross_tenant_admin_returns_404",
-    "test_get_without_token_returns_401",
-    "test_get_with_cross_tenant_admin_returns_404",
-    "test_patch_toggles_enabled_preserves_key",
-    "test_delete_removes_provider_config",
+    "test_post_with_non_admin_token_returns_403",
+    "test_post_without_token_returns_401",
 ]

@@ -8,8 +8,9 @@ Tests that need a cross-tenant probe override ``get_by_id`` to return
 ``None`` (anti-enumeration parity with the repo's own cross-tenant
 behavior).
 """
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.service import TicketNotFound, TicketService

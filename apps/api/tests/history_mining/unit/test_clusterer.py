@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from history_mining.clusterer import Cluster, HdbscanClusterer
+from history_mining.clusterer import HdbscanClusterer
 
 
 def test_cluster_finds_well_separated_groups() -> None:

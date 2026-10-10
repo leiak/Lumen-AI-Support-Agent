@@ -10,7 +10,7 @@ is granted.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -45,7 +45,7 @@ async def test_grant_inserts_row_with_current_utc_period() -> None:
     assert credit.tokens == 500
     assert credit.note == "Q4 promo"
     assert credit.granted_by == "super-uid"
-    assert credit.period == datetime.now(timezone.utc).strftime("%Y-%m")
+    assert credit.period == datetime.now(UTC).strftime("%Y-%m")
     assert credit.id  # ULID is non-empty
     session.add.assert_called_once()
     session.flush.assert_awaited_once()

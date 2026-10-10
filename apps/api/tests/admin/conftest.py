@@ -20,15 +20,14 @@ forces re-instantiation when the env changes.
 """
 from __future__ import annotations
 
-import os
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 
 from auth.jwt import create_access_token
-from cryptography.fernet import Fernet
 from core.config import reset_settings
 from core.database import get_session, get_sessionmaker, reset_engine, reset_sessionmaker
 from tenant.enums import TenantPlan
@@ -62,7 +61,7 @@ def _ensure_fernet_key(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 async def async_client() -> AsyncIterator[AsyncClient]:
     """Yield an httpx ``AsyncClient`` wired to the FULL FastAPI app."""
-    from main import app  # noqa: PLC0415 — import-after-fixture for fast collection
+    from main import app
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

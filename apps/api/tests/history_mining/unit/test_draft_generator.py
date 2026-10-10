@@ -104,7 +104,7 @@ async def test_generate_uses_factory_when_no_client_provided():
 
 def test_kbdraft_model_validates_lengths() -> None:
     """Pydantic model rejects over-length title/body."""
-    with pytest.raises(Exception):  # PydanticValidationError or ValueError
+    with pytest.raises(Exception):  # PydanticValidationError or ValueError  # noqa: B017
         KBDraft(title="x" * 201, body="b", suggested_tags=[])
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         KBDraft(title="t", body="x" * 2001, suggested_tags=[])

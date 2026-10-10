@@ -34,7 +34,6 @@ from llm_client.providers.anthropic_provider import AnthropicProvider
 from llm_client.providers.openai_provider import OpenAIProvider
 from llm_client.types import ChatMessage, ChatRequest, MessageRole
 
-
 # --- Fixtures ---------------------------------------------------------------
 
 

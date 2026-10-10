@@ -15,10 +15,8 @@ emitted JSON log line.
 """
 from __future__ import annotations
 
-import json
 import re
 import sys
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -79,7 +77,7 @@ def test_structlog_emits_request_id_in_handler_logs(capsys: pytest.CaptureFixtur
 
         log = get_logger("test.request_context")
         log.info("stage11.smoke", marker="hello")
-        captured = capsys.readouterr().err + capsys.readouterr().out
+        _captured = capsys.readouterr().err + capsys.readouterr().out
     finally:
         clear_request_context()
 

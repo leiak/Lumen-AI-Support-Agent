@@ -356,7 +356,7 @@ async def _delete_qdrant_points_for_article(*, article_id: str) -> None:
             points_selector=flt,
             wait=True,
         )
-    except Exception:
+    except Exception:  # noqa: S110
         # Best-effort cleanup; a transient Qdrant error during
         # teardown shouldn't fail the test that just passed.
         pass
@@ -387,7 +387,7 @@ async def test_retrieve_top_k_returns_relevant_chunks_first(
     tenant = tenant_factory
 
     kb = await _make_kb(tenant_id=tenant.id, slug="kb-weather")
-    weather_art, weather_ver = await _make_article_and_version(
+    weather_art, _weather_ver = await _make_article_and_version(
         tenant_id=tenant.id,
         knowledge_base_id=kb.id,
         title="Weather Report",

@@ -58,4 +58,4 @@ async def db_session() -> AsyncIterator[Any]:
         yield session
 
 
-__all__ = ["sample_tenant", "db_session"]
+__all__ = ["db_session", "sample_tenant"]

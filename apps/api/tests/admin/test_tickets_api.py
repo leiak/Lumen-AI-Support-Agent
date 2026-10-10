@@ -34,7 +34,6 @@ from tests.admin.conftest import auth_headers
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import Ticket
 
-
 # ---------------------------------------------------------------------------
 # Tenant-table cleanup helper.
 #
@@ -78,7 +77,7 @@ async def _safe_delete_tenant(tenant_id: str) -> None:
 @pytest.fixture(autouse=True)
 async def _cleanup_sample_tenant_after_test(
     sample_tenant: Tenant, request: pytest.FixtureRequest
-) -> AsyncIterator[None]:
+) -> AsyncIterator[None]:  # noqa: F821
     """After each test, robustly delete the sample tenant + its tickets.
 
     Replaces the default ``_delete_tenant`` cleanup path which can

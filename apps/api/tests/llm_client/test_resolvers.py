@@ -88,7 +88,7 @@ def test_prefix_resolver_falls_back_to_default_for_unknown_prefix() -> None:
     assert r(req) is anthropic
 
 
-def test_prefix_resolver_raises_UnknownModelError_when_no_default() -> None:
+def test_prefix_resolver_raises_UnknownModelError_when_no_default() -> None:  # noqa: N802
     minimax = _stub_provider("minimax")
     r = _PrefixResolver(
         providers={"minimax": minimax},

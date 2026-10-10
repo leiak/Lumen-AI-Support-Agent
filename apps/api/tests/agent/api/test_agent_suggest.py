@@ -794,7 +794,7 @@ async def test_suggest_does_not_change_conversation_state(
             **kwargs: Any,
         ) -> Any:
             mutating_calls.append(__name)
-            return await real_method(self, *args, **kwargs)
+            return await real_method(self, *args, **kwargs)  # noqa: B023
 
         monkeypatch.setattr(
             service_module.ConversationService, name, spy
@@ -1513,7 +1513,7 @@ def test_suggestion_service_constructor_defaults() -> None:
 def test_suggestion_service_constructor_overrides() -> None:
     """Constructor accepts injected deps for tests."""
     custom_rag = MagicMock()
-    custom_factory: Callable[[str], Any] = lambda _t: MagicMock()
+    custom_factory: Callable[[str], Any] = lambda _t: MagicMock()  # noqa: E731
     custom_conv = MagicMock()
     svc = SuggestionService(
         conv_service=custom_conv,

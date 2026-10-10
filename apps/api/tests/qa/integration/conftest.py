@@ -45,7 +45,6 @@ from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
 
-
 # ---------------------------------------------------------------------------
 # Singleton reset (autouse)
 # ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 """Tests for S3-compatible object store (M2.B / Stage 17)."""
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
-from knowledge.multimodal.storage import S3ObjectStore, ObjectStoreError
+
+from knowledge.multimodal.storage import S3ObjectStore
 
 
 @pytest.fixture
@@ -10,7 +12,7 @@ def store():
         endpoint="http://localhost:9000",
         bucket="test-bucket",
         access_key="ak",
-        secret_key="sk",
+        secret_key="sk",  # noqa: S106
         region="us-east-1",
     )
 
@@ -90,17 +92,17 @@ def test_get_url_returns_cdn_style(store):
 
 
 def test_get_url_for_real_s3_when_no_endpoint():
-    """Real AWS S3 (no ``endpoint_url``) → virtual-hosted–style URL.
+    """Real AWS S3 (no ``endpoint_url``) -> virtual-hosted-style URL.  # noqa: RUF002
 
     Defends against the production crash where ``meta.endpoint_url`` is
     ``None`` (real AWS, no override) and ``rstrip("/")`` would raise
     ``AttributeError``. The fallback builds the canonical S3 URL.
     """
     store = S3ObjectStore(
-        endpoint=None,  # No endpoint → real AWS S3
+        endpoint=None,  # No endpoint -> real AWS S3
         bucket="prod-bucket",
         access_key="ak",
-        secret_key="sk",
+        secret_key="sk",  # noqa: S106
         region="us-west-2",
     )
     url = store.get_url("kb/img.png")

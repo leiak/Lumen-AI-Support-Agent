@@ -75,7 +75,7 @@ def test_health_ready_returns_503_when_dependencies_down() -> None:
     """
     with patch("core.health.check_postgres", return_value={"status": "error", "error": "pg dead"}), \
          patch("core.health.check_redis", return_value={"status": "error", "error": "redis dead"}), \
-         patch("core.health.check_qdrant", return_value={"status": "error", "error": "qd dead"}):
+         patch("core.health.check_qdrant", return_value={"status": "error", "error": "qd dead"}):  # noqa: E501
         response = client.get("/health/ready")
     assert response.status_code == 503
     body = response.json()

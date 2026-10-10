@@ -1,9 +1,13 @@
 """Tests for Doubao vision embedder (M2.B / Stage 17)."""
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 import pytest_asyncio
-from unittest.mock import patch, AsyncMock, MagicMock
+
 from knowledge.multimodal.embedder import (
-    DoubaoVisionEmbedder, VisionEmbedder, EmbeddingResult,
+    DoubaoVisionEmbedder,
+    EmbeddingResult,
+    VisionEmbedder,
 )
 
 
@@ -48,8 +52,14 @@ async def test_encode_retries_on_5xx(embedder):
         nonlocal call_count
         call_count += 1
         if call_count < 3:
-            raise httpx.HTTPStatusError("503", request=MagicMock(), response=MagicMock(status_code=503))
-        return {"data": [{"embedding": [0.0] * 1024}], "model": "m", "usage": {"prompt_tokens": 0, "total_tokens": 0}}
+            raise httpx.HTTPStatusError(
+                "503", request=MagicMock(), response=MagicMock(status_code=503)
+            )
+        return {
+            "data": [{"embedding": [0.0] * 1024}],
+            "model": "m",
+            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+        }
 
     with patch.object(embedder, "_post", side_effect=fake_post):
         result = await embedder.encode(b"bytes", mime_type="image/png")
@@ -166,13 +176,11 @@ async def test_voyage_encode_sends_inputs_shape():
 
 def test_factory_returns_doubao_by_default():
     """Default vision_provider is doubao."""
+    from core.config import Settings
     from knowledge.multimodal.embedder import (
         DoubaoVisionEmbedder,
-        OpenAIVisionEmbedder,
-        VoyageVisionEmbedder,
         get_vision_embedder,
     )
-    from core.config import Settings
 
     settings = Settings()
     embedder = get_vision_embedder(settings)
@@ -180,11 +188,11 @@ def test_factory_returns_doubao_by_default():
 
 
 def test_factory_returns_openai_clip_for_clip_provider():
+    from core.config import Settings
     from knowledge.multimodal.embedder import (
         OpenAIVisionEmbedder,
         get_vision_embedder,
     )
-    from core.config import Settings
 
     # pydantic-settings v2 with ``alias=`` honors kwargs only via the
     # alias name (unless populate_by_name is enabled). Pass the alias
@@ -198,8 +206,8 @@ def test_factory_returns_openai_clip_for_clip_provider():
 
 
 def test_factory_returns_voyage_for_voyage_provider():
-    from knowledge.multimodal.embedder import VoyageVisionEmbedder, get_vision_embedder
     from core.config import Settings
+    from knowledge.multimodal.embedder import VoyageVisionEmbedder, get_vision_embedder
 
     settings = Settings(
         VISION_PROVIDER="voyage",
@@ -210,8 +218,8 @@ def test_factory_returns_voyage_for_voyage_provider():
 
 
 def test_factory_raises_on_unknown_provider():
-    from knowledge.multimodal.embedder import get_vision_embedder
     from core.config import Settings
+    from knowledge.multimodal.embedder import get_vision_embedder
 
     # ``vision_provider`` is a Literal so Settings() rejects an unknown
     # value at construction. Force the attribute to simulate a config
