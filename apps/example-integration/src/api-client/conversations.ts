@@ -1,16 +1,30 @@
 import { config } from '../shared/config.js';
 
+// Mirrors backend `agent.schemas.ConversationOut` — the agent workspace
+// shape returned by GET /api/v1/agents/queue and POST .../claim. Field
+// names match Pydantic serialization (snake_case).
 export interface QueueItem {
-  conversation_id: string;
+  id: string;
+  tenant_id: string;
+  channel_id: string;
   customer_external_id: string;
-  last_message_preview?: string;
+  status: 'open' | 'pending' | 'closed';
+  assigned_agent_id: string | null;
+  ai_handling: boolean;
   opened_at: string;
+  last_activity_at: string;
 }
 
+// Mirrors backend `conversation.schemas.MessageOut` — the message shape
+// returned by GET /api/v1/conversations/{id}/messages and POST .../messages.
+// `role` is a StrEnum on the backend with values
+// `customer | agent | ai | system | tool`.
 export interface MessageItem {
   id: string;
-  role: 'customer' | 'assistant' | 'agent';
+  conversation_id: string;
+  role: 'customer' | 'agent' | 'ai' | 'system' | 'tool';
   content_text: string;
+  sender_id: string | null;
   created_at: string;
 }
 
@@ -19,19 +33,27 @@ export async function fetchQueue(token: string): Promise<QueueItem[]> {
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!resp.ok) throw new Error(`queue fetch failed: ${resp.status} ${await resp.text()}`);
-  return (await resp.json()) as QueueItem[];
+  const body = (await resp.json()) as { items: QueueItem[] };
+  return body.items;
 }
 
-export async function claimConversation(token: string, conversationId: string): Promise<void> {
-  const resp = await fetch(`${config.apiBaseUrl}/api/v1/agents/claim`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
+// Mirrors backend `agent.api.claim_conversation` — POST
+// /api/v1/agents/conversations/{conversation_id}/claim with no body.
+// Returns the updated ConversationOut so the caller can read the
+// freshly-set `assigned_agent_id` without a refetch.
+export async function claimConversation(
+  token: string,
+  conversationId: string,
+): Promise<QueueItem> {
+  const resp = await fetch(
+    `${config.apiBaseUrl}/api/v1/agents/conversations/${conversationId}/claim`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
     },
-    body: JSON.stringify({ conversation_id: conversationId }),
-  });
+  );
   if (!resp.ok) throw new Error(`claim failed: ${resp.status} ${await resp.text()}`);
+  return (await resp.json()) as QueueItem;
 }
 
 export async function postReply(
@@ -65,6 +87,6 @@ export async function listMessages(
     },
   );
   if (!resp.ok) throw new Error(`messages fetch failed: ${resp.status} ${await resp.text()}`);
-  const body = (await resp.json()) as { messages?: MessageItem[] };
-  return body.messages ?? [];
+  const body = (await resp.json()) as { items: MessageItem[] };
+  return body.items;
 }

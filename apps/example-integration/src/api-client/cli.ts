@@ -55,9 +55,9 @@ const USAGE = `Usage: tsx src/api-client/cli.ts <command> [args]
 Commands:
   login                          POST /auth/login with demo creds
   queue                          GET /agents/queue (PENDING conversations)
-  claim <conv_id>                POST /agents/claim
+  claim <conv_id>                POST /agents/conversations/{id}/claim
   reply <conv_id> <text>         POST /conversations/{id}/messages
-  suggest <conv_id>              POST /agents/suggest-reply
+  suggest <conv_id>              POST /agents/conversations/{id}/suggest-reply
   messages <conv_id>             GET /conversations/{id}/messages
 `;
 

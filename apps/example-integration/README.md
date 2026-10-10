@@ -91,6 +91,8 @@ Browser (5173)                CLI                          Fastify (4567)
   Widget SDK      →     api-client/cli.ts           →   webhook-sender/server.ts
   POST /widget/token      POST /auth/login                POST /channel/feishu/webhook/:app_id
   WS   /widget/ws         GET  /agents/queue              (X-Lark-Signature)
+                          POST /agents/conversations/:id/claim
+                          POST /agents/conversations/:id/suggest-reply
                           POST /conversations/:id/messages
                                   ↓
                           Lumen API at :8000
