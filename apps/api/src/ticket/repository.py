@@ -27,7 +27,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.id_gen import new_id
@@ -133,6 +133,61 @@ class TicketRepository:
             ticket.closed_at = closed_at
         await self.session.flush()
         return ticket
+
+    async def list_by_tenant(
+        self,
+        tenant_id: str,
+        *,
+        status: TicketStatus | None = None,
+        priority: TicketPriority | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Ticket]:
+        """List tickets for ``tenant_id``, newest-first, with optional filters.
+
+        Tenant-scoped at the query site — no inline tenant check needed
+        in the route (mirrors the other repos in this codebase). Used
+        by the admin ``GET /api/v1/admin/tenants/{tid}/tickets``
+        listing endpoint (Task 1.1).
+
+        ``status`` and ``priority`` are optional WHERE clauses; both
+        ``None`` means "no filter". Returned rows are ordered by
+        ``created_at DESC`` so the SPA can render the latest activity
+        first.
+        """
+        stmt = select(Ticket).where(Ticket.tenant_id == tenant_id)
+        if status is not None:
+            stmt = stmt.where(Ticket.status == status)
+        if priority is not None:
+            stmt = stmt.where(Ticket.priority == priority)
+        stmt = (
+            stmt.order_by(Ticket.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars())
+
+    async def count_by_tenant(
+        self,
+        tenant_id: str,
+        *,
+        status: TicketStatus | None = None,
+        priority: TicketPriority | None = None,
+    ) -> int:
+        """Count tickets for ``tenant_id`` matching the same filters as :meth:`list_by_tenant`.
+
+        Returned alongside the page in :class:`TicketListRead.total`
+        so the SPA can render a paginator without a second round-trip.
+        """
+        stmt = select(func.count(Ticket.id)).where(
+            Ticket.tenant_id == tenant_id
+        )
+        if status is not None:
+            stmt = stmt.where(Ticket.status == status)
+        if priority is not None:
+            stmt = stmt.where(Ticket.priority == priority)
+        return int((await self.session.execute(stmt)).scalar_one())
 
     async def list_events(
         self, ticket_id: str, *, tenant_id: str

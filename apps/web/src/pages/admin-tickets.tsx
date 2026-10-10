@@ -6,6 +6,7 @@ import { ArrowUpRight } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { useCurrentUser } from '@/lib/use-current-user';
 import {
   DEFAULT_TICKET_FILTERS,
   fetchTickets,
@@ -131,6 +132,8 @@ function formatDateTime(iso: string | null): string {
  */
 export function AdminTicketsPage(): JSX.Element {
   const navigate = useNavigate();
+  const { user } = useCurrentUser();
+  const tenantId = user?.tenant_id ?? '';
   const [statusFilter, setStatusFilter] = useState<TicketStatus | null>(
     DEFAULT_TICKET_FILTERS.status,
   );
@@ -141,8 +144,9 @@ export function AdminTicketsPage(): JSX.Element {
   const filters: TicketFilters = { status: statusFilter, priority: priorityFilter };
 
   const ticketsQuery = useQuery({
-    queryKey: ticketsQueryKey(filters),
-    queryFn: () => fetchTickets(filters),
+    queryKey: ticketsQueryKey(tenantId, filters),
+    queryFn: () => fetchTickets(tenantId, filters),
+    enabled: Boolean(tenantId),
   });
 
   const tickets = ticketsQuery.data ?? [];

@@ -8,12 +8,24 @@ import { AxiosError } from 'axios';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { apiClient, JWT_STORAGE_KEY } from '@/lib/api-client';
 import type * as ApiClient from '@/lib/api-client';
+import { useCurrentUser } from '@/lib/use-current-user';
+import type * as UseCurrentUser from '@/lib/use-current-user';
 
 vi.mock('@/lib/api-client', async () => {
   const actual = await vi.importActual<typeof ApiClient>('@/lib/api-client');
   return {
     ...actual,
     apiClient: { get: vi.fn(), post: vi.fn() },
+  };
+});
+
+vi.mock('@/lib/use-current-user', async () => {
+  const actual = await vi.importActual<typeof UseCurrentUser>(
+    '@/lib/use-current-user',
+  );
+  return {
+    ...actual,
+    useCurrentUser: vi.fn(),
   };
 });
 
@@ -29,6 +41,13 @@ vi.mock('react-router-dom', async () => {
 
 const mockedGet = vi.mocked(apiClient.get);
 const mockedPost = vi.mocked(apiClient.post);
+const mockedUseCurrentUser = vi.mocked(useCurrentUser);
+
+// Demo tenant ULID used in the URL path of the new admin list endpoint
+// (GET /api/v1/admin/tenants/{tenant_id}/tickets). Must match the
+// ``tenant_id`` field below in the mock so the test exercises a
+// single-tenant, authenticated happy path.
+const DEMO_TENANT_ID = '01HZDEMO00000000000000000';
 
 function makeQueryClient(): QueryClient {
   return new QueryClient({
@@ -64,7 +83,7 @@ function renderList(initialEntry = '/admin/tickets'): {
 const sampleTickets = [
   {
     id: '01HZTCK0000000000000001',
-    tenant_id: 'demo',
+    tenant_id: DEMO_TENANT_ID,
     conversation_id: '01HZCV00000000000000001',
     subject: 'Production API returning 503s intermittently',
     category: 'outage',
@@ -80,7 +99,7 @@ const sampleTickets = [
   },
   {
     id: '01HZTCK0000000000000002',
-    tenant_id: 'demo',
+    tenant_id: DEMO_TENANT_ID,
     conversation_id: '01HZCV00000000000000002',
     subject: 'Duplicate charge on invoice #INV-2026-09',
     category: 'billing',
@@ -96,7 +115,7 @@ const sampleTickets = [
   },
   {
     id: '01HZTCK0000000000000003',
-    tenant_id: 'demo',
+    tenant_id: DEMO_TENANT_ID,
     conversation_id: '01HZCV00000000000000003',
     subject: 'How to issue a partial refund',
     category: 'how-to',
@@ -112,10 +131,30 @@ const sampleTickets = [
   },
 ];
 
+/** Envelope wrapping ``sampleTickets`` for the new admin list endpoint. */
+function envelope(items = sampleTickets, total?: number) {
+  return { data: { items, total: total ?? items.length } };
+}
+
 beforeEach(() => {
   window.localStorage.setItem(JWT_STORAGE_KEY, 'test-token');
   mockedGet.mockReset();
   mockedPost.mockReset();
+  // Default useCurrentUser implementation: returns the demo tenant so
+  // ``fetchTickets`` can construct the admin list URL path. Individual
+  // tests can override via ``mockedUseCurrentUser.mockImplementation``.
+  mockedUseCurrentUser.mockReset();
+  mockedUseCurrentUser.mockReturnValue({
+    user: {
+      user_id: '01HZDEMO00000000000000001',
+      email: 'admin@demo.test',
+      tenant_id: DEMO_TENANT_ID,
+      tenant_name: 'Demo Tenant',
+      role: 'admin',
+    },
+    isLoading: false,
+    isError: false,
+  });
   vi.mocked(useNavigate).mockReturnValue(vi.fn());
 });
 
@@ -127,8 +166,9 @@ afterEach(() => {
 
 describe('AdminTicketsPage', () => {
   it('renders the table with rows on success', async () => {
-    // Primary path: admin list endpoint exists and returns the array.
-    mockedGet.mockResolvedValue({ data: { tickets: sampleTickets } });
+    // Primary path: admin list endpoint returns the envelope shape
+    // ``{items, total}`` (Task 1.1). All three rows render.
+    mockedGet.mockResolvedValue(envelope());
 
     renderList();
 
@@ -140,60 +180,30 @@ describe('AdminTicketsPage', () => {
     expect(screen.getByText('Production API returning 503s intermittently')).toBeInTheDocument();
   });
 
-  it('falls back to the client-side join when the admin list endpoint 404s', async () => {
-    // First call: admin list endpoint 404s.
-    const notFound = new AxiosError('Not Found');
-    notFound.response = {
-      status: 404,
-      data: { detail: 'Not Found' },
-      statusText: 'Not Found',
-      headers: {},
-      config: {} as never,
-    };
-    mockedGet.mockRejectedValueOnce(notFound);
-    // Second call: conversation list (used by the fallback path).
-    // The fallback calls fetchConversations, which validates each row
-    // with ConversationSchema — so we must return FULL conversation
-    // objects, not just ids.
-    const convRows = sampleTickets.map((t) => ({
-      id: t.conversation_id,
-      tenant_id: t.tenant_id,
-      channel_id: '01HZCHAN0000000000000000',
-      customer_external_id: `customer-for-${t.id}`,
-      status: 'open' as const,
-      assigned_agent_id: t.assignee_agent_id,
-      ai_handling: false,
-      opened_at: t.created_at,
-      last_activity_at: t.updated_at,
-    }));
-    mockedGet.mockResolvedValueOnce({ data: { items: convRows } });
-    // Then per-conversation ticket lookups. The first two return 404
-    // (no ticket under those ids) and the third returns a ticket —
-    // exercising the "skip 404" branch.
-    for (let i = 0; i < sampleTickets.length - 1; i++) {
-      const err = new AxiosError('Not Found');
-      err.response = {
-        status: 404,
-        data: { detail: 'ticket not found' },
-        statusText: 'Not Found',
-        headers: {},
-        config: {} as never,
-      };
-      mockedGet.mockRejectedValueOnce(err);
-    }
-    mockedGet.mockResolvedValueOnce({ data: sampleTickets[0] });
+  it('renders 2 tickets when the endpoint returns a 2-row envelope', async () => {
+    // Targeted assertion for the new endpoint: the SPA must render
+    // exactly the rows the backend returns (no client-side join
+    // fallback). Mirrors the live demo seed shape (1 P0 NEW + 1 P1
+    // TRIAGED).
+    const twoTickets = [sampleTickets[0], sampleTickets[1]];
+    mockedGet.mockResolvedValue(envelope(twoTickets, 2));
 
     renderList();
 
     await waitFor(() => {
       expect(screen.getByTestId('ticket-row-01HZTCK0000000000000001')).toBeInTheDocument();
     });
-    // The other two rows should NOT be present (skipped on 404).
-    expect(screen.queryByTestId('ticket-row-01HZTCK0000000000000002')).not.toBeInTheDocument();
+    expect(screen.getByTestId('ticket-row-01HZTCK0000000000000002')).toBeInTheDocument();
+    expect(screen.queryByTestId('ticket-row-01HZTCK0000000000000003')).not.toBeInTheDocument();
   });
 
   it('filters by status — selecting "in_progress" leaves only the matching row', async () => {
-    mockedGet.mockResolvedValue({ data: { tickets: sampleTickets } });
+    // First request (no filter): all 3 rows.
+    mockedGet.mockResolvedValueOnce(envelope());
+    // After filter change: server-side filter returns only the P0
+    // in_progress row.
+    const filtered = [sampleTickets[0]];
+    mockedGet.mockResolvedValueOnce(envelope(filtered, 1));
 
     renderList();
 
@@ -216,7 +226,10 @@ describe('AdminTicketsPage', () => {
   });
 
   it('filters by priority', async () => {
-    mockedGet.mockResolvedValue({ data: { tickets: sampleTickets } });
+    // First request: all 3 rows. After filter: only the P2 row.
+    mockedGet.mockResolvedValueOnce(envelope());
+    const filtered = [sampleTickets[2]];
+    mockedGet.mockResolvedValueOnce(envelope(filtered, 1));
     renderList();
 
     await waitFor(() => {
@@ -236,7 +249,7 @@ describe('AdminTicketsPage', () => {
   });
 
   it('navigates to the detail page when a row is clicked', async () => {
-    mockedGet.mockResolvedValue({ data: { tickets: sampleTickets } });
+    mockedGet.mockResolvedValue(envelope());
 
     const { navigate } = renderList();
 
@@ -266,7 +279,7 @@ describe('AdminTicketsPage', () => {
   });
 
   it('renders the empty state when the list resolves to []', async () => {
-    mockedGet.mockResolvedValue({ data: { tickets: [] } });
+    mockedGet.mockResolvedValue(envelope([], 0));
 
     renderList();
 
@@ -283,9 +296,31 @@ describe('AdminTicketsPage', () => {
     renderList();
 
     expect(screen.getByTestId('tickets-loading')).toBeInTheDocument();
-    resolve({ data: { tickets: [] } });
+    resolve(envelope([], 0));
     await waitFor(() =>
       expect(screen.queryByTestId('tickets-loading')).not.toBeInTheDocument(),
     );
+  });
+
+  it('does not fetch when useCurrentUser has no user (loading skeleton stays)', async () => {
+    // When the caller's JWT is missing or invalid, useCurrentUser
+    // returns ``user: null`` and the page never calls fetchTickets
+    // (the query is ``enabled: Boolean(tenantId)``). The page stays
+    // in the loading state because no result has been resolved.
+    mockedUseCurrentUser.mockReturnValue({
+      user: null,
+      isLoading: false,
+      isError: false,
+    });
+    // Even if fetchTickets were called, it would reject — but with
+    // ``enabled: false`` the query is never fired, so no network
+    // call lands on the mock.
+    mockedGet.mockRejectedValue(new Error('not authenticated'));
+
+    renderList();
+
+    // Loading skeleton stays; no error banner.
+    expect(screen.getByTestId('tickets-loading')).toBeInTheDocument();
+    expect(screen.queryByTestId('tickets-error')).not.toBeInTheDocument();
   });
 });

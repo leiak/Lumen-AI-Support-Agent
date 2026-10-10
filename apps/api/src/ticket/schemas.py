@@ -10,6 +10,9 @@ Three response / request shapes:
 * :class:`TicketEventOut` — one audit-log row returned by the events
   endpoint.
 
+Tier 1 Task 1.1 adds :class:`TicketListRead` (envelope for the admin
+ticket-list endpoint: ``{items, total}``).
+
 PII discipline
 --------------
 
@@ -98,4 +101,22 @@ class SlaPolicyRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
-__all__ = ["TicketOut", "TicketTransitionIn", "TicketEventOut", "SlaPolicyRead"]
+class TicketListRead(BaseModel):
+    """Envelope for the admin ticket list endpoint (Task 1.1).
+
+    ``total`` is the count of rows matching the filter (ignoring
+    limit/offset) so the SPA can render a paginator. Mirrors the
+    M4.D budget ``TenantBudgetUsageRead`` envelope shape.
+    """
+
+    items: list[TicketOut]
+    total: int
+
+
+__all__ = [
+    "SlaPolicyRead",
+    "TicketEventOut",
+    "TicketListRead",
+    "TicketOut",
+    "TicketTransitionIn",
+]

@@ -36,25 +36,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-
-from auth.dependencies import require_admin
-from core.database import get_sessionmaker
-from core.id_gen import new_id
-from knowledge.enums import ArticleSourceType, ArticleStatus
-from knowledge.models import (
-    Article,
-    ArticleVersion,
-    KbArticleDraft,
-    KnowledgeBase,
-)
-from ticket.models import SlaPolicy
-from ticket.schemas import SlaPolicyRead
 
 from admin.repository import (
     AdminTenantBudgetRepository,
@@ -74,12 +61,26 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
 )
+from auth.dependencies import require_admin
 from budget.cleanup import run_budget_cleanup
 from budget.credits import CreditService
 from budget.per_model import PerModelService, get_per_model_cache
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
+from core.database import get_sessionmaker
+from core.id_gen import new_id
+from knowledge.enums import ArticleSourceType, ArticleStatus
+from knowledge.models import (
+    Article,
+    ArticleVersion,
+    KbArticleDraft,
+    KnowledgeBase,
+)
 from tenant.repository import TenantRepository
+from ticket.enums import TicketPriority, TicketStatus
+from ticket.models import SlaPolicy
+from ticket.repository import TicketRepository
+from ticket.schemas import SlaPolicyRead, TicketListRead, TicketOut
 
 logger = logging.getLogger(__name__)
 
@@ -321,7 +322,7 @@ async def approve_kb_draft(
         # Promote the draft.
         draft.status = "APPROVED"
         draft.published_article_id = article_id
-        draft.reviewed_at = datetime.now(timezone.utc)
+        draft.reviewed_at = datetime.now(UTC)
         draft.reviewed_by = reviewer_id
 
         await session.commit()
@@ -377,7 +378,7 @@ async def reject_kb_draft(
             )
 
         draft.status = "REJECTED"
-        draft.reviewed_at = datetime.now(timezone.utc)
+        draft.reviewed_at = datetime.now(UTC)
         draft.reviewed_by = reviewer_id
         await session.commit()
 
@@ -869,6 +870,95 @@ async def list_credits(
     return CreditListResponse(
         credits=[CreditResponse.model_validate(r) for r in rows],
         total_tokens=total,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 Task 1.1 — Admin ticket list endpoint.
+#
+# GET /api/v1/admin/tenants/{tenant_id}/tickets
+#   List the tenant's tickets, newest-first. Optional filters:
+#     * status    — exact match (one of the 7 TicketStatus values)
+#     * priority  — exact match (one of P0/P1/P2/P3)
+#     * limit     — page size, 1..200, default 50
+#     * offset    — page offset, >= 0, default 0
+#   Response is a ``TicketListRead`` envelope: ``{items, total}``.
+#
+# Tenant-scoped on the WHERE clause; JWT tenant check at the boundary
+# is the standard anti-enumeration mirror of the budget / kb-drafts /
+# llm-configs routes above. Returns 404 (NOT 403) when ``claims.tenant_id``
+# does not match the path tenant — cross-tenant probing yields the
+# same status code as a missing / unknown tenant.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/tickets",
+    response_model=TicketListRead,
+)
+async def list_tenant_tickets(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    status: str | None = Query(
+        None,
+        description="Filter by ticket status (e.g. 'new', 'triaged', 'resolved')",
+    ),
+    priority: str | None = Query(
+        None,
+        description="Filter by priority (one of P0/P1/P2/P3)",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> TicketListRead:
+    """List tickets for the tenant, newest-first.
+
+    Returns a ``TicketListRead`` envelope (``items`` + ``total``) so
+    the SPA can render a paginator without an extra round-trip. Both
+    ``status`` and ``priority`` are optional; ``None`` means
+    "no filter". The same filter set is applied to the count query
+    so ``total`` reflects what the user sees on the current filter.
+
+    Auth: admin JWT required. Cross-tenant access returns 404
+    (anti-enumeration) — mirrors the rest of this module.
+
+    Status codes
+    ------------
+    * 200 — list (possibly empty) of tickets + total count.
+    * 401 — missing / invalid bearer token (raised by ``require_admin``).
+    * 403 — token is not admin / owner role (raised by ``require_admin``).
+    * 404 — ``claims['tenant_id']`` != path ``tenant_id`` (anti-enumeration).
+    * 422 — ``status`` / ``priority`` not a valid enum value, or
+      ``limit`` / ``offset`` out of range (Pydantic / FastAPI Query).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: don't reveal that the target tenant exists
+        # to an admin of a different tenant. Same response as a real
+        # unknown tenant — matches the llm-configs + budget + sla-policies
+        # routes above.
+        raise HTTPException(status_code=404, detail="not found")
+    # Parse enum query params inside the route body so a malformed
+    # value surfaces as a clean 422 from Pydantic instead of a 500
+    # from the enum() call.
+    status_enum = TicketStatus(status) if status else None
+    priority_enum = TicketPriority(priority) if priority else None
+    sm = get_sessionmaker()
+    async with sm() as session:
+        repo = TicketRepository(session)
+        items = await repo.list_by_tenant(
+            tenant_id,
+            status=status_enum,
+            priority=priority_enum,
+            limit=limit,
+            offset=offset,
+        )
+        total = await repo.count_by_tenant(
+            tenant_id,
+            status=status_enum,
+            priority=priority_enum,
+        )
+    return TicketListRead(
+        items=[TicketOut.model_validate(t) for t in items],
+        total=total,
     )
 
 

@@ -1,8 +1,6 @@
-import { AxiosError } from 'axios';
 import { z } from 'zod';
 
 import { apiClient } from '@/lib/api-client';
-import { fetchConversations } from '@/lib/conversations';
 
 // Backend shapes (verified against `apps/api/src/ticket/{api.py,schemas.py,enums.py,state_machine.py}`):
 //
@@ -39,19 +37,12 @@ import { fetchConversations } from '@/lib/conversations';
 // next-state buttons. CLOSED and CANCELLED are terminal — no outbound
 // transitions. RESOLVED can reopen back to IN_PROGRESS.
 //
-// List endpoint note (2026-10): the backend does NOT expose
-// `GET /api/v1/tickets` and the admin `GET /api/v1/admin/tickets` does
-// not exist. The conversation inbox endpoint (`/api/v1/conversations/inbox`)
-// is agent-scoped and the admin conversation list does NOT return
-// ``ticket_id`` on each row. So a clean client-side join by
-// ``conversation_id`` is not possible from the public API surface today.
-//
-// The implementation below therefore attempts a hypothetical admin list
-// endpoint first (`/api/v1/admin/tickets`) and falls back to a best-effort
-// client-side join via the admin conversation list (a 404 on the ticket
-// detail endpoint is treated as "no ticket" and silently skipped). The
-// page renders the empty state when neither path produces data — see the
-// return summary for the full discussion.
+// List endpoint note (Tier 1 Task 1.1, 2026-10-10): the admin
+// `GET /api/v1/admin/tenants/{tenant_id}/tickets` endpoint now
+// exists. `fetchTickets` calls it directly — the legacy client-side
+// join via the admin conversation list (which usually produced an
+// empty list because the conversation_id ULID is NOT the ticket_id
+// ULID) has been removed.
 export const TicketStatusSchema = z.enum([
   'new',
   'triaged',
@@ -110,6 +101,19 @@ export const TicketEventSchema = z.object({
   created_at: z.string(),
 });
 export type TicketEvent = z.infer<typeof TicketEventSchema>;
+
+/**
+ * Envelope schema for the admin ticket list endpoint
+ * (GET /api/v1/admin/tenants/{tenant_id}/tickets).
+ *
+ * ``items`` mirrors ``TicketSchema``; ``total`` is the unpaginated
+ * row count for the current filter so the SPA can render a paginator
+ * without a second round-trip.
+ */
+export const TicketListSchema = z.object({
+  items: z.array(TicketSchema),
+  total: z.number().int().nonnegative(),
+});
 
 /**
  * Filter shape for the admin tickets list. Both fields accept `null` to
@@ -195,116 +199,54 @@ interface FetchTicketsOptions {
 /**
  * List tickets for the admin workspace.
  *
- * Implementation note: there is no `GET /api/v1/tickets` list endpoint on
- * the backend. The admin conversation list (`/api/v1/conversations`)
- * does not return `ticket_id` per row, so a clean client-side join by
- * `conversation_id` is not possible from the current public surface.
+ * Calls `GET /api/v1/admin/tenants/{tenant_id}/tickets?status=&priority=&limit=&offset=`
+ * and returns the items array from the response envelope. The
+ * envelope's ``total`` field is the unpaginated row count for the
+ * current filter so the SPA can render a paginator.
  *
- * Strategy:
- *   1. Try `GET /api/v1/admin/tickets` (admin list, not yet implemented
- *      on the server). 200 → use the response directly.
- *   2. On 404, fall back to "load all admin conversations" and attempt
- *      `GET /api/v1/tickets/{conversation_id}` per row. 404s are
- *      silently skipped (a conversation without a ticket yields no
- *      result, which is the right behaviour). Tickets returned are
- *      then filtered client-side.
- *   3. Any other error bubbles up to the caller.
- *
- * The fallback will usually produce an empty list in production (the
- * ticket_id and conversation_id ULIDs are different). When the admin
- * list endpoint is added server-side, no client changes will be needed.
+ * Implementation note (Tier 1 Task 1.1, 2026-10-10): previously this
+ * function attempted `GET /api/v1/admin/tickets` first and fell back
+ * to a best-effort client-side join via the admin conversation list
+ * (the conversation_id ULID is not the ticket_id ULID, so the join
+ * was usually empty). The fallback was removed because the real
+ * per-tenant admin list endpoint now exists server-side.
  */
 export async function fetchTickets(
+  tenantId: string,
   filters: TicketFilters = DEFAULT_TICKET_FILTERS,
-  options: FetchTicketsOptions = {},
+  _options: FetchTicketsOptions = {},
 ): Promise<Ticket[]> {
-  const { tryAdminList = true } = options;
-  if (tryAdminList) {
-    try {
-      const { data } = await apiClient.get('/api/v1/admin/tickets', {
-        params: buildListParams(filters),
-      });
-      const parsed = z
-        .object({ tickets: z.array(TicketSchema) })
-        .safeParse(data);
-      if (parsed.success) {
-        return applyClientFilters(parsed.data.tickets, filters);
-      }
-    } catch (err) {
-      if (!(err instanceof AxiosError) || err.response?.status !== 404) {
-        throw err;
-      }
-      // 404 — fall through to the client-side join below.
-    }
+  if (!tenantId) {
+    throw new Error('not authenticated');
   }
-  return fetchTicketsViaConversations(filters);
-}
-
-/**
- * Fallback path: load all admin conversations (limited, best-effort)
- * and try to load a ticket per row by conversation_id. Filters the
- * result client-side.
- *
- * This is best-effort only. The conversation_id ULID is NOT the
- * ticket_id ULID in general, so most calls will 404. The function
- * exists so the page renders gracefully today and starts working
- * "for free" the moment the admin list endpoint is shipped.
- */
-async function fetchTicketsViaConversations(
-  filters: TicketFilters,
-): Promise<Ticket[]> {
-  const list = await fetchConversations({ status: null, search: '' });
-  const candidates = list.items;
-  const tickets: Ticket[] = [];
-  for (const conv of candidates) {
-    try {
-      const ticket = await fetchTicket(conv.id);
-      tickets.push(ticket);
-    } catch (err) {
-      if (err instanceof AxiosError && err.response?.status === 404) {
-        // No ticket attached to this conversation (or IDs differ).
-        // Skip — this is the expected outcome for the majority of
-        // conversations until the admin list endpoint ships.
-        continue;
-      }
-      // Anything else (5xx, network) is a real failure — surface it
-      // to the caller so the page can render its error state.
-      throw err;
-    }
-  }
-  return applyClientFilters(tickets, filters);
-}
-
-function buildListParams(filters: TicketFilters): Record<string, string> {
-  const params: Record<string, string> = {};
+  const params: Record<string, string> = { limit: '50', offset: '0' };
   if (filters.status) params.status = filters.status;
   if (filters.priority) params.priority = filters.priority;
-  return params;
-}
-
-function applyClientFilters(
-  tickets: readonly Ticket[],
-  filters: TicketFilters,
-): Ticket[] {
-  return tickets.filter((t) => {
-    if (filters.status && t.status !== filters.status) return false;
-    if (filters.priority && t.priority !== filters.priority) return false;
-    return true;
-  });
+  const { data } = await apiClient.get(
+    `/api/v1/admin/tenants/${tenantId}/tickets`,
+    { params },
+  );
+  const parsed = TicketListSchema.parse(data);
+  return parsed.items;
 }
 
 /**
  * Build a stable cache key for the admin tickets list. Encodes the
  * filter shape so cache partitions cleanly per filter combination. The
- * `'list'` discriminator prevents the detail page's
+ * ``'list'`` discriminator prevents the detail page's
  * ``['admin', 'tickets', ticketId]`` key from being invalidated by
- * sibling mutations.
+ * sibling mutations. ``tenantId`` is included so a stale entry from
+ * a previous session (different tenant) is partitioned off.
  */
-export function ticketsQueryKey(filters: TicketFilters): readonly unknown[] {
+export function ticketsQueryKey(
+  tenantId: string,
+  filters: TicketFilters,
+): readonly unknown[] {
   return [
     'admin',
     'tickets',
     'list',
+    tenantId,
     filters.status ?? 'all',
     filters.priority ?? 'all',
   ] as const;
