@@ -12,6 +12,8 @@ from tenant.enums import TenantPlan, TenantStatus, UserRole
 from tenant.models import Tenant
 from tenant.repository import UserRepository
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def seeded_tenant_user():

@@ -19,6 +19,8 @@ from sqlalchemy import inspect
 
 from core.database import get_engine
 
+pytestmark = pytest.mark.integration
+
 
 def _inspect_schema(table_name: str) -> dict:
     """Single async hop: collect table existence, columns, indexes, and checks."""

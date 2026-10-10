@@ -13,6 +13,8 @@ from sqlalchemy import inspect
 
 from core.database import get_engine
 
+pytestmark = pytest.mark.integration
+
 
 def _columns_for(table_name: str) -> dict[str, dict]:
     """Return a ``{column_name: column_dict}`` mapping for ``table_name``.

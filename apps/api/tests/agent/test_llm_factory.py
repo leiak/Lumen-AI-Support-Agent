@@ -22,6 +22,7 @@ pytest-asyncio runs these under ``auto`` mode (see
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -44,6 +45,22 @@ def _fake_cache_with_resolver(resolver: object) -> MagicMock:
     return fake_cache
 
 
+@contextmanager
+def _patch_budget_repo_none() -> MagicMock:
+    """Patch ``TenantBudgetRepository.get_by_tenant`` to return ``None``.
+
+    M4.D added a budget lookup in the factory; without this patch the
+    factory hits the real DB and the test fails on ConnectionRefusedError
+    in CI. Returning ``None`` disables the BudgetResolver wrap and lets
+    the factory return the inner resolver directly.
+    """
+    with patch(
+        "agent.llm_factory.TenantBudgetRepository"
+    ) as mock_repo_cls:
+        mock_repo_cls.return_value.get_by_tenant = AsyncMock(return_value=None)
+        yield mock_repo_cls
+
+
 async def test_factory_returns_llm_client_with_cached_resolver() -> None:
     """Factory returns ``LLMClient`` wired to the cache's resolver.
 
@@ -55,7 +72,8 @@ async def test_factory_returns_llm_client_with_cached_resolver() -> None:
     fake_resolver = MagicMock(name="cached-resolver")
     fake_cache = _fake_cache_with_resolver(fake_resolver)
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         client = await _default_llm_client_factory("t-test")
 
     assert isinstance(client, LLMClient)
@@ -80,13 +98,13 @@ async def test_factory_preserves_tenant_id_for_distinct_calls() -> None:
     with patch(
         "agent.llm_factory._build_tenant_cache",
         return_value=_fake_cache_with_resolver(fake_resolver_a),
-    ):
+    ), _patch_budget_repo_none():
         client_a = await _default_llm_client_factory("tenant-abc")
     # Second call, different tenant
     with patch(
         "agent.llm_factory._build_tenant_cache",
         return_value=_fake_cache_with_resolver(fake_resolver_b),
-    ):
+    ), _patch_budget_repo_none():
         client_b = await _default_llm_client_factory("tenant-xyz")
 
     assert client_a.tenant_id == "tenant-abc"
@@ -114,7 +132,8 @@ async def test_factory_raises_tenant_not_configured() -> None:
         )
     )
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         with pytest.raises(TenantLlmNotConfigured) as excinfo:
             await _default_llm_client_factory("t-empty")
 
@@ -144,7 +163,8 @@ async def test_factory_increments_metric_on_not_configured() -> None:
         )
     )
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         with pytest.raises(TenantLlmNotConfigured):
             await _default_llm_client_factory("t-metric")
 
@@ -164,7 +184,8 @@ async def test_factory_does_not_increment_metric_on_success() -> None:
 
     before = LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL._value.get()  # type: ignore[attr-defined]
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         client = await _default_llm_client_factory("t-ok")
 
     after = LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL._value.get()  # type: ignore[attr-defined]

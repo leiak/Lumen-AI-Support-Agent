@@ -6,7 +6,7 @@ Designed to be idempotent + batch-safe (LIMIT 10000 per transaction).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import insert
@@ -17,8 +17,9 @@ from budget.repository import TenantBudgetSnapshotRepository
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from tenant.enums import TenantPlan
-from tenant.models import Tenant
 from tenant.repository import TenantRepository
+
+pytestmark = pytest.mark.integration
 
 
 async def _seed_snapshot(period: str, tenant_id: str | None = None) -> str:
@@ -46,7 +47,7 @@ async def test_cleanup_keeps_recent_periods() -> None:
     """Snapshots within the retention window are NOT deleted."""
     # 2026-09 is 13 months ago from 2026-11 (test date is dynamic — we use
     # "current period minus 6 months" to be safely recent).
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     recent = now.strftime("%Y-%m")
     # 6 months back
     y, m = now.year, now.month - 6
@@ -62,7 +63,7 @@ async def test_cleanup_keeps_recent_periods() -> None:
     assert "deleted_rows" in stats
     assert "cutoff_period" in stats
     # Both rows must survive (retention default = 13 months)
-    srepo = TenantBudgetSnapshotRepository()
+    _srepo = TenantBudgetSnapshotRepository()
     # The IDs we created must still exist
     assert stats["deleted_rows"] >= 0
 
@@ -90,8 +91,8 @@ async def test_cleanup_batches_at_10000() -> None:
 
     The UNIQUE(tenant_id, period) constraint means we cannot insert
     25001 rows with the same (tenant_id, period). Seed across 425
-    tenants × 60 distinct periods = 25500 unique rows (well past
-    25001). All periods are old (2020-01..2024-12) so every row is
+    tenants * 60 distinct periods = 25500 unique rows (well past
+    25001). All periods are old (2020-01..2024-12) so every row is  # noqa: RUF002
     strictly less than any reasonable cutoff (current_month - 13).
     """
     # 60 distinct periods across 2020-2024 (all comfortably old).
@@ -134,7 +135,7 @@ async def test_cleanup_batches_at_10000() -> None:
 async def test_cleanup_idempotent() -> None:
     """Running cleanup twice → second run returns deleted_rows=0."""
     await _seed_snapshot("2024-03")
-    first = await run_budget_cleanup()
+    _first = await run_budget_cleanup()
     second = await run_budget_cleanup()
     # Second run is a no-op (no rows older than cutoff now)
     assert second["deleted_rows"] == 0

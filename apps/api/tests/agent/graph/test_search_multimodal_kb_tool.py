@@ -47,11 +47,21 @@ def _mock_doubao_vision_config() -> Iterator[None]:
     tool to skip the image-query placeholder entirely. We want
     to exercise the path that actually queries the image
     collection, so we set a non-empty key here.
+
+    Also sets ``vision_provider="doubao"`` because
+    :func:`MultimodalRetriever._search_image` reads
+    ``get_settings().vision_provider`` to pick the Qdrant
+    collection name; a MagicMock attribute would otherwise
+    stringify to "<MagicMock ...>" and break the collection
+    lookup (raising inside the image-search ``except`` branch,
+    which then suppresses the second ``query_points`` call the
+    test asserts on).
     """
     settings = MagicMock()
     settings.doubao_vision_api_key = "fake-vision-key"
     settings.doubao_vision_base_url = "https://fake"
     settings.doubao_vision_model = "doubao-embedding-vision"
+    settings.vision_provider = "doubao"
     with patch("core.config.get_settings", return_value=settings):
         yield
 
@@ -155,9 +165,11 @@ async def test_tool_passes_zero_vector_image_query_when_vision_configured(
     text_call = by_collection.get("article_chunks")
     assert text_call is not None
     assert text_call["query"] == [0.1] * 1024
-    # The image search uses ``kb_image_vectors`` and receives
-    # a 1024-dim zero vector (the placeholder).
-    image_call = by_collection.get("kb_image_vectors")
+    # The image search uses ``kb_image_vectors_doubao`` (provider-
+    # scoped collection; see ``_PROVIDER_COLLECTION_NAMES`` in
+    # ``knowledge.startup``) and receives a 1024-dim zero vector
+    # (the placeholder).
+    image_call = by_collection.get("kb_image_vectors_doubao")
     assert image_call is not None
     assert image_call["query"] == [0.0] * 1024
     assert len(image_call["query"]) == 1024

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import ClassVar
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -152,6 +153,7 @@ def _disable_rate_limit(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_lookup_tenant_returns_tenant_for_existing_user(monkeypatch) -> None:
     _disable_rate_limit(monkeypatch)
     tenant_id, email = seeded_single_user()
@@ -165,6 +167,7 @@ def test_lookup_tenant_returns_tenant_for_existing_user(monkeypatch) -> None:
     assert body["tenant_name"] == f"Acme-{tenant_id[:8]}"
 
 
+@pytest.mark.integration
 def test_lookup_tenant_returns_nulls_for_unknown_email(monkeypatch) -> None:
     _disable_rate_limit(monkeypatch)
     seeded_single_user()
@@ -180,6 +183,7 @@ def test_lookup_tenant_returns_nulls_for_unknown_email(monkeypatch) -> None:
     assert body == {"tenant_id": None, "tenant_name": None}
 
 
+@pytest.mark.integration
 def test_lookup_tenant_response_is_identical_shape_for_hit_and_miss(
     monkeypatch,
 ) -> None:
@@ -208,6 +212,7 @@ def test_lookup_tenant_response_is_identical_shape_for_hit_and_miss(
     assert set(hit_resp.json().keys()) == {"tenant_id", "tenant_name"}
 
 
+@pytest.mark.integration
 def test_lookup_tenant_does_not_log_email(monkeypatch, caplog) -> None:
     """PII: the email must NEVER appear in any log record.
 
@@ -229,6 +234,7 @@ def test_lookup_tenant_does_not_log_email(monkeypatch, caplog) -> None:
     assert leaked == [], "email leaked into a log record"
 
 
+@pytest.mark.integration
 def test_lookup_tenant_invalidates_malformed_email(monkeypatch) -> None:
     """422 from FastAPI for missing @ — anti-enumeration does NOT mean we
     have to accept obviously broken input; this is just normal input
@@ -241,6 +247,7 @@ def test_lookup_tenant_invalidates_malformed_email(monkeypatch) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.integration
 def test_lookup_tenant_handles_multi_tenant_users_with_same_email(
     monkeypatch,
 ) -> None:
@@ -255,6 +262,7 @@ def test_lookup_tenant_handles_multi_tenant_users_with_same_email(
     assert body["tenant_id"] == lower_id
 
 
+@pytest.mark.integration
 def test_lookup_tenant_rate_limit_triggers_after_threshold(
     monkeypatch,
 ) -> None:
@@ -280,6 +288,7 @@ def test_lookup_tenant_rate_limit_triggers_after_threshold(
     assert resp.status_code == 429
 
 
+@pytest.mark.integration
 def test_lookup_tenant_inactive_user_returns_nulls(monkeypatch) -> None:
     """An inactive user must NOT resolve to a tenant — the lookup is for
     active, login-eligible accounts only."""

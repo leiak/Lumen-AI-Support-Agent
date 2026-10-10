@@ -13,6 +13,8 @@ from llm_client.tenant_config_models import (
 from tenant.enums import TenantPlan
 from tenant.repository import TenantRepository
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture
 def cipher() -> TenantLLMConfigCipher:
@@ -61,6 +63,7 @@ async def test_unique_constraint_per_tenant_provider(cipher: TenantLLMConfigCiph
     assert cipher.decrypt(second.encrypted_api_key) == "sk-second"
     # Direct INSERT bypassing upsert should fail
     from sqlalchemy import insert
+
     from core.database import get_sessionmaker
     sm = get_sessionmaker()
     async with sm() as session:

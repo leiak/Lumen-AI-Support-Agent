@@ -22,12 +22,27 @@ not-configured paths.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from agent.llm_factory import _default_llm_client_factory
 from llm_client.exceptions import TenantLlmNotConfigured
+
+
+@contextmanager
+def _patch_budget_repo_none():
+    """Patch ``TenantBudgetRepository.get_by_tenant`` to return ``None``.
+
+    M4.D added a budget lookup in the factory; without this patch the
+    factory hits the real DB and the test fails on ConnectionRefusedError
+    in CI. Returning ``None`` disables the BudgetResolver wrap and lets
+    the factory return the inner resolver directly.
+    """
+    with patch("agent.llm_factory.TenantBudgetRepository") as mock_repo_cls:
+        mock_repo_cls.return_value.get_by_tenant = AsyncMock(return_value=None)
+        yield mock_repo_cls
 
 
 async def test_factory_uses_tenant_resolver() -> None:
@@ -44,7 +59,8 @@ async def test_factory_uses_tenant_resolver() -> None:
     # returning a real resolver here simulates a cache hit.
     fake_cache.get.return_value = fake_resolver
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         client = await _default_llm_client_factory(tenant_id="t1")
 
     assert client.tenant_id == "t1"
@@ -82,7 +98,8 @@ async def test_factory_raises_tenant_not_configured() -> None:
         )
     )
 
-    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache):
+    with patch("agent.llm_factory._build_tenant_cache", return_value=fake_cache), \
+         _patch_budget_repo_none():
         with pytest.raises(TenantLlmNotConfigured) as excinfo:
             await _default_llm_client_factory(tenant_id="t1")
 

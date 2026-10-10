@@ -1,12 +1,11 @@
 """Tests for TenantBudgetRepository + TenantBudgetSnapshotRepository."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import delete, insert
+from sqlalchemy import insert
 
-from budget.models import TenantBudget, TenantBudgetSnapshot
 from budget.repository import TenantBudgetRepository, TenantBudgetSnapshotRepository
 from core.database import get_sessionmaker
 from core.id_gen import new_id
@@ -14,6 +13,8 @@ from llm_client.models import LLMUsage
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
+
+pytestmark = pytest.mark.integration
 
 
 async def test_budget_upsert_creates_row() -> None:
@@ -60,7 +61,7 @@ async def test_snapshot_set_tokens_used_accepts_soft_warn_fired_at() -> None:
     """Pack A #4: set_tokens_used optionally writes soft_warn_fired_at."""
     tenant = await TenantRepository().create(name="Budget Soft Warn", plan=TenantPlan.PRO)
     repo = TenantBudgetSnapshotRepository()
-    fired_at = datetime(2026, 10, 15, 12, 30, tzinfo=timezone.utc)
+    fired_at = datetime(2026, 10, 15, 12, 30, tzinfo=UTC)
     snap = await repo.set_tokens_used(
         tenant_id=tenant.id, period="2026-10",
         tokens_used=500, soft_warn_fired_at=fired_at,
@@ -99,7 +100,7 @@ async def test_snapshot_refresh_sums_llm_usage() -> None:
     snap = await repo.refresh(
         tenant_id=tenant.id,
         period="2026-10",
-        period_starts_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        period_starts_at=datetime(2026, 10, 1, tzinfo=UTC),
     )
     assert snap.tokens_used == 450  # 100+50 + 200+100
 
@@ -154,21 +155,20 @@ async def test_snapshot_refresh_acquires_advisory_lock() -> None:
     # statement. We look for any SQL containing 'pg_advisory' inside
     # the refresh() coroutine.
     lock_seen = False
-    original_execute = None
-    from sqlalchemy import text
+    _original_execute = None
 
     class _LockDetectingSession:
         """Wraps a Session and records whether pg_advisory was called."""
 
-        def __init__(self, inner):  # noqa: ANN001
+        def __init__(self, inner):
             self._inner = inner
 
-        def __getattr__(self, name: str) -> object:  # noqa: ANN204
+        def __getattr__(self, name: str) -> object:
             # Delegate all unknown attributes (begin, commit, refresh, ...)
             # to the wrapped session so the SUT sees a normal AsyncSession.
             return getattr(self._inner, name)
 
-        async def execute(self, stmt, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        async def execute(self, stmt, *args, **kwargs):
             nonlocal lock_seen
             sql_str = str(stmt)
             if "pg_advisory" in sql_str:
@@ -184,7 +184,7 @@ async def test_snapshot_refresh_acquires_advisory_lock() -> None:
             return _LockDetectingCtx(real_sm())
 
     class _LockDetectingCtx:
-        def __init__(self, inner):  # noqa: ANN001
+        def __init__(self, inner):
             self._inner = inner
 
         async def __aenter__(self):
@@ -200,7 +200,7 @@ async def test_snapshot_refresh_acquires_advisory_lock() -> None:
         await repo.refresh(
             tenant_id=tenant.id,
             period="2026-10",
-            period_starts_at=datetime(2026, 10, 1, tzinfo=timezone.utc),
+            period_starts_at=datetime(2026, 10, 1, tzinfo=UTC),
         )
     finally:
         repo_module.get_sessionmaker = real_sm  # type: ignore[assignment]
