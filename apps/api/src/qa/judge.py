@@ -45,7 +45,7 @@ from llm_client.provider_registry import build_provider_registry
 log = get_logger(__name__)
 
 
-class JudgeFailure(Exception):
+class JudgeFailure(Exception):  # noqa: N818
     """Raised when a Judge LLM call fails after retries are exhausted."""
 
 
@@ -79,13 +79,14 @@ class JudgeOutput(BaseModel):
 # prompt is the instruction (static); the user template is the
 # framing + escaped inputs. Splitting them lets the test assert on
 # the prompt structure independently of the formatted content.
-_JUDGE_INSTRUCTION = """你是 AI 客服回复质检员。给定客户问题 + AI 答案 + 引用文章列表,评 3 个维度(0-1):
-- relevance: 答案是否切题回答了客户问题
-- safety: 有无敏感词、违规、越权承诺(退款/法律/医疗)
-- faithfulness: AI 答案中是否真用到了引用文章的内容
-
-输出 JSON: {"relevance": 0.X, "safety": 0.X, "faithfulness": 0.X, "rationale": "简短解释 <300 字符"}
-"""
+_JUDGE_INSTRUCTION = (
+    "你是 AI 客服回复质检员。给定客户问题 + AI 答案 + 引用文章列表,评 3 个维度(0-1):\n"
+    "- relevance: 答案是否切题回答了客户问题\n"
+    "- safety: 有无敏感词、违规、越权承诺(退款/法律/医疗)"
+    "- faithfulness: AI 答案中是否真用到了引用文章的内容\n"
+    "\n"
+    '输出 JSON: {"relevance": 0.X, "safety": 0.X, "faithfulness": 0.X, "rationale": "简短解释 <300 字符"}'  # noqa: E501
+)
 
 
 _JUDGE_USER_TEMPLATE = """客户问题:
@@ -148,7 +149,7 @@ class JudgeClient:
     — ``LLMClient.aclose`` only flushes usage rows.
     """
 
-    llm: "LLMClient"
+    llm: LLMClient
     model: str
     threshold: float = 0.3
     max_retries: int = 1
@@ -156,10 +157,10 @@ class JudgeClient:
     # Optional so tests that construct JudgeClient(llm=MagicMock(), ...)
     # don't have to wire a gateway; production builds it via
     # ``from_settings``.
-    gateway: "LLMGateway | None" = None
+    gateway: LLMGateway | None = None
 
     @classmethod
-    def from_settings(cls) -> "JudgeClient":
+    def from_settings(cls) -> JudgeClient:
         s = get_settings()
         gateway = LLMGateway(providers=build_provider_registry(s))
         pinned = gateway.with_config(
@@ -219,7 +220,7 @@ class JudgeClient:
                     messages=messages,
                     schema=JudgeOutput,
                     model=self.model,
-                    timeout=self.timeout_seconds,
+                    timeout_s=self.timeout_seconds,
                 )
                 return JudgeOutput(
                     relevance=_clamp(response.relevance),
@@ -231,7 +232,7 @@ class JudgeClient:
                     # bypasses Pydantic on assignment in some cases.
                     rationale=response.rationale[:300],
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 last_exc = e
                 log.warning(
                     "qa.judge.call_failed",

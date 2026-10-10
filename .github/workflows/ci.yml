@@ -26,6 +26,12 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: apps/api/pyproject.toml
+      - name: Install system deps (Poppler for PDF screenshots)
+        # pdf2image (used by tests/knowledge/multimodal/unit/test_pdf_processor.py)
+        # shells out to ``pdftoppm``; install it here so the unit job can
+        # exercise the multimodal PDF pipeline without standing up the
+        # full Docker image.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends poppler-utils
       - name: Install deps
         run: pip install -e ".[dev]"
       - name: Ruff lint

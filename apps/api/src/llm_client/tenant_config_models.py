@@ -130,7 +130,7 @@ class TenantLLMConfigRepository:
         tenant_id: str,
         provider_name: str,
         enabled: bool | None = None,
-        base_url: str | None | object = _UNSET,
+        base_url: str | object | None = _UNSET,
     ) -> TenantLLMConfig | None:
         """Update mutable sidecar fields without rotating the API key.
 

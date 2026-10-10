@@ -165,7 +165,7 @@ class LLMClient:
         messages: list[dict[str, Any]],
         schema: type[BaseModel],
         model: str,
-        timeout: float = 10.0,
+        timeout_s: float = 10.0,
     ) -> BaseModel:
         """Call the underlying provider and parse the response into ``schema``.
 
@@ -190,7 +190,7 @@ class LLMClient:
         async def _call() -> ChatResponse:
             return await self.chat(chat_request)
 
-        response = await asyncio.wait_for(_call(), timeout=timeout)
+        response = await asyncio.wait_for(_call(), timeout=timeout_s)
         try:
             parsed = json.loads(response.content)
         except (json.JSONDecodeError, TypeError) as e:
@@ -228,7 +228,7 @@ class LLMClient:
         When ``provider_resolver`` exposes an ``ainvoke`` method
         (FallbackResolver from M4.B), the chain IS the retry mechanism —
         we delegate and skip the local retry loop to avoid
-        ``max_retries × chain_length`` attempt explosion.
+        ``max_retries * chain_length`` attempt explosion.  # noqa: RUF002
         """
         # M4.B: FallbackResolver.ainvoke runs the whole chain (primary +
         # backup, ...) and either returns success or raises
@@ -319,7 +319,7 @@ class LLMClient:
                     ROUTE_UNKNOWN_MODEL,
                     "invalid_request",
                 )
-                raise InvalidRequest(
+                raise InvalidRequest(  # noqa: B904
                     f"No LLM provider registered for model {request.model!r}"
                 )
             except Exception as exc:
@@ -397,7 +397,7 @@ class LLMClient:
                 ROUTE_UNKNOWN_MODEL,
                 "invalid_request",
             )
-            raise InvalidRequest(
+            raise InvalidRequest(  # noqa: B904
                 f"No LLM provider registered for model {request.model!r}"
             )
         except Exception as exc:
