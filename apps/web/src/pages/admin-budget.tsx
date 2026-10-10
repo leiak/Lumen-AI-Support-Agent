@@ -1,8 +1,11 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { AxiosError } from 'axios';
 import { useQuery } from '@tanstack/react-query';
 import { z } from 'zod';
 
+import { BudgetEditDialog } from '@/components/admin/budget-edit-dialog';
+import { CreditGrantDialog } from '@/components/admin/credit-grant-dialog';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { useCurrentUser } from '@/lib/use-current-user';
 import {
@@ -193,6 +196,10 @@ export function AdminBudgetPage(): JSX.Element {
   const tenantId = user?.tenant_id ?? '';
   const period = useMemo(() => currentPeriod(), []);
 
+  // Tier 1 Task 1.4: dialog open state for budget edit + credit grant.
+  const [editOpen, setEditOpen] = useState(false);
+  const [grantOpen, setGrantOpen] = useState(false);
+
   const budgetQuery = useQuery({
     queryKey: [...BUDGET_QUERY_KEY, tenantId, 'config'],
     queryFn: () => fetchBudget(tenantId),
@@ -261,11 +268,21 @@ export function AdminBudgetPage(): JSX.Element {
 
       {/* ----- 1. Usage summary ---------------------------------------- */}
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-base">
             当期用量
             {usage ? `（${usage.period}）` : ''}
           </CardTitle>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            data-testid="budget-edit-open"
+            onClick={() => setEditOpen(true)}
+            disabled={!budgetQuery.data}
+          >
+            编辑预算
+          </Button>
         </CardHeader>
         <CardContent>
           {usageQuery.isError ? (
@@ -350,8 +367,17 @@ export function AdminBudgetPage(): JSX.Element {
 
       {/* ----- 3. Credits list ---------------------------------------- */}
       <Card>
-        <CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
           <CardTitle className="text-base">Credits 历史</CardTitle>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            data-testid="credit-grant-open"
+            onClick={() => setGrantOpen(true)}
+          >
+            发放 Credit
+          </Button>
         </CardHeader>
         <CardContent>
           {creditsQuery.isLoading ? (
@@ -396,6 +422,20 @@ export function AdminBudgetPage(): JSX.Element {
           周期锚点时区: {budgetQuery.data.period_anchor_tz} · 上次更新: {budgetQuery.data.updated_at}
         </p>
       )}
+
+      {/* ----- Mutation dialogs (Tier 1 Task 1.4) ---------------------- */}
+      <BudgetEditDialog
+        tenantId={tenantId}
+        current={budgetQuery.data ?? null}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+      />
+      <CreditGrantDialog
+        tenantId={tenantId}
+        period={period}
+        open={grantOpen}
+        onOpenChange={setGrantOpen}
+      />
     </div>
   );
 }

@@ -76,6 +76,28 @@ export const BudgetCreditListSchema = z.object({
 });
 export type BudgetCreditList = z.infer<typeof BudgetCreditListSchema>;
 
+// --- Mutation inputs ------------------------------------------------------
+//
+// Tier 1 Task 1.4: the budget page is no longer read-only. Two mutations
+// are exposed — `updateBudget` (per-tenant admin) and `grantCredit`
+// (super-admin only; the backend returns 404 for everyone else via the
+// anti-enumeration gate). Both are POST upserts; the API does not
+// currently support PATCH for these rows.
+
+export const BudgetUpdateInputSchema = z.object({
+  soft_warn_tokens: z.number().int().positive(),
+  hard_cap_tokens: z.number().int().positive(),
+  period_anchor_tz: z.string().min(1).max(64),
+});
+export type BudgetUpdateInput = z.infer<typeof BudgetUpdateInputSchema>;
+
+export const CreditGrantInputSchema = z.object({
+  tokens: z.number().int().positive(),
+  note: z.string().min(1).max(500),
+  period: z.string().regex(/^\d{4}-\d{2}$/),
+});
+export type CreditGrantInput = z.infer<typeof CreditGrantInputSchema>;
+
 /**
  * GET /api/v1/admin/tenants/{tenant_id}/budget
  *
@@ -88,6 +110,43 @@ export async function fetchBudget(tenantId: string): Promise<TenantBudget> {
     `/api/v1/admin/tenants/${tenantId}/budget`,
   );
   return TenantBudgetSchema.parse(data);
+}
+
+/**
+ * POST /api/v1/admin/tenants/{tenant_id}/budget — upsert config.
+ *
+ * Tier 1 Task 1.4: a per-tenant admin can now edit the soft_warn and
+ * hard_cap thresholds from the SPA. Backend enforces ``hard_cap >=
+ * soft_warn`` and returns 422 if violated.
+ */
+export async function updateBudget(
+  tenantId: string,
+  input: BudgetUpdateInput,
+): Promise<TenantBudget> {
+  const { data } = await apiClient.post(
+    `/api/v1/admin/tenants/${tenantId}/budget`,
+    input,
+  );
+  return TenantBudgetSchema.parse(data);
+}
+
+/**
+ * POST /api/v1/admin/tenants/{tenant_id}/credits — grant tokens.
+ *
+ * Super-admin only. Per-tenant admins get a 404 (anti-enumeration);
+ * the dialog should be hidden for them via the `is_super_admin` gate
+ * upstream (see `AdminBudgetPage`). Response is a single ``BudgetCredit``
+ * (the just-inserted row).
+ */
+export async function grantCredit(
+  tenantId: string,
+  input: CreditGrantInput,
+): Promise<BudgetCredit> {
+  const { data } = await apiClient.post(
+    `/api/v1/admin/tenants/${tenantId}/credits`,
+    input,
+  );
+  return BudgetCreditSchema.parse(data);
 }
 
 /**
