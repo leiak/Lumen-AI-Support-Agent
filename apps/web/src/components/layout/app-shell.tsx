@@ -10,6 +10,7 @@ import {
   Ticket,
   Cpu,
   Users,
+  Building2,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -37,6 +38,7 @@ const adminNavItems: NavItem[] = [
   { to: '/admin/kb-drafts', label: 'KB 草稿', icon: FileSearch },
   { to: '/admin/llm-configs', label: 'LLM 配置', icon: Cpu },
   { to: '/admin/users', label: '用户管理', icon: Users },
+  { to: '/admin/tenant-settings', label: '租户设置', icon: Building2 },
 ];
 
 export function AppShell(): JSX.Element {

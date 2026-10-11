@@ -6,6 +6,7 @@ import { AuthGuard } from '@/components/auth/auth-guard';
 import { AdminKbDraftsPage } from '@/pages/admin-kb-drafts';
 import { AdminLLMConfigsPage } from '@/pages/admin-llm-configs';
 import { AdminSlaPoliciesPage } from '@/pages/admin-sla-policies';
+import { AdminTenantSettingsPage } from '@/pages/admin-tenant-settings';
 import { AdminUsersPage } from '@/pages/admin-users';
 import { AdminBudgetPage } from '@/pages/admin-budget';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
@@ -88,6 +89,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminUsersPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/tenant-settings"
+          element={
+            <AdminGuard>
+              <AdminTenantSettingsPage />
             </AdminGuard>
           }
         />

@@ -11,6 +11,10 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigRead,
     TenantLLMConfigUpdate,
 )
+from admin.schemas.tenant_settings import (
+    TenantSettingsRead,
+    TenantSettingsUpdate,
+)
 from admin.schemas.users import (
     UserCreate,
     UserPasswordReset,
@@ -25,6 +29,8 @@ __all__ = [
     "TenantLLMConfigCreate",
     "TenantLLMConfigRead",
     "TenantLLMConfigUpdate",
+    "TenantSettingsRead",
+    "TenantSettingsUpdate",
     "UserCreate",
     "UserPasswordReset",
     "UserRead",

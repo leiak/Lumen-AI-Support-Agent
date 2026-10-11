@@ -52,6 +52,35 @@ class TenantRepository:
             result = await session.execute(select(Tenant).where(Tenant.name == name))
             return result.scalar_one_or_none()
 
+    async def update_profile(
+        self,
+        tenant_id: str,
+        *,
+        name: str | None = None,
+        plan: TenantPlan | None = None,
+        status: TenantStatus | None = None,
+    ) -> Tenant | None:
+        """Update mutable profile fields on a Tenant.
+
+        Tier 2 Task 2.3 — admin-side PATCH (tenant self-settings).
+        ``None`` arguments mean "leave this column alone". Returns the
+        refreshed Tenant or ``None`` if the row was deleted
+        concurrently.
+        """
+        async with get_session() as session:
+            tenant = await session.get(Tenant, tenant_id)
+            if tenant is None:
+                return None
+            if name is not None:
+                tenant.name = name
+            if plan is not None:
+                tenant.plan = plan
+            if status is not None:
+                tenant.status = status
+            await session.commit()
+            await session.refresh(tenant)
+            return tenant
+
 
 class UserRepository:
     """CRUD for User rows."""

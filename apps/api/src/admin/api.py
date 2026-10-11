@@ -62,6 +62,10 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigRead,
     TenantLLMConfigUpdate,
 )
+from admin.schemas.tenant_settings import (
+    TenantSettingsRead,
+    TenantSettingsUpdate,
+)
 from admin.schemas.users import (
     UserCreate,
     UserPasswordReset,
@@ -1237,6 +1241,70 @@ async def list_tenant_tickets(
         items=[TicketOut.model_validate(t) for t in items],
         total=total,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.3 — Tenant self-settings endpoints.
+#
+# GET   /api/v1/admin/tenants/{tid}/settings — read name/plan/status
+# PATCH /api/v1/admin/tenants/{tid}/settings — update name/plan/status
+#
+# Scope: a tenant-scoped admin can view + edit their own tenant.
+# Cross-tenant access returns 404 (anti-enumeration, same as the rest
+# of the admin surface). Listing all tenants would require a super-
+# admin role that does NOT exist in the current JWT model; that's
+# deliberately out of scope for this task.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/settings",
+    response_model=TenantSettingsRead,
+)
+async def get_tenant_settings(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantSettingsRead:
+    """Read the current tenant's settings."""
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    tenant = await TenantRepository().get_by_id(tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return TenantSettingsRead.model_validate(tenant)
+
+
+@router.patch(
+    "/tenants/{tenant_id}/settings",
+    response_model=TenantSettingsRead,
+)
+async def patch_tenant_settings(
+    tenant_id: str,
+    payload: TenantSettingsUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantSettingsRead:
+    """Update the current tenant's mutable settings.
+
+    All fields optional. ``status`` is restricted to ``active`` /
+    ``suspended`` — ``deleted`` is reserved for a future super-admin
+    path (out of scope for the tenant-scoped admin surface).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    if payload.status is not None and payload.status.value == "deleted":
+        raise HTTPException(
+            status_code=400,
+            detail="deletion requires super-admin (not exposed via this endpoint)",
+        )
+    updated = await TenantRepository().update_profile(
+        tenant_id,
+        name=payload.name,
+        plan=payload.plan,
+        status=payload.status,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return TenantSettingsRead.model_validate(updated)
 
 
 # ---------------------------------------------------------------------------
