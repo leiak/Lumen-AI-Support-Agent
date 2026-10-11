@@ -1,0 +1,45 @@
+{
+  "common": {
+    "loading": "Loading…",
+    "save": "Save",
+    "cancel": "Cancel",
+    "back": "Back",
+    "refresh": "Refresh",
+    "search": "Search",
+    "send": "Send",
+    "submit": "Submit",
+    "close": "Close",
+    "delete": "Delete",
+    "edit": "Edit",
+    "create": "Create",
+    "confirm": "Confirm",
+    "yes": "Yes",
+    "no": "No",
+    "none": "None"
+  },
+  "shell": {
+    "logout": "Log out",
+    "language": "Language",
+    "language.zh-CN": "中文",
+    "language.en-US": "English"
+  },
+  "inbox": {
+    "title": "Inbox",
+    "loading": "Loading conversations…",
+    "empty": "No conversations yet.",
+    "open": "Open",
+    "channel": "Channel",
+    "status.open": "Open",
+    "status.pending": "Pending",
+    "status.closed": "Closed",
+    "search.placeholder": "Search by customer ID…",
+    "loadMore": "Load more",
+    "pagination.next": "Next",
+    "pagination.prev": "Previous",
+    "pagination.page": "Page {{page}} / {{total}}"
+  },
+  "errors": {
+    "loadFailed": "Failed to load: {{message}}",
+    "networkError": "Network error, please try again."
+  }
+}

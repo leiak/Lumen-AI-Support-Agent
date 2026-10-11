@@ -1,0 +1,45 @@
+{
+  "common": {
+    "loading": "加载中…",
+    "save": "保存",
+    "cancel": "取消",
+    "back": "返回",
+    "refresh": "刷新",
+    "search": "搜索",
+    "send": "发送",
+    "submit": "提交",
+    "close": "关闭",
+    "delete": "删除",
+    "edit": "编辑",
+    "create": "创建",
+    "confirm": "确认",
+    "yes": "是",
+    "no": "否",
+    "none": "无"
+  },
+  "shell": {
+    "logout": "退出登录",
+    "language": "语言",
+    "language.zh-CN": "中文",
+    "language.en-US": "English"
+  },
+  "inbox": {
+    "title": "收件箱",
+    "loading": "加载对话…",
+    "empty": "暂无对话。",
+    "open": "打开",
+    "channel": "渠道",
+    "status.open": "进行中",
+    "status.pending": "等待",
+    "status.closed": "已关闭",
+    "search.placeholder": "按客户 ID 搜索…",
+    "loadMore": "加载更多",
+    "pagination.next": "下一页",
+    "pagination.prev": "上一页",
+    "pagination.page": "第 {{page}} / {{total}} 页"
+  },
+  "errors": {
+    "loadFailed": "加载失败: {{message}}",
+    "networkError": "网络错误,请稍后再试。"
+  }
+}

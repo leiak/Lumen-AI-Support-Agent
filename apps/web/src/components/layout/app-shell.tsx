@@ -18,6 +18,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/api-client';
 import { useCurrentUser } from '@/lib/use-current-user';
+import { LanguageSwitcher } from '@/components/layout/language-switcher';
 import { useIsAdmin } from '@/lib/use-is-admin';
 import { cn } from '@/lib/utils';
 
@@ -76,6 +77,7 @@ export function AppShell(): JSX.Element {
             <LogOut className="mr-2" />
             退出登录
           </Button>
+          <LanguageSwitcher />
         </div>
       </header>
 

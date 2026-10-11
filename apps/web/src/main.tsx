@@ -6,6 +6,7 @@ import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
 
 import { App } from '@/App';
 import { queryClient } from '@/lib/query-client';
+import '@/i18n';
 import './index.css';
 
 const container = document.getElementById('root');
