@@ -76,10 +76,13 @@ services:
 
   # E2E seed one-shot. Runs the base tenant/users/channel seed
   # (tests/e2e/scripts/seed.py) followed by the Pack B budget/credit/
-  # usage seed (tests/e2e/scripts/seed_budget.py). Idempotent — safe
-  # to re-run. Both scripts auto-locate the repo root and anchor
-  # ``apps/api/src`` onto sys.path, so mounting the repo root at
-  # /repo is enough.
+  # usage seed (tests/e2e/scripts/seed_budget.py), then the
+  # example-integration FEISHU channel + KB + articles seed
+  # (apps/example-integration/scripts/extend-seed.py) so the Feishu
+  # webhook demo works out-of-the-box without needing bring-up.sh.
+  # All three are idempotent — safe to re-run. Each script auto-locates
+  # the repo root and anchors ``apps/api/src`` onto sys.path, so
+  # mounting the repo root at /repo is enough.
   seed:
     # Reuse the api-built image (alembic + python deps + curl already present).
     image: aicustomer-api
@@ -95,10 +98,11 @@ services:
     volumes:
       - ../apps/api/src:/repo/apps/api/src:ro
       - ../tests/e2e/scripts:/repo/tests/e2e/scripts:ro
+      - ../apps/example-integration/scripts:/repo/apps/example-integration/scripts:ro
     command:
       - sh
       - -c
-      - "python -u /repo/tests/e2e/scripts/seed.py && python -u /repo/tests/e2e/scripts/seed_budget.py"
+      - "python -u /repo/tests/e2e/scripts/seed.py && python -u /repo/tests/e2e/scripts/seed_budget.py && python -u /repo/apps/example-integration/scripts/extend-seed.py"
     depends_on:
       migrate:
         condition: service_completed_successfully

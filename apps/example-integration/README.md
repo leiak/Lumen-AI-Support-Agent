@@ -1,22 +1,17 @@
-# Lumen Example Integration
+# Lumen 示例集成
 
-Three demo entry points for the [Lumen AI Support Agent](../../) — a Web
-Widget embed, a REST API client, and a Feishu webhook sender — all in one
-Node + TypeScript workspace package, all talking to the real Lumen backend
-with seeded fake data.
+[Lumen AI 客服 Agent](../../) 的三个演示入口 —— Web Widget 嵌入、REST API 客户端和飞书 webhook 发送器 —— 全部集中在一个 Node + TypeScript workspace 包中,均与真实的 Lumen 后端通信,并使用预置的假数据。
 
-> ⚠️ **Not for production.** This example reuses M1 stubs (see
-> [Known Limitations](#known-limitations)). It is intended for local demos,
-> tutorials, and onboarding new contributors.
+> ⚠️ **请勿用于生产环境。** 本示例复用了 M1 阶段的 stub(参见 [已知限制](#已知限制))。仅用于本地演示、教程以及新贡献者入门。
 
-## Prerequisites
+## 前置条件
 
 - Node.js 20+
 - pnpm 9+
 - Docker + Docker Compose
-- The repo cloned with `apps/web-sdk` already built (`pnpm -F @lumen/web-sdk build`)
+- 已克隆本仓库,并且 `apps/web-sdk` 已经构建完成(`pnpm -F @lumen/web-sdk build`)
 
-## Quickstart
+## 快速开始
 
 ```bash
 cd apps/example-integration
@@ -24,67 +19,62 @@ cp .env.example .env
 ./scripts/bring-up.sh        # docker compose up + seed + extend-seed
 ```
 
-Then in three separate terminals:
+然后在三个独立的终端中分别执行:
 
 ```bash
-# Terminal 1 — widget
+# 终端 1 — widget
 pnpm widget
-# open http://localhost:5173 in your browser; chat bubble appears bottom-right
+# 在浏览器中打开 http://localhost:5173;聊天气泡会出现在右下角
 
-# Terminal 2 — REST API
+# 终端 2 — REST API
 pnpm api-client:login
 pnpm api-client:queue
 pnpm api-client:reply 01HZDEMO00000000000000004 "I can help with that."
 pnpm api-client:suggest 01HZDEMO00000000000000004
 
-# Terminal 3 — webhook
+# 终端 3 — webhook
 pnpm webhook:start
-# in another terminal: curl -X POST localhost:4567/simulate-feishu
-# OR: pnpm webhook:simulate
+# 在另一个终端中:curl -X POST localhost:4567/simulate-feishu
+# 或者:pnpm webhook:simulate
 ```
 
-## Demo walkthroughs
+## 演示演练
 
-### Widget (`pnpm widget`)
+### Widget(`pnpm widget`)
 
-Open <http://localhost:5173>. The chat bubble loads via the SDK's IIFE
-script (`lumen-widget.js` mirrored from `apps/web-sdk/dist/`). Try:
+打开 <http://localhost:5173>。聊天气泡通过 SDK 的 IIFE 脚本(`lumen-widget.js`,从 `apps/web-sdk/dist/` 镜像)加载。可以尝试输入:
 
 > "How do I reset my password?"
 
-The backend's LangGraph agent retrieves the seeded KB article and returns
-a streamed reply (the SDK polls `GET /conversations/{id}/messages`).
+后端的 LangGraph agent 会检索预置的 KB 文章,并以流式方式返回回复(SDK 通过轮询 `GET /conversations/{id}/messages` 获取)。
 
 ### REST API
 
 ```bash
-pnpm api-client:login      # caches agent JWT
-pnpm api-client:queue      # lists PENDING conversations
+pnpm api-client:login      # 缓存 agent JWT
+pnpm api-client:queue      # 列出 PENDING 状态的会话
 pnpm api-client:claim 01HZDEMO00000000000000004
 pnpm api-client:reply 01HZDEMO00000000000000004 "Got it, working on it."
 pnpm api-client:suggest 01HZDEMO00000000000000004
 ```
 
-The token cache is `apps/example-integration/.api-token-cache.json`
-(gitignored). Delete it to force re-login.
+token 缓存位于 `apps/example-integration/.api-token-cache.json`(已在 `.gitignore` 中)。删除该文件即可强制重新登录。
 
 ### Webhook
 
 ```bash
 pnpm webhook:start                                   # Fastify :4567
-curl -X POST localhost:4567/simulate-feishu          # default text
-# or with a custom message:
+curl -X POST localhost:4567/simulate-feishu          # 默认文本
+# 或者自定义消息:
 curl -X POST localhost:4567/simulate-feishu -H 'Content-Type: application/json' \
   -d '{"text":"What is the refund policy?"}'
 ```
 
-The local server computes a Feishu SHA-256 signature using the M1 stub
-encrypt key and forwards the event to
-`http://localhost:8000/api/v1/channel/feishu/webhook/demo-feishu-app-001`.
-The backend creates a new conversation and (when AI handling is enabled)
-auto-generates a reply.
+本地服务器使用 M1 stub 加密密钥计算飞书 SHA-256 签名,然后将事件转发到
+`http://localhost:8000/api/v1/channel/feishu/webhook/demo-feishu-app-001`。
+后端会创建一条新会话,并在启用 AI 处理时自动生成回复。
 
-## Architecture
+## 架构
 
 ```
 Browser (5173)                CLI                          Fastify (4567)
@@ -97,27 +87,20 @@ Browser (5173)                CLI                          Fastify (4567)
                                   ↓
                           Lumen API at :8000
                                   ↓
-                          Postgres + Redis + Qdrant (seeded by tests/e2e/scripts/seed.py + scripts/extend-seed.ts)
+                          Postgres + Redis + Qdrant (由 tests/e2e/scripts/seed.py + scripts/extend-seed.ts 预置)
 ```
 
-See [`docs/superpowers/specs/2026-10-10-example-integration-design.md`](../../docs/superpowers/specs/2026-10-10-example-integration-design.md)
-for the full design.
+完整设计文档请参见 [`docs/superpowers/specs/2026-10-10-example-integration-design.md`](../../docs/superpowers/specs/2026-10-10-example-integration-design.md)。
 
-## Known limitations
+## 已知限制
 
-1. **M1 stub Feishu encrypt key.** The webhook sender uses the literal
-   string `M1_STUB_ENCRYPT_KEY_REPLACE_IN_TASK_4_13` because M1 does not
-   look up per-tenant keys (see `apps/api/src/channel/feishu/webhook.py:31`).
-   When Stage 4.13 ships per-tenant lookup, replace `FEISHU_STUB_ENCRYPT_KEY`
-   in `src/webhook-sender/server.ts` with a `Channel.config_json["encrypt_key"]`
-   read.
-2. **No email inbound demo.** `POST /api/v1/email/inbound` requires AWS SES
-   credentials. Out of scope for this example.
-3. **No Playwright CI for the widget.** Manual smoke only.
+1. **M1 stub 飞书加密密钥。** webhook 发送器直接使用字符串常量 `M1_STUB_ENCRYPT_KEY_REPLACE_IN_TASK_4_13`,因为 M1 阶段并未实现按租户查询密钥(参见 `apps/api/src/channel/feishu/webhook.py:31`)。当 Stage 4.13 上线按租户查询能力后,需要将 `src/webhook-sender/server.ts` 中的 `FEISHU_STUB_ENCRYPT_KEY` 替换为从 `Channel.config_json["encrypt_key"]` 读取的值。
+2. **暂无邮件入站 demo。** `POST /api/v1/email/inbound` 需要 AWS SES 凭据,不在本示例范围内。
+3. **widget 未接入 Playwright CI。** 仅支持手动冒烟测试。
 
-## Tests
+## 测试
 
 ```bash
-pnpm test                                              # unit tests (no backend needed)
-LUMEN_E2E=1 pnpm test webhook-sender.test.ts          # integration (backend must be up)
+pnpm test                                              # 单元测试(无需后端)
+LUMEN_E2E=1 pnpm test webhook-sender.test.ts          # 集成测试(需要后端运行)
 ```

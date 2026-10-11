@@ -41,7 +41,16 @@ from channel.models import Channel  # noqa: E402
 from core.database import get_session, reset_engine, reset_sessionmaker  # noqa: E402
 from core.id_gen import new_id  # noqa: E402
 from knowledge.enums import ArticleStatus  # noqa: E402
+# ticket.models MUST be imported before channel/knowledge models so that
+# any cross-domain FKs (e.g. ticket.conversation_id -> conversations.id
+# when present) resolve at ORM flush time. Importing only what we use
+# (Channel, KnowledgeBase, Article) leaves SQLAlchemy unable to walk
+# the FK graph and ``flush()`` raises NoReferencedTableError on the
+# tenants.id target. tenant.models is also imported below for the same
+# reason — Channel / KB / Article all FK to tenants.id.
+from ticket import models as ticket_models  # noqa: E401,F401,E402  -- needed for FK resolution
 from knowledge.models import Article, ArticleVersion, KnowledgeBase  # noqa: E402
+from tenant.models import Tenant  # noqa: E402 -- needed for FK resolution
 
 
 # Deterministic IDs (26 chars, matches String(26) in models).
