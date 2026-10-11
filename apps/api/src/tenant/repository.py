@@ -138,3 +138,50 @@ class UserRepository:
                 return
             user.password_hash = password_hash
             await session.commit()
+
+    async def update_profile(
+        self,
+        user_id: str,
+        *,
+        full_name: str | None = None,
+        role: UserRole | None = None,
+        is_active: bool | None = None,
+    ) -> User | None:
+        """Update mutable profile fields on a User.
+
+        Tier 2 Task 2.2 — admin-side PATCH. ``None`` arguments mean
+        "leave this column alone" (Pydantic-side ``_UNSET`` sentinel
+        is unnecessary here because every column is nullable /
+        has-a-default; ``None`` is a legitimate value for
+        ``full_name``). Returns the refreshed User or ``None`` if the
+        row was deleted concurrently.
+        """
+        async with get_session() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                return None
+            if full_name is not None:
+                user.full_name = full_name
+            if role is not None:
+                user.role = role
+            if is_active is not None:
+                user.is_active = is_active
+            await session.commit()
+            await session.refresh(user)
+            return user
+
+    async def delete_by_id(self, user_id: str) -> bool:
+        """Hard-delete a User by id. Returns True if a row was removed.
+
+        Tier 2 Task 2.2 — admin DELETE endpoint. Idempotent — a
+        second call returns ``False`` without raising. FK references
+        from tickets / sessions will block the delete and surface as
+        ``IntegrityError``; the route handler maps that to 409.
+        """
+        async with get_session() as session:
+            user = await session.get(User, user_id)
+            if user is None:
+                return False
+            await session.delete(user)
+            await session.commit()
+            return True

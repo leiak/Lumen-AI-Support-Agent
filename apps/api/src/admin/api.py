@@ -62,7 +62,14 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigRead,
     TenantLLMConfigUpdate,
 )
+from admin.schemas.users import (
+    UserCreate,
+    UserPasswordReset,
+    UserRead,
+    UserUpdate,
+)
 from auth.dependencies import require_admin
+from auth.password import hash_password
 from budget.cleanup import run_budget_cleanup
 from budget.credits import CreditService
 from budget.per_model import PerModelService, get_per_model_cache
@@ -77,7 +84,9 @@ from knowledge.models import (
     KbArticleDraft,
     KnowledgeBase,
 )
-from tenant.repository import TenantRepository
+from tenant.enums import UserRole
+from tenant.models import User
+from tenant.repository import TenantRepository, UserRepository
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import SlaPolicy
 from ticket.repository import TicketRepository
@@ -1228,6 +1237,177 @@ async def list_tenant_tickets(
         items=[TicketOut.model_validate(t) for t in items],
         total=total,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.2 — Tenant user (agent / admin) CRUD endpoints.
+#
+# GET    /api/v1/admin/tenants/{tenant_id}/users              — list
+# POST   /api/v1/admin/tenants/{tenant_id}/users              — create (bcrypt-hash pw)
+# PATCH  /api/v1/admin/tenants/{tenant_id}/users/{user_id}    — role / full_name / is_active
+# POST   /api/v1/admin/tenants/{tenant_id}/users/{user_id}/reset-password
+# DELETE /api/v1/admin/tenants/{tenant_id}/users/{user_id}    — idempotent hard delete
+#
+# Anti-enumeration: a caller whose JWT tenant_id does not match
+# {tenant_id} gets 404. The handler also blocks deleting the
+# operator's own row (self-delete → 400) so an admin can't accidentally
+# lock themselves out.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/users",
+    response_model=list[UserRead],
+)
+async def list_tenant_users(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> list[UserRead]:
+    """List all users belonging to a tenant.
+
+    Returns ``UserRead`` (no ``password_hash``). Ordered by
+    ``created_at`` ascending so the SPA renders a stable table.
+    Cross-tenant access returns 404 (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    users = await UserRepository().list_for_tenant(tenant_id)
+    return [UserRead.model_validate(u) for u in users]
+
+
+@router.post(
+    "/tenants/{tenant_id}/users",
+    response_model=UserRead,
+    status_code=201,
+)
+async def create_tenant_user(
+    tenant_id: str,
+    payload: UserCreate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> UserRead:
+    """Create a new tenant user.
+
+    Password is bcrypt-hashed via :func:`auth.password.hash_password`
+    before insert. Returns 409 on duplicate (tenant_id, email)
+    (mapped from ``IntegrityError``). Returns 404 on cross-tenant
+    access (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    repo = UserRepository()
+    try:
+        user = await repo.create(
+            tenant_id=tenant_id,
+            email=payload.email,
+            password_hash=hash_password(payload.password),
+            full_name=payload.full_name,
+            role=payload.role,
+            is_active=True,
+        )
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="email already exists",
+        ) from exc
+    return UserRead.model_validate(user)
+
+
+@router.patch(
+    "/tenants/{tenant_id}/users/{user_id}",
+    response_model=UserRead,
+)
+async def patch_tenant_user(
+    tenant_id: str,
+    user_id: str,
+    payload: UserUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> UserRead:
+    """Update a tenant user's mutable profile fields.
+
+    All fields optional. Cross-tenant access returns 404; the user
+    belonging to a different tenant is also 404 (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    repo = UserRepository()
+    existing = await repo.get_by_id(user_id)
+    if existing is None or existing.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    updated = await repo.update_profile(
+        user_id,
+        full_name=payload.full_name,
+        role=payload.role,
+        is_active=payload.is_active,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return UserRead.model_validate(updated)
+
+
+@router.post(
+    "/tenants/{tenant_id}/users/{user_id}/reset-password",
+    status_code=204,
+)
+async def reset_tenant_user_password(
+    tenant_id: str,
+    user_id: str,
+    payload: UserPasswordReset,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> Response:
+    """Reset a tenant user's password.
+
+    Tier 2 Task 2.2 — admin-triggered password reset. ``password_hash``
+    is never returned in the response body (204 No Content). Cross-
+    tenant or unknown user → 404 (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    repo = UserRepository()
+    existing = await repo.get_by_id(user_id)
+    if existing is None or existing.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    await repo.update_password_hash(user_id, hash_password(payload.new_password))
+    return Response(status_code=204)
+
+
+@router.delete(
+    "/tenants/{tenant_id}/users/{user_id}",
+    status_code=204,
+)
+async def delete_tenant_user(
+    tenant_id: str,
+    user_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> Response:
+    """Hard-delete a tenant user. Idempotent.
+
+    Tier 2 Task 2.2. Self-delete is rejected with 400 so an admin
+    can't accidentally lock themselves out — the UI MUST prompt
+    confirmation and surface a 400 as "can't delete yourself".
+    FK references from tickets / audit logs will raise
+    ``IntegrityError``; we map that to 409 so the caller knows it's
+    a data-conflict rather than a permission error.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    if user_id == claims.get("sub"):
+        raise HTTPException(
+            status_code=400,
+            detail="cannot delete the currently authenticated user",
+        )
+    repo = UserRepository()
+    existing = await repo.get_by_id(user_id)
+    if existing is None or existing.tenant_id != tenant_id:
+        # Idempotent — return 204 even when there's nothing to delete.
+        return Response(status_code=204)
+    try:
+        await repo.delete_by_id(user_id)
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="user is referenced by other rows",
+        ) from exc
+    return Response(status_code=204)
 
 
 __all__ = ["router"]
