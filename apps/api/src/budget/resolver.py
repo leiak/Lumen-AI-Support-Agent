@@ -27,6 +27,7 @@ same period).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -201,8 +202,31 @@ class BudgetResolver:
         async cache loading — the resolver is constructed against a
         warm cache so this is cheap). If the budget row is missing or
         ``hard_cap_tokens`` is ``None``, returns silently.
+
+        Async-context guard: ``LLMClient.stream_chat`` resolves the
+        provider via the sync ``__call__`` protocol (it never goes
+        through :meth:`ainvoke`), so this method runs inside the
+        caller's event loop. The snapshot loader bridges via
+        :func:`asyncio.run` internally which raises ``RuntimeError``
+        when called from a running loop — that RuntimeError would
+        then be wrapped as ``ProviderUnavailable`` by ``stream_chat``,
+        breaking every streamed call for budget tenants. Detect a
+        running loop and skip the pre-check silently; the full async
+        :meth:`ainvoke` path still enforces the cap, and the streaming
+        surface soft-degrades (no usage recorded against the budget,
+        but the LLM call proceeds — same trade-off the M4.A spec
+        documents for non-tracked callers).
         """
         if self._budget is None or self._budget.hard_cap_tokens is None:
+            return
+        try:
+            loop_running = asyncio.get_event_loop().is_running()
+        except RuntimeError:
+            # No event loop in this thread — pure sync context, safe to proceed.
+            loop_running = False
+        if loop_running:
+            # Caller is in an async context (LLMClient.stream_chat);
+            # the async ainvoke path enforces the cap. Defer.
             return
         period, period_start = _current_period(self._budget.period_anchor_tz)
         snap = self._snapshot_cache.get_or_load(

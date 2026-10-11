@@ -737,3 +737,68 @@ async def test_ainvoke_handles_prefix_resolver_inner_when_no_budget() -> None:
     resp = await resolver.ainvoke(MagicMock(spec=ChatRequest))
     assert resp is response
     primary_provider.chat.assert_awaited_once()
+
+
+async def test_sync_call_in_async_context_skips_pre_check() -> None:
+    """``__call__`` from inside a running event loop must NOT raise.
+
+    Regression for the LLMClient.stream_chat bug: ``stream_chat`` resolves
+    the provider via the sync ``__call__`` protocol, which runs inside
+    the caller's event loop. The snapshot loader bridges via
+    ``asyncio.run`` internally, which raises ``RuntimeError`` in a
+    running loop. ``stream_chat`` catches that as ``Exception`` and
+    wraps it as ``ProviderUnavailable``, breaking every streamed call
+    for budget tenants. The fix detects a running loop and skips the
+    pre-check silently — the async ``ainvoke`` path still enforces the
+    cap; streaming soft-degrades (no usage recorded, but the call goes
+    through, matching the M4.A spec's documented trade-off).
+    """
+    primary_provider = MagicMock()
+
+    class _PrefixResolverLike:
+        def __call__(self, request):
+            return primary_provider
+
+    inner = _PrefixResolverLike()
+    snap_cache = MagicMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=200),
+        snapshot_cache=snap_cache,
+    )
+    # This call MUST NOT raise — the snapshot_cache.get_or_load (which
+    # internally calls asyncio.run) must NOT be reached.
+    provider = resolver(MagicMock(spec=ChatRequest))
+    assert provider is primary_provider
+    snap_cache.get_or_load.assert_not_called()
+
+
+def test_sync_call_outside_async_context_enforces_cap() -> None:
+    """``__call__`` from a sync context (no running loop) still enforces.
+
+    The async-context guard must not break the genuine sync path —
+    e.g. test fixtures or background threads that construct a
+    ``BudgetResolver`` and invoke it without an event loop. The
+    ``asyncio.run`` inside ``TenantBudgetSnapshotCache.get_or_load``
+    is well-defined in that context, so the pre-check fires as before.
+    """
+    primary_provider = MagicMock()
+
+    class _PrefixResolverLike:
+        def __call__(self, request):
+            return primary_provider
+
+    inner = _PrefixResolverLike()
+    snap_cache = MagicMock()
+    snap_cache.get_or_load = MagicMock(
+        return_value=_make_snapshot("t1", "2026-10", 500)
+    )
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=200),
+        snapshot_cache=snap_cache,
+    )
+    # At-cap tenant → TenantBudgetExceeded, inner never called.
+    with pytest.raises(TenantBudgetExceeded):
+        resolver(MagicMock(spec=ChatRequest))
+    snap_cache.get_or_load.assert_called_once()
