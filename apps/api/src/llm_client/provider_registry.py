@@ -44,6 +44,11 @@ def build_provider_registry(settings: Settings) -> dict[str, BaseProvider]:
         providers["anthropic"] = AnthropicProvider(
             api_key=settings.anthropic_api_key,
             model=settings.default_llm_model,
+            **(
+                {"base_url": settings.anthropic_base_url}
+                if settings.anthropic_base_url
+                else {}
+            ),
         )
     if not providers:
         raise RuntimeError(

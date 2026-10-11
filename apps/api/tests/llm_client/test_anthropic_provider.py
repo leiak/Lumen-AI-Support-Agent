@@ -170,6 +170,64 @@ def test_anthropic_empty_api_key_rejected() -> None:
         AnthropicProvider(api_key="", model="claude-3-5-sonnet-20241022")
 
 
+async def test_anthropic_chat_uses_custom_base_url(httpx_mock: HTTPXMock) -> None:
+    """Reroute the Anthropic-format POST to a proxy base (e.g. MiniMax
+    Anthropic-compatible endpoint at https://api.minimaxi.com/anthropic).
+
+    Regression for M4.C follow-up: real Anthropic keys hit api.anthropic.com,
+    but third-party proxies (which Claude Code itself uses) need a custom
+    base URL. The provider must honour ``base_url=`` and POST ``/v1/messages``
+    under it without code changes.
+    """
+    proxy = AnthropicProvider(
+        api_key="proxy-key",
+        model="MiniMax-M3",
+        base_url="https://api.minimaxi.com/anthropic",
+    )
+    httpx_mock.add_response(
+        url="https://api.minimaxi.com/anthropic/v1/messages",
+        json={
+            "id": "msg_proxy",
+            "model": "MiniMax-M3",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+
+    req = ChatRequest(
+        model="MiniMax-M3",
+        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
+    )
+    resp = await proxy.chat(req)
+    assert resp.content == "ok"
+    assert resp.model == "MiniMax-M3"
+
+
+async def test_anthropic_default_base_url_unchanged(httpx_mock: HTTPXMock) -> None:
+    """When ``base_url`` is not passed the provider must still hit
+    ``https://api.anthropic.com/v1/messages`` — protects the existing
+    real-Anthropic-key callers from the new optional arg breaking them.
+    """
+    p = AnthropicProvider(api_key="k", model="claude-3-5-sonnet-20241022")
+    httpx_mock.add_response(
+        url="https://api.anthropic.com/v1/messages",
+        json={
+            "id": "msg_1",
+            "model": "claude-3-5-sonnet-20241022",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    req = ChatRequest(
+        model="claude-3-5-sonnet-20241022",
+        messages=[ChatMessage(role=MessageRole.USER, content="hi")],
+    )
+    resp = await p.chat(req)
+    assert resp.content == "hi"
+
+
 def _sse(payloads):
     """Join event dicts into an SSE body: 'data: <json>\n' per event."""
     nl = chr(10)

@@ -25,6 +25,8 @@ def _settings(**overrides):  # type: ignore[no-untyped-def]
         "MINIMAX_BASE_URL": None,
         "MINIMAX_MODEL": None,
         "ANTHROPIC_API_KEY": None,
+        "ANTHROPIC_BASE_URL": None,
+        "OPENAI_API_KEY": None,
         "DEFAULT_LLM_MODEL": "claude-3-5-sonnet-20241022",
         "DATABASE_URL": "postgresql+asyncpg://x:y@localhost:5432/z",
         "REDIS_URL": "redis://localhost:6379/0",
@@ -47,12 +49,34 @@ def test_registry_includes_minimax_when_minimax_key_set() -> None:
 
 
 def test_registry_includes_anthropic_when_anthropic_key_set() -> None:
-    settings = _settings(ANTHROPIC_API_KEY="anth-k")
+    # Explicit ANTHROPIC_BASE_URL=None to shadow the shell value Claude
+    # Code exports (the host's env typically carries the MiniMax proxy
+    # URL, which would otherwise sneak into Settings via pydantic-settings).
+    settings = _settings(ANTHROPIC_API_KEY="anth-k", ANTHROPIC_BASE_URL=None)
     with patch("llm_client.provider_registry.AnthropicProvider") as mock_anth:
         reg = build_provider_registry(settings)
     assert "anthropic" in reg
     mock_anth.assert_called_once_with(
         api_key="anth-k", model="claude-3-5-sonnet-20241022"
+    )
+
+
+def test_registry_passes_anthropic_base_url_when_set() -> None:
+    """When ANTHROPIC_BASE_URL is set the registry must thread it into
+    AnthropicProvider so Claude Code's MiniMax proxy works without
+    code changes. Mirrors the OpenAIProvider path which already accepts
+    base_url (see test_registry_includes_minimax_when_minimax_key_set).
+    """
+    settings = _settings(
+        ANTHROPIC_API_KEY="anth-k",
+        ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic",
+    )
+    with patch("llm_client.provider_registry.AnthropicProvider") as mock_anth:
+        build_provider_registry(settings)
+    mock_anth.assert_called_once_with(
+        api_key="anth-k",
+        model="claude-3-5-sonnet-20241022",
+        base_url="https://api.minimaxi.com/anthropic",
     )
 
 

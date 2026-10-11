@@ -69,6 +69,10 @@ class Settings(BaseSettings):
 
     # LLM (M1: 最小客户端)
     anthropic_api_key: str | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    # Anthropic-compatible proxy base URL (e.g. Claude Code's MiniMax
+    # proxy at https://api.minimaxi.com/anthropic). When unset, the
+    # provider hits the public ``https://api.anthropic.com``.
+    anthropic_base_url: str | None = Field(default=None, alias="ANTHROPIC_BASE_URL")
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     ollama_base_url: str | None = Field(default=None, alias="OLLAMA_BASE_URL")
     default_llm_model: str = Field(default="claude-3-5-sonnet-20241022", alias="DEFAULT_LLM_MODEL")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -51,6 +52,11 @@ from knowledge.enums import ArticleStatus  # noqa: E402
 from ticket import models as ticket_models  # noqa: E401,F401,E402  -- needed for FK resolution
 from knowledge.models import Article, ArticleVersion, KnowledgeBase  # noqa: E402
 from tenant.models import Tenant  # noqa: E402 -- needed for FK resolution
+from llm_client.tenant_config_crypto import TenantLLMConfigCipher  # noqa: E402
+from llm_client.tenant_config_models import (  # noqa: E402
+    TenantLLMConfig,
+    TenantLLMConfigRepository,
+)
 
 
 # Deterministic IDs (26 chars, matches String(26) in models).
@@ -61,6 +67,19 @@ DEMO_KB_ID = "01HZDEMO0000000000000000B"
 DEMO_KB_SLUG = "demo-kb"
 ARTICLE_RESET_ID = "01HZDEMO0000000000000000C"
 ARTICLE_REFUND_ID = "01HZDEMO0000000000000000D"
+
+# Demo tenant's LLM config: anthropic provider, routed through the
+# Claude Code proxy when ANTHROPIC_BASE_URL is set. The plaintext API
+# key is read from the host shell's ``$ANTHROPIC_API_KEY`` (set by the
+# operator before running ``docker compose up``) and Fernet-encrypted
+# with the same dev key the api container reads via
+# ``$TENANT_LLM_FERNET_KEY``.
+#
+# Anti-enumeration: the dev Fernet key below is for local demos only —
+# any real deployment must generate its own (see
+# ``llm_client/tenant_config_crypto.py:6``).
+DEMO_LLM_PROVIDER = "anthropic"
+DEMO_TENANT_LLM_FERNET_KEY = "nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y="
 
 
 async def _seed_article(
@@ -138,6 +157,54 @@ async def _seed_kb(s) -> None:
     await s.flush()
 
 
+async def _seed_tenant_llm_config() -> None:
+    """Upsert a tenant_llm_configs row for the demo tenant.
+
+    The agent graph always goes through TenantResolver (M4.C strict
+    mode), which requires a per-tenant enabled config + Fernet key.
+    Without this row the agent refuses to invoke any LLM and falls
+    back to the canned "AI 助手暂时无法回复" stub.
+
+    Reads ``$ANTHROPIC_API_KEY`` from the shell (the operator's
+    Claude Code key) and ``$ANTHROPIC_BASE_URL`` for the proxy URL
+    (when set, threads to AnthropicProvider so the demo tenant routes
+    through Claude Code's MiniMax proxy if the operator is using one).
+    Both are optional: when ``ANTHROPIC_API_KEY`` is unset this is a
+    no-op so the script remains safe to run with no credentials.
+
+    Uses the dev Fernet key baked into DEMO_TENANT_LLM_FERNET_KEY —
+    the api container reads the same key via ``$TENANT_LLM_FERNET_KEY``
+    in docker-compose.yml. No real production deployment should ship
+    this script; the dev key is for local demos only.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        print(
+            "  (skipping tenant_llm seed; $ANTHROPIC_API_KEY not set in env)"
+        )
+        return
+
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip() or None
+    cipher = TenantLLMConfigCipher(DEMO_TENANT_LLM_FERNET_KEY)
+    encrypted = cipher.encrypt(api_key)
+
+    # Repository uses its own sessionmaker internally so it doesn't
+    # share a session with the seed-time inserts above; the BYOK row
+    # is a single self-contained upsert.
+    repo = TenantLLMConfigRepository()
+    row = await repo.upsert(
+        tenant_id=DEMO_TENANT_ID,
+        provider_name=DEMO_LLM_PROVIDER,
+        encrypted_api_key=encrypted,
+        base_url=base_url,
+        enabled=True,
+    )
+    print(
+        f"  tenant_llm_config: tenant={DEMO_TENANT_ID} "
+        f"provider={row.provider_name} base_url={row.base_url or '<api.anthropic.com>'}"
+    )
+
+
 async def main() -> None:
     try:
         async with get_session() as s:
@@ -165,6 +232,9 @@ async def main() -> None:
                 ),
             )
             await s.commit()
+        # Tenant LLM config uses the Repository (its own sessionmaker)
+        # so it can't share the session above.
+        await _seed_tenant_llm_config()
     finally:
         # Mirror tests/e2e/scripts/seed.py: clear cached engine + sessionmaker
         # so the API process picks up a fresh event loop.

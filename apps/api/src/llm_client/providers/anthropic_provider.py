@@ -18,7 +18,6 @@ from llm_client.exceptions import (
 from llm_client.providers.base import BaseProvider
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse, MessageRole
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
 
@@ -48,16 +47,34 @@ class AnthropicProvider(BaseProvider):
     Args:
         api_key: Anthropic API key (must be non-empty).
         model: Default model ID (e.g. claude-3-5-sonnet-20241022).
+        base_url: API root. Default ``https://api.anthropic.com`` — set
+            this to a third-party Anthropic-format proxy (e.g.
+            ``https://api.minimaxi.com/anthropic`` for Claude Code's
+            MiniMax proxy) to reroute without code changes.
         timeout: HTTP timeout in seconds.
     """
 
     name = "anthropic"
+    _DEFAULT_BASE_URL = "https://api.anthropic.com"
 
-    def __init__(self, *, api_key: str, model: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
         if not api_key:
             raise ValueError("Anthropic API key required")
         self.api_key = api_key
         self.model = model
+        # base_url is the absolute origin of the Anthropic API. Strip a
+        # trailing slash so ``{base_url}/v1/messages`` always builds a
+        # clean URL whether the operator passes ``.../anthropic`` or
+        # ``.../anthropic/``. ``None`` falls back to the public
+        # api.anthropic.com origin.
+        self.base_url = (base_url or self._DEFAULT_BASE_URL).rstrip("/")
         # Client is owned by ``agent.llm_factory``'s process-wide
         # :class:`HttpClientPool` (nitpick S4). We just stash the
         # config and lazily fetch the pooled client on first call.
@@ -70,7 +87,7 @@ class AnthropicProvider(BaseProvider):
             from agent.llm_factory import _build_http_pool
 
             self._client = await _build_http_pool().get_or_create(
-                base_url="https://api.anthropic.com",
+                base_url=self.base_url,
                 headers={
                     "x-api-key": self.api_key,
                     "anthropic-version": ANTHROPIC_VERSION,
@@ -107,7 +124,7 @@ class AnthropicProvider(BaseProvider):
 
         try:
             client = await self._get_client()
-            resp = await client.post(ANTHROPIC_API_URL, json=body)
+            resp = await client.post("/v1/messages", json=body)
         except httpx.HTTPError as e:
             raise ProviderUnavailable(f"Anthropic network error: {e}") from e
 
@@ -184,7 +201,7 @@ class AnthropicProvider(BaseProvider):
 
         try:
             client = await self._get_client()
-            stream_ctx = client.stream("POST", ANTHROPIC_API_URL, json=body)
+            stream_ctx = client.stream("POST", "/v1/messages", json=body)
             async with stream_ctx as resp:
                 if resp.status_code == 429:
                     raise RateLimited("Anthropic rate limited")

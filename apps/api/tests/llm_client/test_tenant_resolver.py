@@ -146,3 +146,96 @@ def test_chain_tenant_ainvoke_delegates() -> None:
     import asyncio
     result = asyncio.run(resolver.ainvoke(MagicMock()))
     assert result == "response"
+
+
+def test_build_providers_threads_anthropic_base_url_from_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a tenant_llm_configs row has ``base_url`` set, the resolver
+    must thread it into AnthropicProvider (mirrors the OpenAI/MiniMax
+    path which already honours ``row.base_url``). Regression: the
+    original wiring ignored ``row.base_url`` for anthropic, which meant
+    Claude Code's MiniMax Anthropic proxy couldn't be selected per
+    tenant without code changes.
+    """
+    from llm_client.tenant_config_crypto import TenantLLMConfigCipher
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+
+    cipher = TenantLLMConfigCipher(
+        "nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y="  # dev-only; matches docker-compose
+    )
+    cache = TenantLLMConfigCache(
+        ttl_s=60.0,
+        maxsize=16,
+        cipher=cipher,
+        settings=MagicMock(
+            default_llm_model="MiniMax-M3",
+            minimax_model=None,
+            minimax_base_url=None,
+            openai_model=None,
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_anthropic(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _make_provider("anthropic")
+
+    monkeypatch.setattr(
+        "llm_client.providers.anthropic_provider.AnthropicProvider", fake_anthropic
+    )
+
+    row = MagicMock()
+    row.provider_name = "anthropic"
+    row.encrypted_api_key = cipher.encrypt("sk-tenant-key")
+    row.base_url = "https://api.minimaxi.com/anthropic"
+
+    out = cache._build_providers([row])
+    assert "anthropic" in out
+    assert captured["api_key"] == "sk-tenant-key"
+    assert captured["base_url"] == "https://api.minimaxi.com/anthropic"
+    assert captured["model"] == "MiniMax-M3"
+
+
+def test_build_providers_anthropic_omits_base_url_when_row_has_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the row's ``base_url`` is null we must NOT pass ``base_url=``
+    into AnthropicProvider — the provider's default kicks in
+    (api.anthropic.com). Mirrors provider_registry.py which uses
+    conditional kwargs to keep the real-Anthropic callers unchanged.
+    """
+    from llm_client.tenant_config_crypto import TenantLLMConfigCipher
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+
+    cipher = TenantLLMConfigCipher(
+        "nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y="  # dev-only; matches docker-compose
+    )
+    cache = TenantLLMConfigCache(
+        ttl_s=60.0,
+        maxsize=16,
+        cipher=cipher,
+        settings=MagicMock(
+            default_llm_model="claude-3-5-sonnet-20241022",
+            minimax_model=None,
+            minimax_base_url=None,
+            openai_model=None,
+        ),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_anthropic(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _make_provider("anthropic")
+
+    monkeypatch.setattr(
+        "llm_client.providers.anthropic_provider.AnthropicProvider", fake_anthropic
+    )
+
+    row = MagicMock()
+    row.provider_name = "anthropic"
+    row.encrypted_api_key = cipher.encrypt("sk-real-anthropic")
+    row.base_url = None
+
+    cache._build_providers([row])
+    assert "base_url" not in captured

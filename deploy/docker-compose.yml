@@ -95,6 +95,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
       PYTHONPATH: /repo/apps/api/src
+      # The demo tenant's LLM config seed reads these so the agent graph
+      # can decrypt the BYOK row it inserts. Must match the api
+      # service's TENANT_LLM_FERNET_KEY above. All optional — when
+      # ANTHROPIC_API_KEY is unset the seed skips the row entirely.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      TENANT_LLM_FERNET_KEY: ${TENANT_LLM_FERNET_KEY:-nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y=}
     volumes:
       - ../apps/api/src:/repo/apps/api/src:ro
       - ../tests/e2e/scripts:/repo/tests/e2e/scripts:ro
@@ -137,6 +144,25 @@ services:
       DEFAULT_EMBEDDING_MODEL: ${DEFAULT_EMBEDDING_MODEL:-text-embedding-3-small}
       DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
       DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+      # Anthropic-compatible LLM. When ANTHROPIC_BASE_URL is set the
+      # provider is rerouted to a third-party Anthropic-format proxy
+      # (e.g. Claude Code's MiniMax proxy). DEFAULT_LLM_MODEL can be any
+      # model name the proxy accepts; the prefix resolver falls through
+      # to the anthropic provider whenever the matching family isn't
+      # locally registered (e.g. ``minimax-m3`` -> anthropic when only
+      # ANTHROPIC_API_KEY is configured).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:-claude-3-5-sonnet-20241022}
+      # M4.C BYOK Fernet key. The api container reads this to decrypt
+      # per-tenant LLM API keys in tenant_llm_configs; the ``seed``
+      # one-shot reads the SAME key to encrypt the demo tenant's
+      # row when extending the demo seed with an LLM config. Must be
+      # a url-safe-base64 Fernet key (generate with ``Fernet.generate_key()``);
+      # the dev value here matches DEMO_TENANT_LLM_FERNET_KEY in
+      # apps/example-integration/scripts/extend-seed.py. Override in
+      # production via .env — DO NOT ship the dev key.
+      TENANT_LLM_FERNET_KEY: ${TENANT_LLM_FERNET_KEY:-nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y=}
       # Multimodal KB (Stage 17): S3-compatible object store (MinIO in
       # dev, real AWS S3 in prod) + Doubao vision embedder credentials.
       # The api service depends on the ``minio`` container below; the
