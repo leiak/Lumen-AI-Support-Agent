@@ -21,6 +21,11 @@ from admin.schemas.users import (
     UserRead,
     UserUpdate,
 )
+from admin.schemas.widget_config import (
+    WidgetConfigRead,
+    WidgetConfigResetResponse,
+    WidgetConfigUpdate,
+)
 
 __all__ = [
     "TenantBudgetCreate",
@@ -35,4 +40,7 @@ __all__ = [
     "UserPasswordReset",
     "UserRead",
     "UserUpdate",
+    "WidgetConfigRead",
+    "WidgetConfigResetResponse",
+    "WidgetConfigUpdate",
 ]

@@ -72,6 +72,11 @@ from admin.schemas.users import (
     UserRead,
     UserUpdate,
 )
+from admin.schemas.widget_config import (
+    WidgetConfigRead,
+    WidgetConfigResetResponse,
+    WidgetConfigUpdate,
+)
 from auth.dependencies import require_admin
 from auth.password import hash_password
 from budget.cleanup import run_budget_cleanup
@@ -94,6 +99,7 @@ from tenant.repository import TenantRepository, UserRepository
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import SlaPolicy
 from ticket.repository import TicketRepository
+from widget.repository import WidgetConfigRepository
 from ticket.schemas import (
     SlaPolicyCreate,
     SlaPolicyRead,
@@ -1476,6 +1482,109 @@ async def delete_tenant_user(
             detail="user is referenced by other rows",
         ) from exc
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.4 — Tenant widget appearance config endpoints.
+#
+# GET    /api/v1/admin/tenants/{tid}/widget-config   — read (returns defaults if absent)
+# PATCH  /api/v1/admin/tenants/{tid}/widget-config   — upsert (creates row with defaults)
+# DELETE /api/v1/admin/tenants/{tid}/widget-config   — reset to defaults (idempotent)
+#
+# Anti-enumeration 404 (cross-tenant access), same as the rest of the
+# admin surface. Defaults match the M2.A baseline so a freshly-
+# seeded tenant looks identical before any admin edits.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/widget-config",
+    response_model=WidgetConfigRead,
+)
+async def get_widget_config(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> WidgetConfigRead:
+    """Read the current tenant's widget appearance config.
+
+    If the row is absent (tenant has never customized), the
+    response materializes the M2.A defaults — the SPA renders an
+    editable form pre-filled with those values, and the first PATCH
+    materializes the row.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    row = await WidgetConfigRepository().get(tenant_id)
+    if row is None:
+        # Return a synthesized default row (no DB write).
+        from admin.schemas.widget_config import (
+            DEFAULT_PRIMARY_COLOR,
+            DEFAULT_WELCOME_MESSAGE,
+            DEFAULT_WIDGET_TITLE,
+        )
+
+        return WidgetConfigRead(
+            tenant_id=tenant_id,
+            theme="light",
+            primary_color=DEFAULT_PRIMARY_COLOR,
+            position="bottom-right",
+            widget_title=DEFAULT_WIDGET_TITLE,
+            welcome_message=DEFAULT_WELCOME_MESSAGE,
+            logo_url=None,
+            enabled=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    return WidgetConfigRead.model_validate(row)
+
+
+@router.patch(
+    "/tenants/{tenant_id}/widget-config",
+    response_model=WidgetConfigRead,
+)
+async def patch_widget_config(
+    tenant_id: str,
+    payload: WidgetConfigUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> WidgetConfigRead:
+    """Upsert the tenant's widget appearance config.
+
+    All fields optional. PATCH on an absent row creates one with
+    the server-side defaults; omitted fields preserve the existing
+    value.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    row = await WidgetConfigRepository().upsert(
+        tenant_id,
+        theme=payload.theme,
+        primary_color=payload.primary_color,
+        position=payload.position,
+        widget_title=payload.widget_title,
+        welcome_message=payload.welcome_message,
+        logo_url=payload.logo_url,
+        enabled=payload.enabled,
+    )
+    return WidgetConfigRead.model_validate(row)
+
+
+@router.delete(
+    "/tenants/{tenant_id}/widget-config",
+    response_model=WidgetConfigResetResponse,
+)
+async def reset_widget_config(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> WidgetConfigResetResponse:
+    """Reset the tenant's widget config to defaults (idempotent).
+
+    The next GET will materialize the defaults in memory — there is
+    no need to re-insert a row until the admin PATCHes again.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    await WidgetConfigRepository().delete(tenant_id)
+    return WidgetConfigResetResponse(tenant_id=tenant_id, reset=True)
 
 
 __all__ = ["router"]

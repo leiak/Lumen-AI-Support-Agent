@@ -11,6 +11,7 @@ import {
   Cpu,
   Users,
   Building2,
+  MessageSquare,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -39,6 +40,7 @@ const adminNavItems: NavItem[] = [
   { to: '/admin/llm-configs', label: 'LLM 配置', icon: Cpu },
   { to: '/admin/users', label: '用户管理', icon: Users },
   { to: '/admin/tenant-settings', label: '租户设置', icon: Building2 },
+  { to: '/admin/widget-config', label: 'Widget 配置', icon: MessageSquare },
 ];
 
 export function AppShell(): JSX.Element {

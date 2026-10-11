@@ -8,6 +8,7 @@ import { AdminLLMConfigsPage } from '@/pages/admin-llm-configs';
 import { AdminSlaPoliciesPage } from '@/pages/admin-sla-policies';
 import { AdminTenantSettingsPage } from '@/pages/admin-tenant-settings';
 import { AdminUsersPage } from '@/pages/admin-users';
+import { AdminWidgetConfigPage } from '@/pages/admin-widget-config';
 import { AdminBudgetPage } from '@/pages/admin-budget';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { AdminTicketDetailPage } from '@/pages/admin-ticket-detail';
@@ -97,6 +98,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminTenantSettingsPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/widget-config"
+          element={
+            <AdminGuard>
+              <AdminWidgetConfigPage />
             </AdminGuard>
           }
         />
