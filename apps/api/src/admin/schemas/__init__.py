@@ -27,10 +27,13 @@ from admin.schemas.widget_config import (
     WidgetConfigUpdate,
 )
 from admin.schemas.dashboard import DashboardRead, StatusCount
+from admin.schemas.search import SearchResult, SearchResultsOut
 
 __all__ = [
     "DashboardRead",
     "StatusCount",
+    "SearchResult",
+    "SearchResultsOut",
     "TenantBudgetCreate",
     "TenantBudgetRead",
     "TenantBudgetUsageRead",

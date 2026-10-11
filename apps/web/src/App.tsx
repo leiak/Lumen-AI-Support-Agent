@@ -11,6 +11,7 @@ import { AdminUsersPage } from '@/pages/admin-users';
 import { AdminWidgetConfigPage } from '@/pages/admin-widget-config';
 import { AdminBudgetPage } from '@/pages/admin-budget';
 import { AdminDashboardPage } from '@/pages/admin-dashboard';
+import { AdminSearchPage } from '@/pages/admin-search';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { AdminTicketDetailPage } from '@/pages/admin-ticket-detail';
 import { LoginPage } from '@/pages/login';
@@ -115,6 +116,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminDashboardPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/search"
+          element={
+            <AdminGuard>
+              <AdminSearchPage />
             </AdminGuard>
           }
         />

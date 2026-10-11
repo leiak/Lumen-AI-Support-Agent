@@ -19,6 +19,7 @@ import { Button } from '@/components/ui/button';
 import { clearAuthToken } from '@/lib/api-client';
 import { useCurrentUser } from '@/lib/use-current-user';
 import { LanguageSwitcher } from '@/components/layout/language-switcher';
+import { GlobalSearchInput } from '@/components/layout/global-search-input';
 import { useIsAdmin } from '@/lib/use-is-admin';
 import { cn } from '@/lib/utils';
 
@@ -66,6 +67,7 @@ export function AppShell(): JSX.Element {
           </span>
         </div>
         <div className="flex items-center gap-4">
+          <GlobalSearchInput />
           <span
             className="text-sm text-muted-foreground"
             data-testid="current-user-email"

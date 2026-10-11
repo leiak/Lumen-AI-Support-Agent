@@ -58,6 +58,8 @@ from admin.schemas.budget import (
     TenantBudgetUsageRead,
 )
 from admin.schemas.dashboard import DashboardRead, StatusCount
+from admin.schemas.search import SearchResultsOut
+from admin.search import AdminSearchService
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
@@ -1726,6 +1728,37 @@ async def get_tenant_dashboard(
         active_users=active_users,
         total_users=total_users,
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 Task 3.3 — cross-domain search
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/search",
+    response_model=SearchResultsOut,
+)
+async def admin_search(
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    q: Annotated[str, Query(min_length=1, max_length=100)],
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> SearchResultsOut:
+    """Cross-domain search across KB articles + tickets + conversations.
+
+    The tenant is taken from the JWT — operators can only search
+    what they're already authorised to read. Empty ``q`` returns
+    an empty result set (not an error) so a cleared input doesn't
+    flash a 422 to the user.
+    """
+    sm = get_sessionmaker()
+    async with sm() as session:
+        service = AdminSearchService(session)
+        return await service.search(
+            tenant_id=claims["tenant_id"],
+            query=q,
+            limit=limit,
+        )
 
 
 __all__ = ["router"]
