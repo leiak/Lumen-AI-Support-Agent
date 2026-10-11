@@ -123,6 +123,90 @@ jobs:
       - name: Build bundle
         run: pnpm --filter @lumen/web-sdk build
 
+  # Tier 3 Task 3.2 — Playwright E2E suite in CI. Same rule as the
+  # docker-build job: only on push to main. PRs stay fast (the
+  # suite spins up Postgres + Redis + Qdrant + Vite + uvicorn +
+  # static host + a Chromium browser; ~3-5 minutes end-to-end and
+  # we don't want that gating every PR).
+  #
+  # The suite tolerates the API returning 503 (degraded Qdrant →
+  # ``llm_unavailable`` fallback); we don't gate CI on a real LLM
+  # key. The /health probe plus the suite's own self-validation
+  # is enough to catch a real regression.
+  e2e:
+    name: Playwright E2E (Chromium)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aicustomer
+          POSTGRES_PASSWORD: aicustomer
+          POSTGRES_DB: aicustomer
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aicustomer"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+      qdrant:
+        image: qdrant/qdrant:v1.7.4
+        ports: ["6333:6333"]
+    env:
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@localhost:5432/aicustomer
+      REDIS_URL: redis://localhost:6379/0
+      QDRANT_URL: http://localhost:6333
+      JWT_SECRET: ci-only-secret-at-least-32-characters-long
+      ENVIRONMENT: development
+      DOUBAO_API_KEY: ci-only-key-not-real
+      CI: "1"
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: apps/api/pyproject.toml
+      - name: Install uv (matches local dev — playwright config + globalSetup use ``uv run``)
+        run: pip install uv
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/playwright.config.ts', 'apps/web-sdk/package.json') }}
+      - name: Install API deps
+        run: pip install -e ".[dev]"
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+      - name: Migrate DB schema
+        run: uv run alembic upgrade head
+      - name: Build web SDK bundle (globalSetup expects dist/lumen-widget.js)
+        run: pnpm --filter @lumen/web-sdk build
+      - name: Run Playwright suite
+        run: pnpm exec playwright test --config=tests/e2e/playwright.config.ts
+      - name: Upload Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: tests/e2e/report
+          retention-days: 14
+
   # Stage 11.7: smoke-test the container images end-to-end. Only runs
   # on push to main — PRs stay fast (DockerHub rate-limit + ~2 min
   # build savings per PR). The api smoke test curls ``/health/live``,
