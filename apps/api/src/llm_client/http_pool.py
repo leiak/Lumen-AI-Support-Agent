@@ -26,11 +26,12 @@ internal httpx pool, so wrapping it in our pool would be a no-op.
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import httpx
 
-_log = logging.getLogger("llm_client.http_pool")
+from core.logging import get_logger
+
+_log = get_logger("llm_client.http_pool")
 
 
 class HttpClientPool:

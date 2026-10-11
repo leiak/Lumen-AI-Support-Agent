@@ -94,6 +94,79 @@ def test_client_ip_falls_back_to_leftmost_when_header_shorter_than_hops(
     assert _client_ip(req) == "1.2.3.4"
 
 
+@pytest.mark.parametrize(
+    "header_value",
+    [
+        b"   ",        # whitespace-only
+        b",",          # bare comma
+        b" , ",        # comma wrapped in whitespace
+        b"  ,  ,  ",   # only whitespace separators
+        b", , ,",      # all-empty entries
+    ],
+)
+def test_client_ip_falls_back_to_socket_when_xff_header_is_empty_after_split(
+    monkeypatch: pytest.MonkeyPatch,
+    reset_settings_after_test,
+    header_value: bytes,
+) -> None:
+    """Pin the contract for degenerate XFF headers (whitespace / commas only).
+
+    ``_client_ip`` filters empty / whitespace-only entries via
+    ``[e.strip() for e in fwd.split(",") if e.strip()]``. When the
+    filter produces ``entries=[]`` we want the function to fall through
+    to ``request.client.host`` instead of returning the empty string or
+    the literal ``"unknown"`` — those would either (a) collapse every
+    request into a single rate-limit bucket (silent DoS of legitimate
+    callers sharing an empty key) or (b) crash downstream string
+    formatting that assumes a real IP.
+
+    Regression target: a future refactor of the split-and-filter logic
+    must not regress these inputs to ``""`` / ``"unknown"``.
+    """
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:y@localhost:5432/z")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("JWT_SECRET", "xK3mF9pL2qR8tN5vW7yA1bC4dE6gH0iJ")
+    # Trust one hop so the XFF branch is exercised (the no-proxy branch
+    # would skip it entirely).
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    reset_settings()
+    from fastapi import Request
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-forwarded-for", header_value)],
+        "client": ("9.9.9.9", 12345),
+    }
+    req = Request(scope)
+    assert _client_ip(req) == "9.9.9.9"
+
+
+def test_client_ip_strips_whitespace_around_real_entries(
+    monkeypatch: pytest.MonkeyPatch, reset_settings_after_test
+) -> None:
+    """Padded-but-real entries (``"  1.2.3.4  ,  10.0.0.1"``) must be
+    accepted. Split-then-strip preserves the real IP and discards
+    leading/trailing whitespace, so the contract is robust against
+    proxies that pad with spaces (nginx ``proxy_set_header X-Forwarded-For
+    $proxy_add_x_forwarded_for;`` does not, but a custom WASM filter
+    might)."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:y@localhost:5432/z")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("JWT_SECRET", "xK3mF9pL2qR8tN5vW7yA1bC4dE6gH0iJ")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    reset_settings()
+    from fastapi import Request
+
+    scope = {
+        "type": "http",
+        "headers": [(b"x-forwarded-for", b"  1.2.3.4  ,  10.0.0.1  ")],
+        "client": ("9.9.9.9", 12345),
+    }
+    req = Request(scope)
+    # 1 trusted hop → next leftward is 1.2.3.4 (the originating client).
+    assert _client_ip(req) == "1.2.3.4"
+
+
 class _PipelineCtx:
     """Minimal async-context-manager stand-in for a Redis pipeline.
 
