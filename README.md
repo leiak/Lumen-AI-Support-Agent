@@ -34,7 +34,10 @@
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
 | 22 (M4.B) | LLM Gateway Fallback Resolver — chain-based failover on M4.A resolver seam (`FallbackResolver.ainvoke` + `FallbackChainExhausted(attempts)` + per-step `lumen_llm_fallback_attempts_total{provider,model,step,outcome}` + env-driven `LLM_FALLBACK_CHAIN`) | ✅ | 10 resolver + 5 client branch + 12 gateway/env + 6 factory + e2e + 3 regression |
 | 23 (M4.C) | LLM Gateway Tenant Resolver (BYOK) — per-tenant provider API keys (Fernet at rest + LRU/TTL cache + admin POST/GET endpoints + strict-mode `TenantLlmNotConfigured` + `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` zero-label counter) | ✅ | 4 cipher + 5 ORM + 9 resolver + 7 factory + 9 admin + 3 e2e |
-| 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics; **Pack A**: sticky soft-warn (`soft_warn_fired_at`) + DB-direct pre-check + `pg_advisory_xact_lock` in `refresh()` + daily cleanup cron + `/admin/budget/cleanup` super-admin endpoint) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e + **Pack A: 2 migration + 2 repo + 6 resolver + 4 cleanup + 1 admin + 3 e2e** |
+| 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics; **Pack A**: sticky soft-warn (`soft_warn_fired_at`) + DB-direct pre-check + `pg_advisory_xact_lock` in `refresh()` + daily cleanup cron + `/admin/budget/cleanup` super-admin endpoint; **Pack B**: `tenant_budget_credits` (immutable grant audit log) + `CreditService` + `PerModelBreakdown` cache + `LLM_BUDGET_GATE_TOTAL` 429 gate; **Pack C**: Docker 部署验证(端口偏移 25432/26333/26379 + migrate/seed one-shots + `seed_budget.py` + `main.py` startup typo 修复)) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e + **Pack A: 2 migration + 2 repo + 6 resolver + 4 cleanup + 1 admin + 3 e2e** + **Pack B: 27 tests** + **Pack C: end-to-end Docker bring-up** |
+| 25 (Tier 1/2/3) | 14 任务 gap-fill — **Tier 1**: admin tickets/channel CRUD/LLM Config/budget mutation (4 commit, 155 tests); **Tier 2**: 已知 nitpick 整理 (14 任务,5 commit + silent-observability 修复 + session bug); **Tier 3**: i18n + Playwright CI + cross-domain admin search + runtime LLM provider chain admin (5 commit, 219 frontend + 120 backend tests) | ✅ | 155 (Tier 1) + 79 (Tier 2) + 38 (Tier 3) = **272 new tests** |
+| 26 (Quick Wins) | **A**: HttpClientPool `aclose_all` failure injection + 5 个 XFF whitespace parametrize + 顺手修 `http_pool.py` 没迁到 structlog 的 bug (1 commit, 10 new tests); **B**: ruff sweep 41 → 0 (1 commit); **C**: demo-act4-02 spec 启用 — `test.skip` 移除 + captureFlow 实际写盘 + `playwright.docker.config.ts` 绕过端口冲突 + 跑通产生 `images/demo-act4-02.png` (1 commit) | ✅ | 10 (A) + 0 (B) + 1 (C) = **11 new tests + 1 captured PNG** |
+| 顺手 bugfixes | `BudgetResolver._PrefixResolver` 单 provider 处理 + `stream_chat` async-context guard (loop-running detect) | ✅ | 2 new tests (prefix resolver + stream_chat loop) |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -155,6 +158,11 @@ make eval-rag-real
 # 录制 demo 截图(需 Postgres+Redis+Qdrant up,seed 已跑)
 bash tests/e2e/scripts/record-demo.sh  # → 11 张 images/demo-act{N}-{step}.png
 # PowerShell: .\tests\e2e\scripts\record-demo.ps1
+
+# 单 spec 跑通(无需 webServer 启动,默认已 docker stack 在跑)
+DEMO_WEB_URL=http://localhost:8080 \
+  pnpm exec playwright test --config=tests/e2e/playwright.docker.config.ts \
+    tests/e2e/demo-act4-02.spec.ts
 ```
 
 ### 环境变量
@@ -319,7 +327,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 6. **Plan 10.4 LLM/tracing spans 留 M3** — M1 close-out 只做 request_id 贯穿;OpenTelemetry 留到 M3 LLM Gateway
 7. **Plan 10.7 K8s manifests 留 M3/M4** — docker-compose 单区域部署够用
 8. **`search_internal_kb` 只查 KB 文本** — 当前只检索 Qdrant 文本块;vision/多模态(图/PDF 图表)待 M2.B
-9. **Ticket 工单当前无 UI** — 后端完整,前端 `/tickets/{id}` 页面待补(`tests/e2e/demo-act4-02.spec.ts` 已写契约 + `test.skip` 等前端就绪)
+9. ~~Ticket 工单当前无 UI~~ — Stage 20 #20 admin SPA UI 已 ship `/admin/tickets/{id}` (`admin-ticket-detail.tsx`),demo-act4-02 spec 已启用(`1713c8e`),PNG 已捕获到 `images/demo-act4-02.png`
 10. **Judge 模型假阳性** — QA Judge 阈值默认 0.3,首批 spot-check 后调;`lumen_qa_flagged_total` 曲线要人工盯
 11. **`stream_chat()` skips fallback** — 设计选择 (mid-stream switch 不可靠);M4.B+ 视客户用例再考虑
 12. **No per-step budget** — `attempt_timeout_s` 单一值应用到所有 step;Deferred
