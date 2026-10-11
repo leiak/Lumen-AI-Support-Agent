@@ -135,14 +135,19 @@ class BudgetResolver:
         """
         if self._budget is None:
             # Opt-out: no enforcement, no snapshot reads or writes.
-            return await self._inner.ainvoke(request)
+            return await self._invoke_inner(request)
         period, period_start = await self._pre_check()
         try:
-            resp = await self._inner.ainvoke(request)
+            resp = await self._invoke_inner(request)
         except _NoChainConfigured:
-            # Single-provider tenant — replicate LLMClient's retry loop so
-            # _post_record still runs and cap tracking stays consistent.
-            primary = self._inner(request)  # sync __call__ returns primary provider
+            # Single-provider tenant wrapped in ``TenantResolver`` — fall
+            # through to the primary provider via ``__call__`` so
+            # ``_post_record`` still runs and cap tracking stays
+            # consistent. Kept as a defensive branch: ``TenantResolver``
+            # isn't part of the standard chain (the cache builder returns
+            # ``gateway.default_resolver`` directly), but the helper
+            # above can surface this for a wrapped resolver too.
+            primary = self._inner(request)
             resp = await primary.chat(request)
         except RateLimited:
             # Provider chain exhausted on 429. Invalidate per-model cache
@@ -159,6 +164,33 @@ class BudgetResolver:
         if tokens_consumed > 0:
             await self._post_record(period, period_start, tokens_consumed)
         return resp
+
+    async def _invoke_inner(self, request: ChatRequest) -> ChatResponse:
+        """Delegate to the inner resolver uniformly across resolver shapes.
+
+        The inner resolver can be one of:
+
+        * :class:`llm_client.resolvers.FallbackResolver` — has ``ainvoke``;
+          execute the full chain and return the first success.
+        * :class:`llm_client.resolvers._PrefixResolver` (the gateway's
+          ``default_resolver`` for single-provider tenants) — only
+          exposes the ``Resolver`` ``__call__`` protocol; calling
+          ``ainvoke`` on it raises ``AttributeError`` (not
+          ``_NoChainConfigured``). Mirror ``TenantResolver``'s behavior:
+          resolve to the primary provider via ``__call__``, then chat.
+
+        Keeping the dispatch in one place keeps :meth:`ainvoke` readable
+        and makes the single-provider fallback the same path regardless
+        of which optional wrapper is present.
+        """
+        if hasattr(self._inner, "ainvoke"):
+            return await self._inner.ainvoke(request)
+        # Single-provider tenant (inner is ``_PrefixResolver``). Resolve
+        # the primary provider via the ``Resolver`` ``__call__`` protocol
+        # and chat directly — same path ``LLMClient`` takes when it sees
+        # no ``ainvoke`` on the resolver.
+        primary = self._inner(request)
+        return await primary.chat(request)
 
     # ---- pre-check ---------------------------------------------------------
 

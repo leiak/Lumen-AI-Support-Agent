@@ -659,3 +659,81 @@ async def test_post_record_skips_invalidate_when_no_cache() -> None:
     # Must complete without raising.
     await resolver.ainvoke(MagicMock(spec=ChatRequest))
     snap_repo.set_tokens_used.assert_awaited()
+
+
+async def test_ainvoke_handles_prefix_resolver_inner_without_ainvoke() -> None:
+    """Single-provider tenant via real ``_PrefixResolver`` shape (no ``ainvoke``).
+
+    Regression for the M4.D ↔ MiniMax-proxy demo bug: when a tenant has a
+    ``tenant_budgets`` row + a single provider, ``_default_llm_client_factory``
+    wraps the gateway's ``default_resolver`` (a :class:`_PrefixResolver`,
+    which only implements the ``__call__`` ``Resolver`` protocol) inside a
+    :class:`BudgetResolver`. The old code called ``self._inner.ainvoke(...)``
+    directly and crashed with ``AttributeError`` instead of routing through
+    the primary provider. The fix dispatches via ``__call__`` + ``provider.chat``
+    so single-provider tenants with a budget row still get their calls tracked.
+    """
+    primary_provider = MagicMock()
+    response = MagicMock()
+    response.prompt_tokens = 100
+    response.completion_tokens = 50
+    primary_provider.chat = AsyncMock(return_value=response)
+
+    class _PrefixResolverLike:
+        """Mirror of llm_client.resolvers._PrefixResolver: __call__ only."""
+
+        def __call__(self, request):
+            return primary_provider
+
+    inner = _PrefixResolverLike()  # NO ainvoke attribute at all
+
+    cache = MagicMock()
+    snap = _make_snapshot("t1", "2026-10", 0)
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(return_value=snap)
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=_make_budget(),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    # The bug: this raised AttributeError ("'_PrefixResolver' object has no
+    # attribute 'ainvoke'") and wrapped as ProviderUnavailable in
+    # LLMClient.chat, breaking every agent-graph call for budget tenants.
+    resp = await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    assert resp is response
+    primary_provider.chat.assert_awaited_once()
+    # post_record must still run so cap enforcement + soft-warn fire.
+    repo.set_tokens_used.assert_awaited()
+    last_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert last_kwargs["tokens_used"] == 150
+
+
+async def test_ainvoke_handles_prefix_resolver_inner_when_no_budget() -> None:
+    """budget=None + _PrefixResolver inner → still routes through __call__.
+
+    The opt-out branch (``self._budget is None``) historically called
+    ``self._inner.ainvoke(...)`` directly. Same AttributeError for
+    _PrefixResolver inners. After the fix the helper centralizes dispatch.
+    """
+    primary_provider = MagicMock()
+    response = MagicMock()
+    response.prompt_tokens = 7
+    response.completion_tokens = 3
+    primary_provider.chat = AsyncMock(return_value=response)
+
+    class _PrefixResolverLike:
+        def __call__(self, request):
+            return primary_provider
+
+    inner = _PrefixResolverLike()
+    resolver = BudgetResolver(
+        inner=inner, tenant_id="t1",
+        budget=None,
+        snapshot_cache=MagicMock(),
+    )
+    resp = await resolver.ainvoke(MagicMock(spec=ChatRequest))
+    assert resp is response
+    primary_provider.chat.assert_awaited_once()

@@ -158,12 +158,23 @@ async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
 def _resolve_default_model() -> str:
     """Resolve the effective default model from settings.
 
-    (Unchanged from M4.B; preserved for backward compatibility with
-    :class:`SimpleResponder.__init__`.)
+    Preference order (2026-10-11):
+
+    1. ``settings.default_llm_model`` (``DEFAULT_LLM_MODEL`` env var) —
+       operator override. Lets a Claude Code operator reroute the graph
+       to a proxy-specific name (``MiniMax-M3`` for the MiniMax Anthropic-
+       compatible proxy) without code changes. Without this, the graph
+       was hardcoded to ``claude-haiku-4-5`` and the proxy returned 4xx.
+    2. ``settings.minimax_model`` when ``MINIMAX_API_KEY`` is set — the
+       MiniMax direct (non-Anthropic-compatible) path.
+    3. The module-level ``DEFAULT_MODEL`` constant — kept for back-compat
+       with deployments that never touched ``DEFAULT_LLM_MODEL``.
     """
     from agent.simple_responder import DEFAULT_MODEL
 
     settings = get_settings()
+    if settings.default_llm_model:
+        return settings.default_llm_model
     if settings.minimax_api_key:
         return settings.minimax_model or "MiniMax-M3"
     return DEFAULT_MODEL
