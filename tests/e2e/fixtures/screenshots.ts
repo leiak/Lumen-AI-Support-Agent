@@ -7,7 +7,7 @@
  * of which test ran first. ``captureFlow`` writes to a stable path
  * AND attaches the buffer to the test report.
  */
-import { mkdir } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -24,6 +24,12 @@ const ARTIFACTS = join(HERE, '..', 'artifacts');
  *
  * ``name`` MUST be unique per flow (Flow A / Flow B each have one
  * final screenshot — see the task spec).
+ *
+ * Persistence: the disk write happens BEFORE the testInfo.attach so
+ * that even if the runner's output cleanup deletes the test-results
+ * directory after a passing run, the run-local artefact under
+ * ``tests/e2e/artifacts/`` survives (post-run shell scripts pick it
+ * up to commit into ``images/<name>.png``).
  */
 export async function captureFlow(
   page: Page,
@@ -31,15 +37,13 @@ export async function captureFlow(
   name:
     | 'agent-flow-complete'
     | 'widget-flow-complete'
-    // Stage 13 / Task 6 (M2.A): ticket detail flow. The frontend
-    // page does not exist yet — the demo-act4-02.spec.ts spec is
-    // shipped as a stub (skipped) so the contract is in place when
-    // the M2.A frontend ships.
+    // Stage 13 / Task 6 (M2.A): ticket detail flow.
     | 'ticket-detail-complete',
 ): Promise<void> {
   await mkdir(ARTIFACTS, { recursive: true });
   const filePath = join(ARTIFACTS, `${name}.png`);
   const buffer = await page.screenshot({ fullPage: true });
+  await writeFile(filePath, buffer);
   await testInfo.attach(name, { body: buffer, contentType: 'image/png' });
   // eslint-disable-next-line no-console -- intentional operator log
   console.log(`[e2e] screenshot saved → ${filePath}`);
