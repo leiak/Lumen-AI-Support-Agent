@@ -11,6 +11,7 @@ import { AdminUsersPage } from '@/pages/admin-users';
 import { AdminWidgetConfigPage } from '@/pages/admin-widget-config';
 import { AdminBudgetPage } from '@/pages/admin-budget';
 import { AdminDashboardPage } from '@/pages/admin-dashboard';
+import { AdminLlmChainPage } from '@/pages/admin-llm-chain';
 import { AdminSearchPage } from '@/pages/admin-search';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { AdminTicketDetailPage } from '@/pages/admin-ticket-detail';
@@ -124,6 +125,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminSearchPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/llm-chain"
+          element={
+            <AdminGuard>
+              <AdminLlmChainPage />
             </AdminGuard>
           }
         />

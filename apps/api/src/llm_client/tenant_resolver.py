@@ -202,6 +202,15 @@ class TenantLLMConfigCache:
                         if self._settings is not None
                         else "claude-3-5-sonnet-20241022"
                     ),
+                    # Thread the per-row base_url so a tenant can reroute
+                    # the Anthropic-format POST to a third-party proxy
+                    # (e.g. Claude Code's MiniMax proxy at
+                    # https://api.minimaxi.com/anthropic). When the row
+                    # has no base_url we deliberately omit the kwarg so
+                    # the provider falls back to api.anthropic.com —
+                    # mirrors provider_registry.py's conditional-kwarg
+                    # pattern that protects real-Anthropic callers.
+                    **({"base_url": row.base_url} if row.base_url else {}),
                 )
             elif row.provider_name == "openai":
                 out[row.provider_name] = OpenAIProvider(
@@ -242,15 +251,23 @@ class TenantLLMConfigCache:
         # Lazy imports to avoid circular dep with gateway
         from llm_client.gateway import LLMGateway
         from llm_client.provider_registry import parse_fallback_chain_env
+        from llm_client.runtime_chain import get_runtime_chain
 
-        chain = (
-            parse_fallback_chain_env(self._settings.llm_fallback_chain)
-            if self._settings is not None
-            else None
-        )
+        # Seed the runtime chain from env once (idempotent). After
+        # that, admin mutations via ``ReplaceStore`` win. This is the
+        # single source of truth for the default fallback resolver —
+        # Task 3.4.
+        runtime = get_runtime_chain()
+        if self._settings is not None and not runtime.snapshot():
+            env_steps = parse_fallback_chain_env(
+                self._settings.llm_fallback_chain
+            )
+            if env_steps:
+                runtime.initial_steps(env_steps)
+        chain = runtime.active_chain() or None
         gateway = LLMGateway(
             providers=providers,
-            default_fallback_chain=chain or None,
+            default_fallback_chain=chain,
             attempt_timeout_s=(
                 self._settings.llm_fallback_attempt_timeout_s
                 if self._settings is not None

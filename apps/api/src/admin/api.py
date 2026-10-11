@@ -58,6 +58,12 @@ from admin.schemas.budget import (
     TenantBudgetUsageRead,
 )
 from admin.schemas.dashboard import DashboardRead, StatusCount
+from admin.schemas.llm_chain import (
+    LLMChainRead,
+    LLMChainStep,
+    LLMChainUpdate,
+    LLMProviderInfo,
+)
 from admin.schemas.search import SearchResultsOut
 from admin.search import AdminSearchService
 from admin.schemas.tenant_llm_config import (
@@ -87,6 +93,7 @@ from budget.credits import CreditService
 from budget.per_model import PerModelService, get_per_model_cache
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
+from core.config import get_settings
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from knowledge.enums import ArticleSourceType, ArticleStatus
@@ -106,6 +113,11 @@ from widget.repository import WidgetConfigRepository
 from conversation.enums import ConversationStatus
 from conversation.models import Conversation
 from llm_client.models import LLMUsage
+from llm_client.provider_registry import build_provider_registry
+from llm_client.runtime_chain import (
+    ChainStep,
+    get_runtime_chain,
+)
 from ticket.schemas import (
     SlaPolicyCreate,
     SlaPolicyRead,
@@ -1759,6 +1771,91 @@ async def admin_search(
             query=q,
             limit=limit,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 Task 3.4 — runtime LLM provider chain admin
+# ---------------------------------------------------------------------------
+
+
+def _list_global_providers() -> list[LLMProviderInfo]:
+    """Snapshot the globally-registered providers (no credentials)."""
+    try:
+        registry = build_provider_registry(get_settings())
+    except RuntimeError:
+        # No provider configured — return empty list so the SPA
+        # shows an explicit "no providers" empty state instead of
+        # crashing the page.
+        return []
+    default_name = next(iter(registry))
+    return [
+        LLMProviderInfo(
+            name=p.name,
+            model=getattr(p, "model", ""),
+            is_default=(p.name == default_name),
+        )
+        for p in registry.values()
+    ]
+
+
+@router.get(
+    "/llm-chain",
+    response_model=LLMChainRead,
+)
+async def get_llm_chain(
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> LLMChainRead:
+    """Read the current runtime fallback chain + provider registry.
+
+    Returns the chain that the next gateway construction will use
+    (the ``RuntimeChain`` singleton), plus the list of providers
+    the admin is allowed to put in the chain. No API keys are
+    included — the SPA doesn't need them.
+    """
+    runtime = get_runtime_chain()
+    steps = [
+        LLMChainStep(provider=s.provider, model=s.model, enabled=s.enabled)
+        for s in runtime.snapshot()
+    ]
+    return LLMChainRead(steps=steps, providers=_list_global_providers())
+
+
+@router.put(
+    "/llm-chain",
+    response_model=LLMChainRead,
+)
+async def put_llm_chain(
+    payload: LLMChainUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> LLMChainRead:
+    """Replace the runtime fallback chain atomically.
+
+    Validation rules:
+    * Each ``provider`` must be in the registered global providers.
+    * The resulting chain must have at least one ``enabled`` step
+      (an empty / fully-disabled chain is rejected so the gateway
+      can't accidentally fall back to prefix-only routing).
+
+    Successful updates take effect on the next gateway construction
+    (the per-tenant LLM cache picks them up). Already-cached
+    resolvers keep their old chain until they expire.
+    """
+    providers = _list_global_providers()
+    known = {p.name for p in providers}
+    try:
+        await get_runtime_chain().replace_steps(
+            [ChainStep(s.provider, s.model, s.enabled) for s in payload.steps],
+            known_providers=known,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    runtime = get_runtime_chain()
+    steps = [
+        LLMChainStep(provider=s.provider, model=s.model, enabled=s.enabled)
+        for s in runtime.snapshot()
+    ]
+    return LLMChainRead(steps=steps, providers=providers)
 
 
 __all__ = ["router"]
