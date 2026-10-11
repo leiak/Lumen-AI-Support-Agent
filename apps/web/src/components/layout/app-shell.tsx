@@ -12,6 +12,7 @@ import {
   Users,
   Building2,
   MessageSquare,
+  LayoutDashboard,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -33,6 +34,7 @@ const navItems: NavItem[] = [
 ];
 
 const adminNavItems: NavItem[] = [
+  { to: '/admin/dashboard', label: '仪表盘', icon: LayoutDashboard },
   { to: '/admin/sla-policies', label: 'SLA 策略', icon: Timer },
   { to: '/admin/budget', label: '预算', icon: Wallet },
   { to: '/admin/tickets', label: '工单', icon: Ticket },

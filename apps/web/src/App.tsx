@@ -10,6 +10,7 @@ import { AdminTenantSettingsPage } from '@/pages/admin-tenant-settings';
 import { AdminUsersPage } from '@/pages/admin-users';
 import { AdminWidgetConfigPage } from '@/pages/admin-widget-config';
 import { AdminBudgetPage } from '@/pages/admin-budget';
+import { AdminDashboardPage } from '@/pages/admin-dashboard';
 import { AdminTicketsPage } from '@/pages/admin-tickets';
 import { AdminTicketDetailPage } from '@/pages/admin-ticket-detail';
 import { LoginPage } from '@/pages/login';
@@ -106,6 +107,14 @@ export function App(): JSX.Element {
           element={
             <AdminGuard>
               <AdminWidgetConfigPage />
+            </AdminGuard>
+          }
+        />
+        <Route
+          path="/admin/dashboard"
+          element={
+            <AdminGuard>
+              <AdminDashboardPage />
             </AdminGuard>
           }
         />

@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from admin.repository import (
@@ -57,6 +57,7 @@ from admin.schemas.budget import (
     TenantBudgetRead,
     TenantBudgetUsageRead,
 )
+from admin.schemas.dashboard import DashboardRead, StatusCount
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
@@ -97,9 +98,12 @@ from tenant.enums import UserRole
 from tenant.models import User
 from tenant.repository import TenantRepository, UserRepository
 from ticket.enums import TicketPriority, TicketStatus
-from ticket.models import SlaPolicy
+from ticket.models import SlaPolicy, Ticket
 from ticket.repository import TicketRepository
 from widget.repository import WidgetConfigRepository
+from conversation.enums import ConversationStatus
+from conversation.models import Conversation
+from llm_client.models import LLMUsage
 from ticket.schemas import (
     SlaPolicyCreate,
     SlaPolicyRead,
@@ -1585,6 +1589,143 @@ async def reset_widget_config(
         raise HTTPException(status_code=404, detail="not found")
     await WidgetConfigRepository().delete(tenant_id)
     return WidgetConfigResetResponse(tenant_id=tenant_id, reset=True)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.5 — Admin Dashboard aggregate endpoint.
+#
+# GET /api/v1/admin/tenants/{tid}/dashboard — tickets today + by status +
+#   by priority + open conversations + LLM tokens this period + user count.
+#
+# Anti-enumeration 404 on cross-tenant access, same as the rest of the
+# admin surface. The endpoint is read-only and idempotent — the SPA
+# polls it (or refetches on focus) for live KPI tiles.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/dashboard",
+    response_model=DashboardRead,
+)
+async def get_tenant_dashboard(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> DashboardRead:
+    """Aggregate KPI counts for the admin dashboard page.
+
+    Returns ticket + conversation + LLM-usage + user counts scoped
+    to ``tenant_id``. ``period`` / ``period_starts_at`` mirror the
+    budget snapshot so the operator sees the same window the cap
+    applies to.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+
+    # ---- tickets ----
+    today_utc_start = datetime.now(UTC).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    sm = get_sessionmaker()
+    async with sm() as session:
+        # Tickets today (UTC midnight onward).
+        tickets_today_q = await session.execute(
+            select(func.count(Ticket.id)).where(
+                Ticket.tenant_id == tenant_id,
+                Ticket.created_at >= today_utc_start,
+            )
+        )
+        tickets_today = int(tickets_today_q.scalar() or 0)
+
+        # Tickets by status.
+        tickets_by_status_rows = await session.execute(
+            select(Ticket.status, func.count(Ticket.id))
+            .where(Ticket.tenant_id == tenant_id)
+            .group_by(Ticket.status)
+        )
+        tickets_by_status = [
+            StatusCount(key=str(row[0].value), count=int(row[1]))
+            for row in tickets_by_status_rows.all()
+        ]
+
+        # Tickets by priority.
+        tickets_by_priority_rows = await session.execute(
+            select(Ticket.priority, func.count(Ticket.id))
+            .where(Ticket.tenant_id == tenant_id)
+            .group_by(Ticket.priority)
+        )
+        tickets_by_priority = [
+            StatusCount(key=str(row[0].value), count=int(row[1]))
+            for row in tickets_by_priority_rows.all()
+        ]
+
+        # Open conversations — status=open OR pending both require
+        # operator attention, so both count toward the dashboard
+        # "open" tile.
+        conv_open_q = await session.execute(
+            select(func.count(Conversation.id)).where(
+                Conversation.tenant_id == tenant_id,
+                Conversation.status.in_(
+                    [ConversationStatus.OPEN, ConversationStatus.PENDING]
+                ),
+            )
+        )
+        conversations_open = int(conv_open_q.scalar() or 0)
+
+        # LLM tokens this period — anchored to UTC month for the
+        # dashboard. The Budget page reads the budget endpoint for
+        # the tenant-configured TZ; the dashboard uses UTC for
+        # simplicity (and so the operator doesn't see two different
+        # "this month" numbers on adjacent tiles).
+        period, period_starts_at = _current_period("UTC")
+        # M4.D Pack B #5: LLMUsage.created_at is stored TIMESTAMP WITHOUT
+        # TIME ZONE — strip tzinfo before comparing so asyncpg doesn't
+        # try to subtract offset-naive vs offset-aware datetimes.
+        period_starts_naive = (
+            period_starts_at.replace(tzinfo=None)
+            if period_starts_at.tzinfo is not None
+            else period_starts_at
+        )
+        tokens_q = await session.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        LLMUsage.prompt_tokens + LLMUsage.completion_tokens
+                    ),
+                    0,
+                )
+            ).where(
+                LLMUsage.tenant_id == tenant_id,
+                LLMUsage.created_at >= period_starts_naive,
+            )
+        )
+        llm_tokens_this_period = int(tokens_q.scalar() or 0)
+
+        # User counts.
+        active_users_q = await session.execute(
+            select(func.count(User.id)).where(
+                User.tenant_id == tenant_id, User.is_active.is_(True)
+            )
+        )
+        active_users = int(active_users_q.scalar() or 0)
+        total_users_q = await session.execute(
+            select(func.count(User.id)).where(
+                User.tenant_id == tenant_id
+            )
+        )
+        total_users = int(total_users_q.scalar() or 0)
+
+    return DashboardRead(
+        today_utc_start=today_utc_start,
+        tickets_today=tickets_today,
+        tickets_by_status=tickets_by_status,
+        tickets_by_priority=tickets_by_priority,
+        conversations_open=conversations_open,
+        period=period,
+        period_starts_at=period_starts_at,
+        llm_tokens_this_period=llm_tokens_this_period,
+        active_users=active_users,
+        total_users=total_users,
+    )
 
 
 __all__ = ["router"]

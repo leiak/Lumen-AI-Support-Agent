@@ -26,8 +26,11 @@ from admin.schemas.widget_config import (
     WidgetConfigResetResponse,
     WidgetConfigUpdate,
 )
+from admin.schemas.dashboard import DashboardRead, StatusCount
 
 __all__ = [
+    "DashboardRead",
+    "StatusCount",
     "TenantBudgetCreate",
     "TenantBudgetRead",
     "TenantBudgetUsageRead",

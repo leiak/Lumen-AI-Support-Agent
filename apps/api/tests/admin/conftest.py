@@ -34,7 +34,7 @@ from sqlalchemy import delete as sql_delete
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
-from ticket.models import SlaPolicy
+from ticket.models import SlaPolicy, Ticket
 
 
 @pytest.fixture(autouse=True)
@@ -88,10 +88,16 @@ async def _delete_tenant(tenant_id: str) -> None:
     SLA policies therefore have to sweep them out of the way before
     the tenant delete; otherwise the next test's ``sample_tenant``
     teardown fails with FK violation.
+
+    Tier 2 Task 2.5 — same story for ``tickets`` (FK to tenants with
+    no ON DELETE CASCADE; intentional).
     """
     async with get_session() as session:
         await session.execute(
             sql_delete(SlaPolicy).where(SlaPolicy.tenant_id == tenant_id)
+        )
+        await session.execute(
+            sql_delete(Ticket).where(Ticket.tenant_id == tenant_id)
         )
         await session.commit()
         t = await session.get(Tenant, tenant_id)
