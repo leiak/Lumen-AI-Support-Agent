@@ -12,7 +12,16 @@
     "e2e": "playwright test --config=tests/e2e/playwright.config.ts",
     "e2e:install": "playwright install chromium",
     "e2e:headed": "playwright test --config=tests/e2e/playwright.config.ts --headed",
-    "e2e:report": "playwright show-report --config=tests/e2e/playwright.config.ts"
+    "e2e:report": "playwright show-report --config=tests/e2e/playwright.config.ts",
+    "e2e:docker": "playwright test --config=tests/e2e/playwright.docker.config.ts",
+    "demo:record": "bash tests/e2e/scripts/record-demo.sh",
+    "demo:record:windows": "powershell -File tests/e2e/scripts/record-demo.ps1",
+    "demo:record:skip5": "bash tests/e2e/scripts/record-demo.sh --skip-act5",
+    "stack:up": "bash scripts/bring-up.sh",
+    "stack:up:no-build": "bash scripts/bring-up.sh --no-build",
+    "stack:up:seed-only": "bash scripts/bring-up.sh --seed-only",
+    "stack:down": "bash scripts/teardown.sh",
+    "stack:down:clean": "bash scripts/teardown.sh --volumes --images"
   },
   "devDependencies": {
     "@playwright/test": "^1.50.0",

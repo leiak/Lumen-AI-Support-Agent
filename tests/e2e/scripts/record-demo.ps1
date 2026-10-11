@@ -1,26 +1,37 @@
 <#
 .SYNOPSIS
-    Stage 11.5: Lumen AI M1 demo screenshot recorder (Windows).
+    Stage 11.5 + 15 + 19: Lumen AI demo screenshot recorder (Windows).
 
 .DESCRIPTION
     Windows counterpart to tests/e2e/scripts/record-demo.sh. Drives
-    headless Chromium through the Playwright Node API to capture 11
+    headless Chromium through the Playwright Node API to capture ~16
     PNGs into the repo-root images/ directory (one per demo step).
     Reuses the same dev-server prerequisites as the e2e suite:
-    Postgres + Redis + Qdrant up, alembic upgrade head, seed.py run,
-    web-sdk built, the three dev servers (api:8000, web:5173,
-    widget-host:8080) reachable.
+    Postgres + Redis + Qdrant up, alembic upgrade head, all 4 seed
+    scripts run (scripts/bring-up.sh), web-sdk built, the three dev
+    servers (api:8000, web:5173, widget-host:8080) reachable.
+
+    Captures Act 1 (widget) + Act 2 (agent) + Act 3 (admin KB) +
+    Act 4 (M2.A ticket detail) + Act 5 (M2.B email / multimodal /
+    history mining admin views). Use -SkipAct5 to skip the M2.B
+    blocks when only the M1+M2.A surface is set up.
 
 .PARAMETER WithGif
     If set, also stitches one GIF per Act using ffmpeg (must be on PATH).
 
+.PARAMETER SkipAct5
+    If set, skip the M2.B Act 5 captures (email / multimodal /
+    history mining admin entry views).
+
 .EXAMPLE
     .\scripts\record-demo.ps1
     .\scripts\record-demo.ps1 -WithGif
+    .\scripts\record-demo.ps1 -SkipAct5
 #>
 [CmdletBinding()]
 param(
-    [switch]$WithGif
+    [switch]$WithGif,
+    [switch]$SkipAct5
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,15 +144,62 @@ const shoot = async (name) => {
   await shoot('act3-03-after-upload');
 }
 
+// Act 4: admin ticket detail (M2.A) — Stage 20 #20 shipped
+// `apps/web/src/pages/admin-ticket-detail.tsx`. The deterministic
+// P1 billing ticket id is fixed by seed_demo_rich.py — override via
+// DEMO_TICKET_ID env if the rich seed evolves.
+{
+  const ticketId = process.env.DEMO_TICKET_ID || '01HZDEMOT0P1BILLING0TICKET';
+  const ticketUrl = `http://localhost:5173/admin/tickets/${ticketId}`;
+
+  // Re-login as admin (already admin from Act 3, but keep it explicit
+  // for symmetry with the bash recorder).
+  await page.goto('http://localhost:5173/login');
+  await page.locator('input[type="email"]').fill('admin@demo.test');
+  await page.locator('input[type="password"]').fill('Demo123!');
+  await page.locator('button[type="submit"]').click();
+  await page.waitForURL(/\/(inbox|kb|settings)/, { timeout: 8000 });
+
+  await page.goto('http://localhost:5173/admin/tickets');
+  await page.waitForTimeout(1000);
+  await shoot('act4-01-tickets-list');
+
+  await page.goto(ticketUrl);
+  await page.waitForTimeout(1500);
+  await shoot('act4-02-ticket-detail');
+}
+
+if (process.env.SKIP_ACT5 !== '1') {
+  // Act 5: M2.B surfaces — entry-point admin views. Full-flow
+  // screenshots live in the stub PNGs `images/demo-act5-{01,02,03}-*.png`
+  // committed at Stage 19 close-out; this recorder refreshes the live
+  // page so layout changes surface in CI.
+  await page.goto('http://localhost:5173/admin/email');
+  await page.waitForTimeout(1000);
+  await shoot('act5-01-email-admin');
+
+  await page.goto('http://localhost:5173/admin/knowledge/multimodal');
+  await page.waitForTimeout(1000);
+  await shoot('act5-02-multimodal-admin');
+
+  await page.goto('http://localhost:5173/admin/knowledge/history-mining');
+  await page.waitForTimeout(1000);
+  await shoot('act5-03-history-mining-admin');
+}
+
 await browser.close();
 console.log('[record-demo] done');
 '@
+
+$env:SKIP_ACT5 = if ($SkipAct5) { '1' } else { '0' }
 
 node --input-type=module -e $nodeScript
 
 if ($WithGif) {
     if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-        foreach ($act in @('act1','act2','act3')) {
+        $acts = @('act1','act2','act3','act4')
+        if (-not $SkipAct5) { $acts += 'act5' }
+        foreach ($act in $acts) {
             $out = Join-Path $ImagesDir "demo-$act.gif"
             $pattern = Join-Path $ImagesDir "demo-$act-*.png"
             ffmpeg -y -framerate 1 -pattern_type glob -i $pattern -vf "fps=1,scale=1024:-1:flags=lanczos" $out 2>$null

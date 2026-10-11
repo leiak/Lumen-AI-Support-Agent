@@ -33,6 +33,12 @@ text() sends literal lowercase strings directly.
 The real fix is to add ``values_callable=lambda x: [e.value for e in x]``
 to the SAEnum declarations in ``apps/api/src/ticket/models.py`` — that
 is a separate hotfix; the seed must work today for self-testing.
+
+A copy of every raw SQL statement is mirrored into
+``tests/e2e/scripts/seed_demo_rich.sql`` as a single-source-of-truth
+reference (with psql-runnable examples for manual ops). The Python
+text() strings here MUST stay byte-identical to the templates in that
+file — when you change a column list, update both.
 """
 from __future__ import annotations
 

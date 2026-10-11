@@ -36,7 +36,7 @@
 | 23 (M4.C) | LLM Gateway Tenant Resolver (BYOK) — per-tenant provider API keys (Fernet at rest + LRU/TTL cache + admin POST/GET endpoints + strict-mode `TenantLlmNotConfigured` + `LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL` zero-label counter) | ✅ | 4 cipher + 5 ORM + 9 resolver + 7 factory + 9 admin + 3 e2e |
 | 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics; **Pack A**: sticky soft-warn (`soft_warn_fired_at`) + DB-direct pre-check + `pg_advisory_xact_lock` in `refresh()` + daily cleanup cron + `/admin/budget/cleanup` super-admin endpoint; **Pack B**: `tenant_budget_credits` (immutable grant audit log) + `CreditService` + `PerModelBreakdown` cache + `LLM_BUDGET_GATE_TOTAL` 429 gate; **Pack C**: Docker 部署验证(端口偏移 25432/26333/26379 + migrate/seed one-shots + `seed_budget.py` + `main.py` startup typo 修复)) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e + **Pack A: 2 migration + 2 repo + 6 resolver + 4 cleanup + 1 admin + 3 e2e** + **Pack B: 27 tests** + **Pack C: end-to-end Docker bring-up** |
 | 25 (Tier 1/2/3) | 14 任务 gap-fill — **Tier 1**: admin tickets/channel CRUD/LLM Config/budget mutation (4 commit, 155 tests); **Tier 2**: 已知 nitpick 整理 (14 任务,5 commit + silent-observability 修复 + session bug); **Tier 3**: i18n + Playwright CI + cross-domain admin search + runtime LLM provider chain admin (5 commit, 219 frontend + 120 backend tests) | ✅ | 155 (Tier 1) + 79 (Tier 2) + 38 (Tier 3) = **272 new tests** |
-| 26 (Quick Wins) | **A**: HttpClientPool `aclose_all` failure injection + 5 个 XFF whitespace parametrize + 顺手修 `http_pool.py` 没迁到 structlog 的 bug (1 commit, 10 new tests); **B**: ruff sweep 41 → 0 (1 commit); **C**: demo-act4-02 spec 启用 — `test.skip` 移除 + captureFlow 实际写盘 + `playwright.docker.config.ts` 绕过端口冲突 + 跑通产生 `images/demo-act4-02.png` (1 commit) | ✅ | 10 (A) + 0 (B) + 1 (C) = **11 new tests + 1 captured PNG** |
+| 26 (Quick Wins) | **A**: HttpClientPool `aclose_all` failure injection + 5 个 XFF whitespace parametrize + 顺手修 `http_pool.py` 没迁到 structlog 的 bug (1 commit, 10 new tests); **B**: ruff sweep 41 → 0 (1 commit); **C**: demo-act4-02 spec 启用 — `test.skip` 移除 + captureFlow 实际写盘 + `playwright.docker.config.ts` 绕过端口冲突 + 跑通产生 `images/demo-act4-02.png` (1 commit); **D**: `scripts/bring-up.sh` + `scripts/teardown.sh` + `scripts/wait-ready.sh` 一键全栈 + 4 个种子脚本加 `--help` 和退出码 (1 commit) | ✅ | 10 (A) + 0 (B) + 1 (C) + 0 (D) = **11 new tests + 1 captured PNG + 3 root scripts + 4 `--help` flags** |
 | 顺手 bugfixes | `BudgetResolver._PrefixResolver` 单 provider 处理 + `stream_chat` async-context guard (loop-running detect) | ✅ | 2 new tests (prefix resolver + stream_chat loop) |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
@@ -180,6 +180,37 @@ export OPENAI_API_KEY=sk-...   # 用于 RAG eval 或 OpenAI provider
 ```
 
 ### 容器化 + CI (Stage 10)
+
+#### 一键全栈 bring-up / teardown
+
+```bash
+# 完整拉起:docker compose + wait + 4 脚本种子链 + web-sdk 构建
+scripts/bring-up.sh                  # 首次或干净环境
+scripts/bring-up.sh --no-build       # 跳过 docker build(用缓存镜像)
+scripts/bring-up.sh --no-seeds       # 只拉服务,不跑种子
+scripts/bring-up.sh --seed-only      # 跳过 docker,只跑种子链
+scripts/bring-up.sh --help           # 看所有 flag
+
+# 干净关停
+scripts/teardown.sh                  # docker compose down,保留 volume
+scripts/teardown.sh --volumes        # 同时清掉 named volume(DATA LOSS)
+scripts/teardown.sh --images         # 同时 prune dangling 镜像
+```
+
+`bring-up.sh` 会按顺序跑 4 个种子脚本(`seed.py → seed_budget.py →
+seed_demo_rich.py → extend-seed.py`),每个都支持 `--help` 单独使用:
+
+```bash
+cd apps/api && uv run python ../../tests/e2e/scripts/seed.py --help
+cd apps/api && uv run python ../../tests/e2e/scripts/seed_budget.py --help
+cd apps/api && uv run python ../../tests/e2e/scripts/seed_demo_rich.py --help
+apps/api/.venv/Scripts/python.exe apps/example-integration/scripts/extend-seed.py --help
+```
+
+退出码:`0` 成功 · `1` 未捕获异常 · `2` prereq 缺失(种子链上游未跑)
+· `64` 未知 CLI flag。
+
+#### 手动步骤(等价的细粒度版本)
 
 ```bash
 # 一键拉起 基础设施 + API + 前端 (Web Widget 同源代理 + WS)
