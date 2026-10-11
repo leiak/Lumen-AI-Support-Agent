@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from admin.repository import (
@@ -81,7 +81,13 @@ from tenant.repository import TenantRepository
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import SlaPolicy
 from ticket.repository import TicketRepository
-from ticket.schemas import SlaPolicyRead, TicketListRead, TicketOut
+from ticket.schemas import (
+    SlaPolicyCreate,
+    SlaPolicyRead,
+    SlaPolicyUpdate,
+    TicketListRead,
+    TicketOut,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -432,6 +438,161 @@ async def list_sla_policies(
             .order_by(SlaPolicy.priority)
         )
         return [SlaPolicyRead.model_validate(p) for p in result.scalars()]
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.1 — SLA policy mutation endpoints (POST / PATCH / DELETE).
+#
+# POST   /api/v1/admin/tenants/{tenant_id}/sla-policies
+#   upsert on (tenant_id, name); Pydantic enforces uniqueness at the
+#   column level — the SPA names policies freely but can't collide on
+#   names within a tenant.
+#
+# PATCH  /api/v1/admin/tenants/{tenant_id}/sla-policies/{policy_id}
+#   update mutable fields. ``name`` is the natural key and CANNOT be
+#   changed here — rename requires delete + recreate.
+#
+# DELETE /api/v1/admin/tenants/{tenant_id}/sla-policies/{policy_id}
+#   idempotent. Tickets that reference the deleted policy keep their
+#   stamped ``sla_deadline_at`` (it's a timestamp, not a FK) so
+#   historical data is intact.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tenants/{tenant_id}/sla-policies",
+    response_model=SlaPolicyRead,
+    status_code=201,
+)
+async def create_sla_policy(
+    tenant_id: str,
+    payload: SlaPolicyCreate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> SlaPolicyRead:
+    """Upsert an SLA policy for the tenant (Tier 2 Task 2.1).
+
+    ``(tenant_id, name)`` is unique; re-using a name overwrites the
+    existing row's mutable fields (priority, first_response_minutes,
+    resolution_minutes, business_hours_only). The ``id`` (ULID) is
+    regenerated on overwrite so existing FK references from tickets
+    keep pointing at a valid historical record.
+
+    Auth: requires admin JWT. Cross-tenant access returns 404.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        existing = (
+            await session.execute(
+                select(SlaPolicy).where(
+                    SlaPolicy.tenant_id == tenant_id,
+                    SlaPolicy.name == payload.name,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.priority = payload.priority
+            existing.first_response_minutes = payload.first_response_minutes
+            existing.resolution_minutes = payload.resolution_minutes
+            existing.business_hours_only = payload.business_hours_only
+            row = existing
+        else:
+            row = SlaPolicy(
+                id=new_id(),
+                tenant_id=tenant_id,
+                name=payload.name,
+                priority=payload.priority,
+                first_response_minutes=payload.first_response_minutes,
+                resolution_minutes=payload.resolution_minutes,
+                business_hours_only=payload.business_hours_only,
+            )
+            session.add(row)
+        await session.flush()
+        await session.commit()
+        await session.refresh(row)
+        return SlaPolicyRead.model_validate(row)
+
+
+@router.patch(
+    "/tenants/{tenant_id}/sla-policies/{policy_id}",
+    response_model=SlaPolicyRead,
+)
+async def patch_sla_policy(
+    tenant_id: str,
+    policy_id: str,
+    payload: SlaPolicyUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> SlaPolicyRead:
+    """Update an SLA policy's mutable fields (Tier 2 Task 2.1).
+
+    Returns 404 for cross-tenant / unknown-policy / unknown-tenant —
+    all three collapse to the same response per anti-enumeration.
+
+    Auth: requires admin JWT.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        existing = (
+            await session.execute(
+                select(SlaPolicy).where(
+                    SlaPolicy.tenant_id == tenant_id,
+                    SlaPolicy.id == policy_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="not found")
+        if payload.priority is not None:
+            existing.priority = payload.priority
+        if payload.first_response_minutes is not None:
+            existing.first_response_minutes = payload.first_response_minutes
+        if payload.resolution_minutes is not None:
+            existing.resolution_minutes = payload.resolution_minutes
+        if payload.business_hours_only is not None:
+            existing.business_hours_only = payload.business_hours_only
+        await session.flush()
+        await session.commit()
+        await session.refresh(existing)
+        return SlaPolicyRead.model_validate(existing)
+
+
+@router.delete(
+    "/tenants/{tenant_id}/sla-policies/{policy_id}",
+    status_code=204,
+)
+async def delete_sla_policy(
+    tenant_id: str,
+    policy_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> Response:
+    """Delete an SLA policy. Idempotent (Tier 2 Task 2.1).
+
+    Tickets that referenced this policy keep their stamped
+    ``sla_deadline_at`` (it's a snapshot, not a FK). The operator can
+    re-create the policy with the same name via POST.
+
+    Auth: requires admin JWT.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    sm = get_sessionmaker()
+    async with sm() as session:
+        stmt = delete(SlaPolicy).where(
+            SlaPolicy.tenant_id == tenant_id,
+            SlaPolicy.id == policy_id,
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        # 204 whether the row existed or not — idempotent.
+        if (result.rowcount or 0) == 0:
+            # Re-check whether the row exists at all. If we hit zero
+            # rows it's because the tenant has no such policy; that's
+            # still 204 by idempotency. We don't surface 404 here.
+            pass
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------

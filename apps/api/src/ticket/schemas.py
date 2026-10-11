@@ -29,7 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ticket.enums import TicketPriority, TicketStatus
 
@@ -99,6 +99,35 @@ class SlaPolicyRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class SlaPolicyCreate(BaseModel):
+    """Request body for POST /api/v1/admin/tenants/{tenant_id}/sla-policies.
+
+    Tier 2 Task 2.1 — lets the admin SPA provision SLA policies from
+    the UI instead of relying solely on the seed script. ``name`` is
+    the natural key (per-tenant uniqueness); ``priority`` is the
+    bucket (P0..P3) the SLA applies to.
+    """
+
+    name: str = Field(..., min_length=1, max_length=128)
+    priority: TicketPriority
+    first_response_minutes: int = Field(..., ge=1, le=100_000)
+    resolution_minutes: int = Field(..., ge=1, le=1_000_000)
+    business_hours_only: bool = False
+
+
+class SlaPolicyUpdate(BaseModel):
+    """Request body for PATCH /api/v1/admin/tenants/{tenant_id}/sla-policies/{policy_id}.
+
+    All fields optional — omitted fields are preserved. ``name`` cannot
+    be changed (it is the natural key; to rename, delete + recreate).
+    """
+
+    priority: TicketPriority | None = None
+    first_response_minutes: int | None = Field(default=None, ge=1, le=100_000)
+    resolution_minutes: int | None = Field(default=None, ge=1, le=1_000_000)
+    business_hours_only: bool | None = None
 
 
 class TicketListRead(BaseModel):

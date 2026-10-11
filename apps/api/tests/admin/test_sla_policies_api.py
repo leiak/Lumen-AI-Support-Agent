@@ -123,3 +123,94 @@ async def test_list_sla_policies_empty_when_none_configured(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.1 — SLA policy mutation (POST / PATCH / DELETE).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_creates_sla_policy(
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
+) -> None:
+    """POST creates a row and the GET listing includes it."""
+    token = admin_token_for(tenant_id=sample_tenant.id)
+    resp = await async_client.post(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies",
+        json={
+            "name": "P0 outage",
+            "priority": "P0",
+            "first_response_minutes": 5,
+            "resolution_minutes": 60,
+            "business_hours_only": False,
+        },
+        headers=auth_headers(token),
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "P0 outage"
+    assert body["priority"] == "P0"
+    assert body["first_response_minutes"] == 5
+    # GET reflects the new row.
+    listing = await async_client.get(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies",
+        headers=auth_headers(token),
+    )
+    assert listing.status_code == 200, listing.text
+    assert len(listing.json()) == 1
+    assert listing.json()[0]["name"] == "P0 outage"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_then_delete_sla_policy(
+    async_client: AsyncClient, sample_tenant: Tenant, admin_token_for
+) -> None:
+    """PATCH updates mutable fields; DELETE removes the row idempotently."""
+    token = admin_token_for(tenant_id=sample_tenant.id)
+    # Seed via POST.
+    created = await async_client.post(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies",
+        json={
+            "name": "P2 default",
+            "priority": "P2",
+            "first_response_minutes": 30,
+            "resolution_minutes": 240,
+            "business_hours_only": False,
+        },
+        headers=auth_headers(token),
+    )
+    assert created.status_code == 201, created.text
+    policy_id = created.json()["id"]
+    # PATCH the mutable fields.
+    patched = await async_client.patch(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies/{policy_id}",
+        json={"first_response_minutes": 15, "business_hours_only": True},
+        headers=auth_headers(token),
+    )
+    assert patched.status_code == 200, patched.text
+    body = patched.json()
+    assert body["first_response_minutes"] == 15
+    assert body["business_hours_only"] is True
+    assert body["resolution_minutes"] == 240  # preserved
+    # DELETE the row.
+    deleted = await async_client.delete(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies/{policy_id}",
+        headers=auth_headers(token),
+    )
+    assert deleted.status_code == 204, deleted.text
+    # Re-delete is idempotent — also 204.
+    again = await async_client.delete(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies/{policy_id}",
+        headers=auth_headers(token),
+    )
+    assert again.status_code == 204, again.text
+    # GET is empty now.
+    listing = await async_client.get(
+        f"/api/v1/admin/tenants/{sample_tenant.id}/sla-policies",
+        headers=auth_headers(token),
+    )
+    assert listing.status_code == 200, listing.text
+    assert listing.json() == []

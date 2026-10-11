@@ -1,21 +1,38 @@
+import { useState } from 'react';
 import { Clock, Sun } from 'lucide-react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { Badge } from '@/components/ui/badge';
-import { fetchSlaPolicies, type SlaPolicy, type SlaPriority } from '@/lib/sla-policies';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  deleteSlaPolicy,
+  fetchSlaPolicies,
+  patchSlaPolicy,
+  upsertSlaPolicy,
+  type SlaPolicy,
+  type SlaPolicyCreateInput,
+  type SlaPriority,
+} from '@/lib/sla-policies';
 import { useCurrentUser } from '@/lib/use-current-user';
 import { cn } from '@/lib/utils';
 
-// SLA Policies admin page — read-only listing of per-priority SLA
-// targets. The ticket service stamps ``tickets.sla_deadline_at`` by
-// looking up the policy matching the ticket's priority at create time,
-// so the page is the only place admins can audit which buckets are
-// configured and how aggressive each is.
+// SLA Policies admin page — per-priority SLA targets with full CRUD.
 //
-// Pairs with the new endpoint at
-// GET /api/v1/admin/tenants/{tenant_id}/sla-policies.
+// Backend:
+//   GET    /api/v1/admin/tenants/{tenant_id}/sla-policies
+//   POST   /api/v1/admin/tenants/{tenant_id}/sla-policies      (Tier 2 Task 2.1)
+//   PATCH  /api/v1/admin/tenants/{tenant_id}/sla-policies/{id}
+//   DELETE /api/v1/admin/tenants/{tenant_id}/sla-policies/{id}
+//
+// The ticket service stamps ``tickets.sla_deadline_at`` by looking up
+// the policy matching the ticket's priority at create time, so the
+// page is the only place admins can audit which buckets are configured
+// and how aggressive each is.
 
 const SLA_POLICIES_QUERY_KEY = ['admin', 'sla-policies'] as const;
+
+const PRIORITY_OPTIONS: SlaPriority[] = ['P0', 'P1', 'P2', 'P3'];
 
 /** Map each priority to a Tailwind hue pair used by the badge. */
 const PRIORITY_STYLES: Record<SlaPriority, string> = {
@@ -40,10 +57,50 @@ function PriorityBadge({ priority }: { priority: SlaPriority }): JSX.Element {
   );
 }
 
-function PolicyRow({ policy }: { policy: SlaPolicy }): JSX.Element {
+function PolicyEditorRow({
+  policy,
+  tenantId,
+}: {
+  policy: SlaPolicy;
+  tenantId: string;
+}): JSX.Element {
+  const qc = useQueryClient();
+  const [firstRespMin, setFirstRespMin] = useState(policy.first_response_minutes);
+  const [resolutionMin, setResolutionMin] = useState(policy.resolution_minutes);
+  const [hoursOnly, setHoursOnly] = useState(policy.business_hours_only);
+
+  const dirty =
+    firstRespMin !== policy.first_response_minutes ||
+    resolutionMin !== policy.resolution_minutes ||
+    hoursOnly !== policy.business_hours_only;
+
+  const patchMut = useMutation({
+    mutationFn: () =>
+      patchSlaPolicy(tenantId, policy.id, {
+        first_response_minutes: firstRespMin,
+        resolution_minutes: resolutionMin,
+        business_hours_only: hoursOnly,
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [...SLA_POLICIES_QUERY_KEY, tenantId] });
+    },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: () => deleteSlaPolicy(tenantId, policy.id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [...SLA_POLICIES_QUERY_KEY, tenantId] });
+    },
+  });
+
+  function handleDelete(): void {
+    if (!window.confirm(`删除 SLA 策略 “${policy.name}”?`)) return;
+    deleteMut.mutate();
+  }
+
   return (
     <tr
-      className="border-b transition-colors hover:bg-muted/40"
+      className="border-b"
       data-testid={`sla-policy-row-${policy.priority}`}
     >
       <td className="px-4 py-3 align-middle">
@@ -58,42 +115,174 @@ function PolicyRow({ policy }: { policy: SlaPolicy }): JSX.Element {
         </span>
       </td>
       <td className="px-4 py-3 align-middle">
-        <span
-          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground"
-          data-testid={`sla-policy-response-${policy.priority}`}
-        >
-          <Clock className="h-3.5 w-3.5" aria-hidden="true" />
-          首响 {policy.first_response_minutes} 分钟
-        </span>
+        <input
+          type="number"
+          min={1}
+          className="w-20 rounded border px-2 py-1 text-sm tabular-nums"
+          data-testid={`sla-policy-edit-response-${policy.priority}`}
+          value={firstRespMin}
+          onChange={(e) => setFirstRespMin(Number.parseInt(e.target.value, 10) || 0)}
+        />
+        <span className="ml-1 text-xs text-muted-foreground">分钟</span>
       </td>
       <td className="px-4 py-3 align-middle">
-        <span
-          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground"
-          data-testid={`sla-policy-resolution-${policy.priority}`}
-        >
-          <Clock className="h-3.5 w-3.5" aria-hidden="true" />
-          解决 {policy.resolution_minutes} 分钟
-        </span>
+        <input
+          type="number"
+          min={1}
+          className="w-24 rounded border px-2 py-1 text-sm tabular-nums"
+          data-testid={`sla-policy-edit-resolution-${policy.priority}`}
+          value={resolutionMin}
+          onChange={(e) => setResolutionMin(Number.parseInt(e.target.value, 10) || 0)}
+        />
+        <span className="ml-1 text-xs text-muted-foreground">分钟</span>
       </td>
       <td className="px-4 py-3 align-middle">
-        {policy.business_hours_only ? (
-          <span
-            className="inline-flex items-center gap-1.5 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-900 dark:bg-amber-900/40 dark:text-amber-200"
-            data-testid={`sla-policy-hours-${policy.priority}`}
+        <label className="inline-flex items-center gap-1 text-xs">
+          <input
+            type="checkbox"
+            data-testid={`sla-policy-edit-hours-${policy.priority}`}
+            checked={hoursOnly}
+            onChange={(e) => setHoursOnly(e.target.checked)}
+          />
+          仅工作时段
+        </label>
+      </td>
+      <td className="px-4 py-3 align-middle">
+        <div className="flex gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            data-testid={`sla-policy-save-${policy.priority}`}
+            onClick={() => patchMut.mutate()}
+            disabled={!dirty || patchMut.isPending}
           >
-            <Sun className="h-3 w-3" aria-hidden="true" />
-            仅工作时间
-          </span>
-        ) : (
-          <span
-            className="inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:bg-zinc-700/40 dark:text-zinc-200"
-            data-testid={`sla-policy-hours-${policy.priority}`}
+            {patchMut.isPending ? '保存中…' : '保存'}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            data-testid={`sla-policy-delete-${policy.priority}`}
+            onClick={handleDelete}
+            disabled={deleteMut.isPending}
           >
-            全天
-          </span>
-        )}
+            删除
+          </Button>
+        </div>
       </td>
     </tr>
+  );
+}
+
+function CreatePolicyForm({ tenantId }: { tenantId: string }): JSX.Element {
+  const qc = useQueryClient();
+  const [name, setName] = useState('');
+  const [priority, setPriority] = useState<SlaPriority>('P2');
+  const [firstRespMin, setFirstRespMin] = useState(30);
+  const [resolutionMin, setResolutionMin] = useState(240);
+  const [hoursOnly, setHoursOnly] = useState(false);
+
+  const upsertMut = useMutation({
+    mutationFn: (input: SlaPolicyCreateInput) => upsertSlaPolicy(tenantId, input),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [...SLA_POLICIES_QUERY_KEY, tenantId] });
+      setName('');
+      setFirstRespMin(30);
+      setResolutionMin(240);
+      setHoursOnly(false);
+    },
+  });
+
+  function handleSubmit(): void {
+    if (name.trim().length === 0) return;
+    upsertMut.mutate({
+      name: name.trim(),
+      priority,
+      first_response_minutes: firstRespMin,
+      resolution_minutes: resolutionMin,
+      business_hours_only: hoursOnly,
+    });
+  }
+
+  return (
+    <Card data-testid="sla-policy-create-card">
+      <CardHeader>
+        <CardTitle className="text-base">新建 / 更新 SLA 策略</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-5">
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">名称</span>
+            <input
+              className="rounded border px-2 py-1.5"
+              data-testid="sla-policy-create-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              maxLength={128}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">优先级</span>
+            <select
+              className="rounded border px-2 py-1.5"
+              data-testid="sla-policy-create-priority"
+              value={priority}
+              onChange={(e) => setPriority(e.target.value as SlaPriority)}
+            >
+              {PRIORITY_OPTIONS.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">首响 (分钟)</span>
+            <input
+              type="number"
+              min={1}
+              className="rounded border px-2 py-1.5 tabular-nums"
+              data-testid="sla-policy-create-response"
+              value={firstRespMin}
+              onChange={(e) => setFirstRespMin(Number.parseInt(e.target.value, 10) || 0)}
+            />
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">解决 (分钟)</span>
+            <input
+              type="number"
+              min={1}
+              className="rounded border px-2 py-1.5 tabular-nums"
+              data-testid="sla-policy-create-resolution"
+              value={resolutionMin}
+              onChange={(e) => setResolutionMin(Number.parseInt(e.target.value, 10) || 0)}
+            />
+          </label>
+          <label className="flex flex-col items-start gap-1 text-sm">
+            <span className="text-muted-foreground">仅工作时段</span>
+            <input
+              type="checkbox"
+              className="mt-2"
+              data-testid="sla-policy-create-hours"
+              checked={hoursOnly}
+              onChange={(e) => setHoursOnly(e.target.checked)}
+            />
+          </label>
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button
+            type="button"
+            size="sm"
+            data-testid="sla-policy-create-submit"
+            onClick={handleSubmit}
+            disabled={upsertMut.isPending || name.trim().length === 0}
+          >
+            {upsertMut.isPending ? '保存中…' : '保存'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -119,6 +308,8 @@ export function AdminSlaPoliciesPage(): JSX.Element {
         </p>
       </div>
 
+      <CreatePolicyForm tenantId={tenantId} />
+
       {policiesQuery.isLoading ? (
         <p
           className="text-sm text-muted-foreground"
@@ -142,7 +333,7 @@ export function AdminSlaPoliciesPage(): JSX.Element {
           className="text-sm text-muted-foreground"
           data-testid="sla-policies-empty"
         >
-          暂无 SLA 策略。
+          暂无 SLA 策略 — 上面填一张表提交即创建。
         </p>
       ) : (
         <div
@@ -157,16 +348,31 @@ export function AdminSlaPoliciesPage(): JSX.Element {
                 <th className="px-4 py-2 font-medium">首响时间</th>
                 <th className="px-4 py-2 font-medium">解决时间</th>
                 <th className="px-4 py-2 font-medium">生效时段</th>
+                <th className="px-4 py-2 font-medium">操作</th>
               </tr>
             </thead>
             <tbody>
               {policiesQuery.data!.map((policy) => (
-                <PolicyRow key={policy.id} policy={policy} />
+                <PolicyEditorRow
+                  key={policy.id}
+                  policy={policy}
+                  tenantId={tenantId}
+                />
               ))}
             </tbody>
           </table>
         </div>
       )}
+
+      {/* Footer hint — icons reused from the original spec for visual continuity. */}
+      <div className="flex gap-4 text-xs text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          <Clock className="h-3 w-3" /> 工单创建时按 priority 查找策略
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <Sun className="h-3 w-3" /> 仅工作时段 — 仅 9-18 (UTC+8) 计入 SLA
+        </span>
+      </div>
     </div>
   );
 }

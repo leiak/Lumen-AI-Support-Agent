@@ -30,7 +30,7 @@ vi.mock('@/lib/api-client', async () => {
   );
   return {
     ...actual,
-    apiClient: { get: vi.fn(), post: vi.fn() },
+    apiClient: { get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() },
   };
 });
 
@@ -103,7 +103,7 @@ const SEED_POLICIES = [
 ];
 
 describe('AdminSlaPoliciesPage', () => {
-  it('renders all 4 policies with priority, name, and SLA minute values', async () => {
+  it('renders all 4 policies with priority, name, and editable SLA inputs', async () => {
     mockedGet.mockResolvedValue({ data: SEED_POLICIES });
 
     renderPage();
@@ -115,30 +115,59 @@ describe('AdminSlaPoliciesPage', () => {
       '/api/v1/admin/tenants/tenant-abc/sla-policies',
     );
 
-    // All 4 priority rows render.
+    // All 4 priority rows render with editable inputs pre-filled from the policy.
     for (const p of ['P0', 'P1', 'P2', 'P3'] as const) {
+      const seed = SEED_POLICIES.find((row) => row.priority === p)!;
       expect(screen.getByTestId(`sla-policy-row-${p}`)).toBeInTheDocument();
       expect(screen.getByTestId(`sla-priority-badge-${p}`)).toHaveTextContent(p);
-      expect(screen.getByTestId(`sla-policy-response-${p}`)).toHaveTextContent(
-        /首响 \d+ 分钟/,
-      );
-      expect(screen.getByTestId(`sla-policy-resolution-${p}`)).toHaveTextContent(
-        /解决 \d+ 分钟/,
-      );
+      const resp = screen.getByTestId(
+        `sla-policy-edit-response-${p}`,
+      ) as HTMLInputElement;
+      expect(resp.value).toBe(String(seed.first_response_minutes));
+      const reso = screen.getByTestId(
+        `sla-policy-edit-resolution-${p}`,
+      ) as HTMLInputElement;
+      expect(reso.value).toBe(String(seed.resolution_minutes));
     }
 
-    // P0 — values + 24/7 indicator.
-    expect(screen.getByTestId('sla-policy-response-P0')).toHaveTextContent('首响 15 分钟');
-    expect(screen.getByTestId('sla-policy-resolution-P0')).toHaveTextContent('解决 240 分钟');
-    expect(screen.getByTestId('sla-policy-hours-P0')).toHaveTextContent('全天');
+    // P0 — values pre-filled.
+    expect(
+      (screen.getByTestId('sla-policy-edit-response-P0') as HTMLInputElement)
+        .value,
+    ).toBe('15');
+    expect(
+      (screen.getByTestId('sla-policy-edit-resolution-P0') as HTMLInputElement)
+        .value,
+    ).toBe('240');
+    expect(
+      screen.getByTestId('sla-policy-edit-hours-P0'),
+    ).not.toBeChecked();
 
-    // P3 — values + business-hours indicator.
-    expect(screen.getByTestId('sla-policy-response-P3')).toHaveTextContent('首响 1440 分钟');
-    expect(screen.getByTestId('sla-policy-resolution-P3')).toHaveTextContent('解决 4320 分钟');
-    expect(screen.getByTestId('sla-policy-hours-P3')).toHaveTextContent('仅工作时间');
+    // P3 — values pre-filled, business-hours flag on.
+    expect(
+      (screen.getByTestId('sla-policy-edit-response-P3') as HTMLInputElement)
+        .value,
+    ).toBe('1440');
+    expect(
+      (screen.getByTestId('sla-policy-edit-resolution-P3') as HTMLInputElement)
+        .value,
+    ).toBe('4320');
+    expect(
+      screen.getByTestId('sla-policy-edit-hours-P3'),
+    ).toBeChecked();
 
     // Names are wired through.
-    expect(screen.getByTestId('sla-policy-name-P2')).toHaveTextContent('P2 Normal');
+    expect(screen.getByTestId('sla-policy-name-P2')).toHaveTextContent(
+      'P2 Normal',
+    );
+
+    // Save + delete buttons are present per row.
+    expect(
+      screen.getByTestId('sla-policy-save-P0'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId('sla-policy-delete-P0'),
+    ).toBeInTheDocument();
   });
 
   it('shows loading state while fetching', async () => {

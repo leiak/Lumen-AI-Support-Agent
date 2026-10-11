@@ -30,9 +30,11 @@ from httpx import ASGITransport, AsyncClient
 from auth.jwt import create_access_token
 from core.config import reset_settings
 from core.database import get_session, get_sessionmaker, reset_engine, reset_sessionmaker
+from sqlalchemy import delete as sql_delete
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
+from ticket.models import SlaPolicy
 
 
 @pytest.fixture(autouse=True)
@@ -78,8 +80,20 @@ async def db_session() -> AsyncIterator[Any]:
 
 
 async def _delete_tenant(tenant_id: str) -> None:
-    """Cascade-delete a tenant."""
+    """Cascade-delete a tenant.
+
+    Tier 2 Task 2.1 added ``sla_policies`` with an FK on
+    ``tenants.id`` but no ``ON DELETE CASCADE`` (intentional — production
+    tenant deletion is intentionally explicit). Tests that seed
+    SLA policies therefore have to sweep them out of the way before
+    the tenant delete; otherwise the next test's ``sample_tenant``
+    teardown fails with FK violation.
+    """
     async with get_session() as session:
+        await session.execute(
+            sql_delete(SlaPolicy).where(SlaPolicy.tenant_id == tenant_id)
+        )
+        await session.commit()
         t = await session.get(Tenant, tenant_id)
         if t is not None:
             await session.delete(t)
