@@ -223,4 +223,39 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="seed.py",
+        description=(
+            "Idempotent e2e seed — creates the demo tenant, agent + admin "
+            "users, web channel, and one PENDING conversation with a "
+            "single customer message. Re-running this script is safe: "
+            "every row has a fixed id so a second invocation hits the "
+            "unique-constraint no-op path."
+        ),
+        epilog=(
+            "Example:\n"
+            "  cd apps/api && uv run python ../../tests/e2e/scripts/seed.py\n"
+            "\n"
+            "Prereqs:\n"
+            "  - Postgres reachable via DATABASE_URL (apps/api/.env)\n"
+            "  - alembic upgrade head already applied\n"
+            "\n"
+            "Order matters — run BEFORE seed_budget.py / seed_demo_rich.py / "
+            "extend-seed.py (the other three depend on the tenant + "
+            "users this script inserts)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args()
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        # Tenant-FK failures etc. raise RuntimeError with a hint — surface
+        # it on stderr with a non-zero code instead of an ugly traceback.
+        print(f"seed.py failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:  # pragma: no cover — defensive
+        print(f"seed.py crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)

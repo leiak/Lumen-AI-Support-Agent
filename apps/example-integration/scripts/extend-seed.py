@@ -249,4 +249,39 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="extend-seed.py",
+        description=(
+            "Idempotent FEISHU channel + KB + 2 articles seed. Adds a "
+            "feishu webhook channel, one demo KB (slug='demo-kb'), and "
+            "two articles (password reset + refund policy) on top of "
+            "the base seed."
+        ),
+        epilog=(
+            "Example:\n"
+            "  pnpm seed        # alias for `node --import tsx scripts/extend-seed.ts`\n"
+            "  # or:\n"
+            "  uv run python scripts/extend-seed.py\n"
+            "\n"
+            "Prereqs:\n"
+            "  - tests/e2e/scripts/seed.py has already run\n"
+            "  - alembic upgrade head applied (knowledge / channel configs)\n"
+            "  - DATABASE_URL in apps/api/.env points at the demo DB\n"
+            "\n"
+            "Optional: ANTHROPIC_API_KEY in env enables the tenant_llm "
+            "config row (without it, the demo tenant falls back to the "
+            "canned 'AI 助手暂时无法回复' stub for chat)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args()
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"extend-seed.py failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:  # pragma: no cover — defensive
+        print(f"extend-seed.py crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)

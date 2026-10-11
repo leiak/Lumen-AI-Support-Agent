@@ -241,4 +241,34 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="seed_budget.py",
+        description=(
+            "Idempotent Pack B budget seed — adds tenant_budgets + "
+            "tenant_budget_credits + llm_usage rows to the demo tenant "
+            "so the budget UI is non-empty and ?breakdown=true returns "
+            ">1 group."
+        ),
+        epilog=(
+            "Example:\n"
+            "  cd apps/api && uv run python ../../tests/e2e/scripts/seed_budget.py\n"
+            "\n"
+            "Prereqs:\n"
+            "  - tests/e2e/scripts/seed.py has already run (creates DEMO_TENANT_ID)\n"
+            "  - alembic upgrade head applied (tenant_budgets + LLMUsage tables)\n"
+            "\n"
+            "Re-run safely — every row dedupes on a stable natural key."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args()
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"seed_budget.py failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:  # pragma: no cover — defensive
+        print(f"seed_budget.py crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)

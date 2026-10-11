@@ -560,4 +560,37 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="seed_demo_rich.py",
+        description=(
+            "Rich demo seed — extends seed.py with 4 SLA policies, 5 "
+            "conversations, 3 tickets (NEW/IN_PROGRESS/RESOLVED), ticket "
+            "audit events, and budget usage rows for the current period."
+        ),
+        epilog=(
+            "Example (host):\n"
+            "  cd apps/api && uv run python ../../tests/e2e/scripts/seed_demo_rich.py\n"
+            "\n"
+            "Example (docker exec):\n"
+            "  docker compose cp tests/e2e/scripts/seed_demo_rich.py api:/tmp/\n"
+            "  docker compose exec -T api python -u /tmp/seed_demo_rich.py\n"
+            "\n"
+            "Prereqs:\n"
+            "  - tests/e2e/scripts/seed.py has already run\n"
+            "  - alembic upgrade head applied (tickets / sla_policies tables)\n"
+            "\n"
+            "Idempotent — every row dedupes on a stable natural key."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.parse_args()
+    try:
+        asyncio.run(main())
+    except RuntimeError as e:
+        print(f"seed_demo_rich.py failed: {e}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:  # pragma: no cover — defensive
+        print(f"seed_demo_rich.py crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
