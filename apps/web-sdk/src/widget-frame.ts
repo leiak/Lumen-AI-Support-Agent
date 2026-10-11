@@ -133,7 +133,7 @@ export function createWidgetFrame(
   const onCloseClick = (): void => {
     setOpenState(false);
   };
-  const onIframeLoad = (): void => {
+  const postInit = (): void => {
     // Hand the iframe its config via postMessage. We always send — even
     // when widgetToken is empty — so the iframe can decide whether to
     // mount a graceful "connection failed" state. postMessage with a
@@ -161,14 +161,35 @@ export function createWidgetFrame(
       // the user can still close via the SDK's own close button.
     }
   };
+  const onIframeLoad = (): void => {
+    // The iframe's `load` event fires once for the initial about:blank
+    // document and MAY fire again when srcdoc is set — but only in some
+    // browsers / only when the iframe is visible. We can't rely on it as
+    // the sole trigger; the iframe's `{type:'ready'}` handshake is the
+    // primary signal (see onWindowMessage). Still keep this as a fallback
+    // for the case where the load event arrives before the iframe script
+    // posts its ready message.
+    postInit();
+  };
   const onWindowMessage = (event: MessageEvent): void => {
     const data = event.data;
     if (!data || typeof data !== 'object') return;
     const msg = data as Record<string, unknown>;
-    // Only collapse if the message came from OUR iframe. Other iframes on
-    // the page might also be posting `close` events; we ignore them.
-    if (msg.type === 'close' && event.source === iframe.contentWindow) {
+    // Only react to messages from OUR iframe. Other iframes on the page
+    // might also be posting `close` / `ready` events; we ignore them.
+    if (event.source !== iframe.contentWindow) return;
+    if (msg.type === 'close') {
       setOpenState(false);
+      return;
+    }
+    if (msg.type === 'ready') {
+      // The iframe script has run and its message listener is wired up —
+      // now it's safe to deliver the init config. This is the primary
+      // handshake that works regardless of whether the iframe `load`
+      // event fires when srcdoc is set lazily on a previously-empty
+      // iframe (Chromium-based browsers do NOT re-fire `load` in this
+      // case, which left the chat UI permanently unmounted).
+      postInit();
     }
   };
 

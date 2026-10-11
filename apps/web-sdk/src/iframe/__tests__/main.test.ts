@@ -89,6 +89,55 @@ describe('bootIframe', () => {
     handle.destroy();
   });
 
+  it('posts {type:"ready"} to parent on boot', () => {
+    const parentPost = (window.parent as unknown as { postMessage: ReturnType<typeof vi.fn> })
+      .postMessage;
+    parentPost.mockClear();
+
+    bootIframe({
+      documentRef: document,
+      windowRef: window,
+      webSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+
+    expect(parentPost).toHaveBeenCalledWith({ type: 'ready' }, '*');
+  });
+
+  it('listens for init on the IFRAME window, not on windowRef (parent)', () => {
+    // Regression for the lazy-srcdoc bug: previously the listener was added
+    // to `windowRef` (the parent), but the parent's postMessage lands on
+    // `iframe.contentWindow` — the iframe's own window — so the chat UI
+    // never mounted when srcdoc was set after the iframe was already in
+    // the DOM.
+    const onParentMessage = vi.fn();
+    window.addEventListener('message', onParentMessage);
+
+    bootIframe({
+      documentRef: document,
+      windowRef: window,
+      webSocketImpl: FakeWebSocket as unknown as typeof WebSocket,
+    });
+
+    // Sending init on `window` (the iframe's own window) must mount the chat.
+    dispatchInit(window, {
+      apiBaseUrl: 'https://api.example.com',
+      channelId: 'chan_1',
+      tenantId: 'tenant_a',
+      widgetToken: 'jwt.token.here',
+      title: 'Need help?',
+      subtitle: 'Subtitle',
+      externalUserId: 'visitor-1',
+    });
+    expect(document.querySelector('[data-lumen-iframe="chat"]')).toBeTruthy();
+
+    // A separate listener on the same window (which would mirror the
+    // parent-side `onWindowMessage`) should NOT have fired for the init
+    // message — that's the parent-side concern, not the iframe's.
+    expect(onParentMessage).not.toHaveBeenCalledWith();
+
+    window.removeEventListener('message', onParentMessage);
+  });
+
   it('receives config via postMessage', () => {
     const onMessageSpy = vi.fn();
     window.addEventListener('message', onMessageSpy);

@@ -227,14 +227,6 @@ export function bootIframe(options: BootIframeOptions): IframeHandle {
         : {}),
     });
     ws.on('message', handleFrame);
-
-    // Signal to parent that we're ready (the parent also kicks off init
-    // via iframe.onload, so this is mostly informational / for tests).
-    try {
-      windowRef.parent?.postMessage({ type: 'ready' }, '*');
-    } catch {
-      // best effort
-    }
   }
 
   function onMessage(event: MessageEvent): void {
@@ -244,10 +236,34 @@ export function bootIframe(options: BootIframeOptions): IframeHandle {
     if (msg.type !== 'init') return;
     if (!isIframeConfig(msg.config)) return;
     init(msg.config);
-    windowRef.removeEventListener('message', onMessage);
+    ownWindow.removeEventListener('message', onMessage);
   }
 
-  windowRef.addEventListener('message', onMessage);
+  // We listen on the IFRAME's own window, not on `windowRef` (the parent).
+  // postMessage from the parent lands on `iframe.contentWindow` which is
+  // the iframe's own window — attaching the listener to the parent's
+  // window means we'd never see init and the chat UI would never mount.
+  // In standalone dev (loaded as a top-level page) `parent === window`,
+  // so `documentRef.defaultView ?? windowRef` still resolves to the same
+  // window the messages arrive on.
+  const ownWindow = documentRef.defaultView ?? windowRef;
+  ownWindow.addEventListener('message', onMessage);
+
+  // Signal to the parent that our message listener is wired and we can
+  // receive `{type:'init', config}` immediately. This is the primary
+  // handshake — the parent's `iframe.onload` is unreliable (Chromium
+  // does not re-fire `load` when srcdoc is set lazily on an iframe that
+  // already had an about:blank document), so without this ready signal
+  // the chat UI never mounts.
+  //
+  // Parent SDK subscribes to this via window.message and replies with
+  // `{type:'init', config}`. See apps/web-sdk/src/widget-frame.ts.
+  try {
+    windowRef.parent?.postMessage({ type: 'ready' }, '*');
+  } catch {
+    // best effort — if the parent is gone (e.g. detached iframe) we just
+    // sit and wait for someone to send init manually.
+  }
 
   return {
     destroy(): void {
