@@ -1,16 +1,19 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AxiosError } from 'axios';
-import { ArrowLeft, Bot, CircleAlert, CircleCheck, MessageCircle, RefreshCw, User } from 'lucide-react';
+import { ArrowLeft, Bot, CircleAlert, CircleCheck, MessageCircle, RefreshCw, Trash2, User } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { MessageStream } from '@/components/conversation/message-stream';
 import {
+  createTicketNote,
+  deleteTicketNote,
   fetchTicket,
   fetchTicketEvents,
+  isTicketNote,
   nextTicketStatuses,
   ticketDetailQueryKey,
   ticketEventsQueryKey,
@@ -20,6 +23,7 @@ import {
   type TicketStatus,
 } from '@/lib/tickets';
 import { fetchMessages, messagesQueryKey } from '@/lib/messages';
+import { useCurrentUser } from '@/lib/use-current-user';
 
 // ---------------------------------------------------------------------------
 // Display constants (mirror admin-tickets.tsx for visual consistency)
@@ -423,6 +427,16 @@ export function AdminTicketDetailPage(): JSX.Element {
               )}
             </CardContent>
           </Card>
+
+          {/* Tier 2 Task 2.6 — internal notes panel.
+              Renders the same audit table filtered by event_type="note".
+              Agents can post + delete their own notes; the UI surfaces
+              only the "delete" affordance on notes the caller authored. */}
+          <NotesPanel
+            ticketId={ticketId}
+            events={events}
+            eventsLoaded={!eventsQuery.isPending && !eventsQuery.isError}
+          />
         </div>
 
         {/* Right sidebar — linked conversation messages */}
@@ -513,5 +527,193 @@ function EventRow({ event }: EventRowProps): JSX.Element {
         </p>
       ) : null}
     </li>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// NotesPanel — Tier 2 Task 2.6
+//
+// Filters the same audit table as the timeline above to surface
+// agent-authored internal notes. Posts go through POST /notes
+// (returns the created event row); deletes go through DELETE /notes
+// and only succeed for the original author (server-side check — the
+// UI hides the button on others' notes too as a UX hint).
+// ---------------------------------------------------------------------------
+
+interface NotesPanelProps {
+  ticketId: string;
+  events: readonly TicketEvent[];
+  eventsLoaded: boolean;
+}
+
+const MAX_NOTE_BODY = 4096;
+
+function NotesPanel({
+  ticketId,
+  events,
+  eventsLoaded,
+}: NotesPanelProps): JSX.Element {
+  const queryClient = useQueryClient();
+  const { user } = useCurrentUser();
+  const currentUserId = user?.user_id ?? '';
+
+  const notes = useMemo(
+    () => events.filter(isTicketNote),
+    [events],
+  );
+
+  const [draft, setDraft] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const createMut = useMutation({
+    mutationFn: (body: string) => createTicketNote(ticketId, body),
+    onSuccess: (created) => {
+      // Append the new note into the cached events list so the
+      // panel re-renders without a full refetch round-trip.
+      queryClient.setQueryData<TicketEvent[]>(
+        ticketEventsQueryKey(ticketId),
+        (prev) => (prev ? [created, ...prev] : [created]),
+      );
+      setDraft('');
+      setError(null);
+    },
+    onError: (err) => {
+      setError(extractErrorMessage(err));
+    },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: (noteId: string) => deleteTicketNote(ticketId, noteId),
+    onSuccess: (_void, noteId) => {
+      queryClient.setQueryData<TicketEvent[]>(
+        ticketEventsQueryKey(ticketId),
+        (prev) => (prev ? prev.filter((e) => e.id !== noteId) : prev),
+      );
+    },
+    onError: (err) => {
+      setError(extractErrorMessage(err));
+    },
+  });
+
+  const trimmed = draft.trim();
+  const draftInvalid = trimmed.length === 0 || trimmed.length > MAX_NOTE_BODY;
+  const submitDisabled = draftInvalid || createMut.isPending;
+
+  const handleSubmit = (): void => {
+    if (submitDisabled) return;
+    createMut.mutate(trimmed);
+  };
+
+  return (
+    <Card data-testid="ticket-notes-card">
+      <CardHeader className="pb-3">
+        <CardTitle className="flex items-center justify-between text-base">
+          <span>内部备注</span>
+          <span
+            className="text-xs text-muted-foreground"
+            data-testid="ticket-notes-count"
+          >
+            {notes.length} 条
+          </span>
+        </CardTitle>
+        <p className="text-xs text-muted-foreground">
+          仅坐席可见 — 客户看不到。
+        </p>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2">
+          <textarea
+            rows={3}
+            className="rounded border px-2 py-1.5 text-sm"
+            placeholder="记下要点、转办说明、风险提示…"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            maxLength={MAX_NOTE_BODY + 100}
+            data-testid="ticket-notes-input"
+          />
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span data-testid="ticket-notes-counter">
+              {trimmed.length} / {MAX_NOTE_BODY}
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              onClick={handleSubmit}
+              disabled={submitDisabled}
+              data-testid="ticket-notes-submit"
+            >
+              {createMut.isPending ? '发布中…' : '发布备注'}
+            </Button>
+          </div>
+        </div>
+
+        {error && (
+          <p
+            className="text-xs text-destructive"
+            role="alert"
+            data-testid="ticket-notes-error"
+          >
+            {error}
+          </p>
+        )}
+
+        {!eventsLoaded ? (
+          <Skeleton className="h-12 w-full" data-testid="ticket-notes-loading" />
+        ) : notes.length === 0 ? (
+          <p
+            className="text-sm text-muted-foreground"
+            data-testid="ticket-notes-empty"
+          >
+            暂无备注。
+          </p>
+        ) : (
+          <ol
+            className="flex flex-col gap-3"
+            data-testid="ticket-notes-list"
+          >
+            {notes.map((note) => {
+              const isAuthor =
+                currentUserId.length > 0 && note.actor_id === currentUserId;
+              const body =
+                typeof note.payload['body'] === 'string'
+                  ? note.payload['body']
+                  : '';
+              return (
+                <li
+                  key={note.id}
+                  className="flex flex-col gap-1 rounded border bg-muted/30 p-2 text-sm"
+                  data-testid={`ticket-note-row-${note.id}`}
+                >
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>
+                      {note.actor_id ?? 'system'} ·{' '}
+                      {formatDateTime(note.created_at)}
+                    </span>
+                    {isAuthor && (
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 text-destructive hover:underline disabled:opacity-50"
+                        onClick={() => deleteMut.mutate(note.id)}
+                        disabled={deleteMut.isPending}
+                        data-testid={`ticket-note-delete-${note.id}`}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        删除
+                      </button>
+                    )}
+                  </div>
+                  <p
+                    className="whitespace-pre-wrap"
+                    data-testid={`ticket-note-body-${note.id}`}
+                  >
+                    {body}
+                  </p>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </CardContent>
+    </Card>
   );
 }

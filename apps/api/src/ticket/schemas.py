@@ -81,6 +81,18 @@ class TicketEventOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TicketNoteCreate(BaseModel):
+    """Request body for ``POST /api/v1/tickets/{id}/notes``.
+
+    Tier 2 Task 2.6 — internal notes. Body is plain text up to 4 KB.
+    Notes are stored as :class:`TicketEvent` rows with
+    ``event_type="note"`` so they ride the same audit trail as
+    state changes — no new migration needed.
+    """
+
+    body: str = Field(..., min_length=1, max_length=4096)
+
+
 class SlaPolicyRead(BaseModel):
     """Public representation of an SLA policy (admin listing endpoint).
 
@@ -146,6 +158,7 @@ __all__ = [
     "SlaPolicyRead",
     "TicketEventOut",
     "TicketListRead",
+    "TicketNoteCreate",
     "TicketOut",
     "TicketTransitionIn",
 ]

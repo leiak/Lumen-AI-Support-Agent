@@ -233,5 +233,103 @@ class TicketService:
             subject=subject,
         )
 
+    # ---- notes (Tier 2 Task 2.6) ----
+
+    async def add_note(
+        self,
+        ticket_id: str,
+        *,
+        tenant_id: str,
+        author_id: str,
+        body: str,
+    ) -> TicketEvent:
+        """Append an internal note to ``ticket_id``.
+
+        Notes ride the same :class:`TicketEvent` audit table as
+        state changes — ``event_type="note"``, ``actor_type="agent"``,
+        ``actor_id=author_id``. No new migration needed; the SPA
+        filters the events list by ``event_type === 'note'`` to
+        render the dedicated notes panel.
+
+        Raises :class:`TicketNotFound` for missing / cross-tenant
+        tickets — the route surfaces that as 404 (anti-enumeration,
+        mirrors the events list endpoint).
+        """
+        ticket = await self.repo.get_by_id(ticket_id, tenant_id=tenant_id)
+        if ticket is None:
+            raise TicketNotFound(
+                f"ticket {ticket_id} not found for tenant {tenant_id}"
+            )
+        event = await self.repo.append_event(
+            ticket_id=ticket_id,
+            tenant_id=tenant_id,
+            actor_type="agent",
+            actor_id=author_id,
+            event_type="note",
+            payload={"body": body},
+        )
+        # Commit so the next request (e.g. GET /events) sees the new
+        # row. The DI in api.py wraps the session in a context manager
+        # that does NOT auto-commit on exit — we own the commit here.
+        await self.repo.session.commit()
+        log.info(
+            "ticket_note_added",
+            ticket_id=ticket_id,
+            tenant_id=tenant_id,
+            note_id=event.id,
+        )
+        return event
+
+    async def delete_note(
+        self,
+        ticket_id: str,
+        note_id: str,
+        *,
+        tenant_id: str,
+        author_id: str,
+    ) -> bool:
+        """Delete a note the author posted. Returns True on success.
+
+        Notes are the one exception to the audit-trail append-only
+        rule — they're user content, not system facts. But only the
+        original author can remove their own note (``actor_id ==
+        author_id``); supervisors / admins cannot edit or remove
+        someone else's note (anti-tampering).
+
+        Returns ``False`` if the note doesn't exist, belongs to
+        another tenant, is not a note (i.e. trying to remove a
+        state-change event through this path), or was authored by
+        someone else. The route surfaces all four cases as 404
+        (anti-enumeration parity).
+        """
+        event = await self.repo.get_event_by_id(
+            note_id, tenant_id=tenant_id
+        )
+        if event is None:
+            return False
+        # Three separate 404 paths, intentionally collapsed:
+        #   - cross-ticket (note belongs to a different ticket)
+        #   - cross-tenant (already filtered above)
+        #   - wrong event_type (state-change / SLA / etc.)
+        #   - not the author (anti-tampering — keep callers from
+        #     removing each other's notes)
+        if event.ticket_id != ticket_id:
+            return False
+        if event.event_type != "note":
+            return False
+        if event.actor_id != author_id:
+            return False
+        await self.repo.delete_event(event)
+        # Commit so the row is gone by the time the next request
+        # (e.g. GET /events) reads.
+        await self.repo.session.commit()
+        log.info(
+            "ticket_note_deleted",
+            ticket_id=ticket_id,
+            tenant_id=tenant_id,
+            note_id=note_id,
+        )
+        return True
+
 
 __all__ = ["TicketNotFound", "TicketService"]

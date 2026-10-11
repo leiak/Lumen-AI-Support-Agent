@@ -37,13 +37,13 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from auth.dependencies import get_current_user
 from conversation.repository import ConversationRepository
 from core.database import get_sessionmaker
 from ticket.repository import TicketRepository
-from ticket.schemas import TicketEventOut, TicketOut, TicketTransitionIn
+from ticket.schemas import TicketEventOut, TicketOut, TicketNoteCreate, TicketTransitionIn
 from ticket.service import TicketNotFound, TicketService
 from ticket.state_machine import InvalidTransition
 
@@ -193,6 +193,93 @@ async def list_ticket_events(
         )
     events = await svc.repo.list_events(ticket_id, tenant_id=tenant_id)
     return [TicketEventOut.model_validate(e) for e in events]
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 Task 2.6 — Internal notes.
+#
+# POST   /tickets/{ticket_id}/notes — append an internal note (agent-only
+#                                     audit row, ``event_type="note"``).
+# DELETE /tickets/{ticket_id}/notes/{note_id} — author can delete their
+#                                              own note; all other cases
+#                                              return 404 (anti-tampering
+#                                              + anti-enumeration).
+#
+# Notes ride the same ``TicketEvent`` audit table as state changes,
+# so the existing GET /events endpoint is the source of truth — the
+# SPA filters ``event_type === 'note'`` to render the dedicated panel.
+# No new migration needed.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/{ticket_id}/notes",
+    response_model=TicketEventOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_ticket_note(
+    ticket_id: str,
+    payload: TicketNoteCreate,
+    svc: Annotated[TicketService, Depends(get_ticket_service)],
+    claims: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> TicketEventOut:
+    """Append an internal note to ``ticket_id``.
+
+    Body is plain text (1–4096 chars). Author is taken from the JWT
+    ``sub`` claim — agents cannot post notes on behalf of other
+    agents. Notes are NOT visible to end-customers; they live in
+    the agent workspace and admin SPA only.
+
+    Returns 404 for missing / cross-tenant tickets (anti-enumeration).
+    """
+    tenant_id = claims["tenant_id"]
+    author_id = claims.get("sub", "")
+    try:
+        event = await svc.add_note(
+            ticket_id,
+            tenant_id=tenant_id,
+            author_id=author_id,
+            body=payload.body,
+        )
+    except TicketNotFound as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="ticket not found"
+        ) from e
+    return TicketEventOut.model_validate(event)
+
+
+@router.delete(
+    "/{ticket_id}/notes/{note_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_ticket_note(
+    ticket_id: str,
+    note_id: str,
+    svc: Annotated[TicketService, Depends(get_ticket_service)],
+    claims: Annotated[dict[str, Any], Depends(get_current_user)],
+) -> Response:
+    """Delete a note the caller authored.
+
+    Only the original author can delete their own note. All
+    failure modes (missing / cross-tenant / cross-ticket / not a
+    note / wrong author) collapse to 404 — anti-enumeration
+    parity with the rest of the API surface, and anti-tampering
+    (cannot enumerate whether a sibling agent has notes on the
+    ticket).
+    """
+    tenant_id = claims["tenant_id"]
+    author_id = claims.get("sub", "")
+    ok = await svc.delete_note(
+        ticket_id,
+        note_id,
+        tenant_id=tenant_id,
+        author_id=author_id,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="note not found"
+        )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 __all__ = ["get_ticket_service", "router"]

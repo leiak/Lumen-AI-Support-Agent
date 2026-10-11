@@ -259,3 +259,44 @@ export function ticketDetailQueryKey(ticketId: string): readonly unknown[] {
 export function ticketEventsQueryKey(ticketId: string): readonly unknown[] {
   return ['admin', 'tickets', ticketId, 'events'] as const;
 }
+
+/**
+ * Tier 2 Task 2.6 — internal notes.
+ *
+ * Notes ride the same audit-log table as state-change events. The
+ * SPA filters the events list by ``event_type === 'note'`` to
+ * render the dedicated notes panel; the POST/DELETE helpers below
+ * target the dedicated endpoints so authors can post + delete their
+ * own notes without round-tripping through the events table.
+ */
+export const TicketNoteCreateSchema = z.object({
+  body: z.string().min(1).max(4096),
+});
+export type TicketNoteCreate = z.infer<typeof TicketNoteCreateSchema>;
+
+export async function createTicketNote(
+  ticketId: string,
+  body: string,
+): Promise<TicketEvent> {
+  const { data } = await apiClient.post(
+    `/api/v1/tickets/${ticketId}/notes`,
+    TicketNoteCreateSchema.parse({ body }),
+  );
+  return TicketEventSchema.parse(data);
+}
+
+export async function deleteTicketNote(
+  ticketId: string,
+  noteId: string,
+): Promise<void> {
+  await apiClient.delete(
+    `/api/v1/tickets/${ticketId}/notes/${noteId}`,
+  );
+}
+
+/** Predicate — is this event a user-authored internal note? */
+export function isTicketNote(
+  event: TicketEvent,
+): boolean {
+  return event.event_type === 'note';
+}

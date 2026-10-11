@@ -268,6 +268,32 @@ class TicketRepository:
         await self.session.flush()
         return event
 
+    async def get_event_by_id(
+        self, event_id: str, *, tenant_id: str
+    ) -> TicketEvent | None:
+        """Fetch one audit-log row by id, tenant-scoped.
+
+        Tier 2 Task 2.6 — used by the note-deletion path so a
+        cross-tenant attacker can't probe note existence.
+        """
+        stmt = select(TicketEvent).where(
+            TicketEvent.id == event_id,
+            TicketEvent.tenant_id == tenant_id,
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def delete_event(self, event: TicketEvent) -> None:
+        """Delete one audit-log row. Caller commits.
+
+        The audit trail is normally append-only — this method is the
+        one exception, used only for the user's own notes
+        (``event_type="note"``, ``actor_id == caller``). State-change
+        and SLA events are not deletable through this path (the
+        service layer enforces that).
+        """
+        await self.session.delete(event)
+        await self.session.flush()
+
     # ---- sla_policies ----
 
     async def find_sla_policy(

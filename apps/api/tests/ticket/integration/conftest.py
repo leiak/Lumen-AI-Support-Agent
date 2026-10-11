@@ -38,6 +38,8 @@ from channel.repository import ChannelRepository
 from conversation.enums import ConversationStatus
 from conversation.models import Conversation
 from conversation.repository import ConversationRepository
+from sqlalchemy import delete as sql_delete
+
 from core.database import get_session, reset_engine, reset_sessionmaker
 from core.id_gen import new_id
 from tenant.enums import TenantPlan
@@ -100,8 +102,23 @@ def _auth_headers(*, tenant_id: str, user_id: str = "u_admin") -> dict[str, str]
 
 
 async def _delete_tenant(tenant_id: str) -> None:
-    """Cascade-delete a tenant (kills channels, conversations, messages, tickets)."""
+    """Cascade-delete a tenant (kills channels, conversations, messages, tickets).
+
+    Tier 2 Task 2.6 — ``tickets`` and ``ticket_events`` FK to ``tenants``
+    without ON DELETE CASCADE (intentional — production tenant deletion
+    is a destructive admin op). We sweep them out before the tenant
+    delete or the teardown FK check trips.
+    """
     async with get_session() as session:
+        await session.execute(
+            sql_delete(Ticket).where(Ticket.tenant_id == tenant_id)
+        )
+        await session.execute(
+            sql_delete(TicketEvent).where(
+                TicketEvent.tenant_id == tenant_id
+            )
+        )
+        await session.commit()
         t = await session.get(Tenant, tenant_id)
         if t is not None:
             await session.delete(t)
