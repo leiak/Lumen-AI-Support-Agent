@@ -23,7 +23,6 @@ import os
 import sys
 import time
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -43,7 +42,6 @@ if str(_API_SRC) not in sys.path:
 
 
 # Late imports — must come after sys.path tweak above.
-import httpx  # noqa: E402
 import requests  # noqa: E402
 import websockets  # noqa: E402
 

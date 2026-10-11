@@ -76,10 +76,6 @@ if _API_SRC not in sys.path:
 # Import everything the rich seed needs.  ticket.models must come before
 # conversation.models so ``conversations.ticket_id`` FK resolves cleanly.
 from ticket import models as _ticket_models  # noqa: E402,F401
-from budget.models import (  # noqa: E402
-    TenantBudget,
-    TenantBudgetCredit,
-)
 from channel.enums import ChannelStatus, ChannelType  # noqa: E402
 from channel.models import Channel  # noqa: E402
 from conversation.enums import ConversationStatus, MessageRole  # noqa: E402
@@ -88,8 +84,8 @@ from core.database import get_session, reset_engine, reset_sessionmaker  # noqa:
 from core.id_gen import new_id  # noqa: E402
 from llm_client.models import LLMUsage  # noqa: E402
 from sqlalchemy import text  # noqa: E402
-from tenant.enums import TenantPlan, TenantStatus, UserRole  # noqa: E402
-from tenant.models import Tenant, User  # noqa: E402
+from tenant.enums import TenantPlan, TenantStatus  # noqa: E402
+from tenant.models import Tenant  # noqa: E402
 
 
 # ─── Constants aligned with seed.py ──────────────────────────────────────

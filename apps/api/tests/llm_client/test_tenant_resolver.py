@@ -148,7 +148,7 @@ def test_chain_tenant_ainvoke_delegates() -> None:
     assert result == "response"
 
 
-def test_build_providers_threads_anthropic_base_url_from_row(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_providers_threads_anthropic_base_url_from_row(monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: E501
     """When a tenant_llm_configs row has ``base_url`` set, the resolver
     must thread it into AnthropicProvider (mirrors the OpenAI/MiniMax
     path which already honours ``row.base_url``). Regression: the

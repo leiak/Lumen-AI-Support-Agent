@@ -36,13 +36,11 @@ from dataclasses import dataclass
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from admin.schemas.search import SearchResult, SearchResultsOut
 from conversation.models import Conversation
 from knowledge.models import Article, ArticleVersion
 from ticket.enums import TicketStatus
 from ticket.models import Ticket
-
-from admin.schemas.search import SearchResult, SearchResultsOut
-
 
 # Hard cap on snippet length so we never leak a giant body to the UI.
 _SNIPPET_MAX = 200

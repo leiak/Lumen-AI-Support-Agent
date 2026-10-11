@@ -44,7 +44,7 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.func.now(),
         ),
-        sa.UniqueConstraint("tenant_id", "provider_name", name="uq_tenant_llm_configs_tenant_provider"),
+        sa.UniqueConstraint("tenant_id", "provider_name", name="uq_tenant_llm_configs_tenant_provider"),  # noqa: E501
     )
     op.create_index(
         "ix_tenant_llm_configs_tenant_id",

@@ -29,7 +29,6 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import delete as sql_delete
 
 from channel.enums import ChannelStatus, ChannelType
 from channel.models import Channel
@@ -45,7 +44,6 @@ from tenant.repository import TenantRepository
 from tests.admin.conftest import _delete_tenant, auth_headers
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import Ticket
-
 
 # ---------------------------------------------------------------------------
 # Seed helpers

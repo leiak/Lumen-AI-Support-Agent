@@ -14,7 +14,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 WidgetTheme = Literal["light", "dark", "auto"]
 WidgetPosition = Literal["bottom-right", "bottom-left"]
 

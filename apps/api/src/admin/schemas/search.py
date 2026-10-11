@@ -23,7 +23,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
 SearchKind = Literal["article", "ticket", "conversation"]
 
 
@@ -46,4 +45,4 @@ class SearchResultsOut(BaseModel):
     results: list[SearchResult]
 
 
-__all__ = ["SearchResult", "SearchResultsOut", "SearchKind"]
+__all__ = ["SearchKind", "SearchResult", "SearchResultsOut"]

@@ -51,10 +51,8 @@ from knowledge.enums import ArticleStatus  # noqa: E402
 # reason — Channel / KB / Article all FK to tenants.id.
 from ticket import models as ticket_models  # noqa: E401,F401,E402  -- needed for FK resolution
 from knowledge.models import Article, ArticleVersion, KnowledgeBase  # noqa: E402
-from tenant.models import Tenant  # noqa: E402 -- needed for FK resolution
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher  # noqa: E402
 from llm_client.tenant_config_models import (  # noqa: E402
-    TenantLLMConfig,
     TenantLLMConfigRepository,
 )
 

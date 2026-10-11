@@ -28,7 +28,6 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
-from tenant.enums import UserRole
 from tenant.models import Tenant, User
 from tests.admin.conftest import auth_headers
 

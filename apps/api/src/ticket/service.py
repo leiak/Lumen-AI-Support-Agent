@@ -37,7 +37,7 @@ from ticket.state_machine import transition as sm_transition
 
 if TYPE_CHECKING:
     from conversation.repository import ConversationRepository
-    from ticket.models import Ticket
+    from ticket.models import Ticket, TicketEvent
 
 
 log = get_logger(__name__)

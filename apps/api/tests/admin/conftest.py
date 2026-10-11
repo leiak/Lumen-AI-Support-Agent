@@ -26,11 +26,11 @@ from typing import Any
 import pytest
 from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete as sql_delete
 
 from auth.jwt import create_access_token
 from core.config import reset_settings
 from core.database import get_session, get_sessionmaker, reset_engine, reset_sessionmaker
-from sqlalchemy import delete as sql_delete
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository

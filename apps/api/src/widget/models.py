@@ -8,10 +8,8 @@ freshly-seeded tenant matches the M2.A baseline.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.database import Base

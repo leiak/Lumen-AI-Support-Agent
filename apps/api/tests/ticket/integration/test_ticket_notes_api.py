@@ -29,7 +29,6 @@ from ticket.models import Ticket, TicketEvent
 
 
 def _hdr(*, tenant_id: str, user_id: str = "u_admin", role: str = "admin") -> dict[str, str]:
-    from tests.ticket.integration.conftest import _auth_headers
     # _auth_headers hardcodes role="admin" + user_id="u_admin"; we
     # need flexible identity for the author-can-only-delete-own-note
     # test, so re-mint here.
@@ -321,18 +320,18 @@ async def test_delete_unknown_note_returns_404(
 
 
 __all__ = [
-    "test_post_note_creates_event_with_note_event_type",
-    "test_post_note_appears_in_events_endpoint",
-    "test_post_note_rejects_empty_body",
-    "test_post_note_rejects_oversize_body",
-    "test_post_note_cross_tenant_returns_404",
-    "test_post_note_unknown_ticket_returns_404",
-    "test_post_note_requires_auth",
-    "test_author_can_delete_own_note",
-    "test_other_agent_cannot_delete_sibling_note",
     "test_admin_cannot_delete_other_agents_note",
-    "test_cannot_delete_state_change_event_through_note_path",
+    "test_author_can_delete_own_note",
     "test_cannot_delete_note_on_other_ticket",
+    "test_cannot_delete_state_change_event_through_note_path",
     "test_delete_note_cross_tenant_returns_404",
     "test_delete_unknown_note_returns_404",
+    "test_other_agent_cannot_delete_sibling_note",
+    "test_post_note_appears_in_events_endpoint",
+    "test_post_note_creates_event_with_note_event_type",
+    "test_post_note_cross_tenant_returns_404",
+    "test_post_note_rejects_empty_body",
+    "test_post_note_rejects_oversize_body",
+    "test_post_note_requires_auth",
+    "test_post_note_unknown_ticket_returns_404",
 ]

@@ -21,7 +21,6 @@ from httpx import AsyncClient
 from llm_client.providers.base import BaseProvider
 from llm_client.runtime_chain import (
     RuntimeChain,
-    get_runtime_chain,
     reset_runtime_chain_for_tests,
 )
 from tenant.enums import TenantPlan

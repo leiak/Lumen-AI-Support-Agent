@@ -43,7 +43,7 @@ from auth.dependencies import get_current_user
 from conversation.repository import ConversationRepository
 from core.database import get_sessionmaker
 from ticket.repository import TicketRepository
-from ticket.schemas import TicketEventOut, TicketOut, TicketNoteCreate, TicketTransitionIn
+from ticket.schemas import TicketEventOut, TicketNoteCreate, TicketOut, TicketTransitionIn
 from ticket.service import TicketNotFound, TicketService
 from ticket.state_machine import InvalidTransition
 
@@ -225,7 +225,7 @@ async def create_ticket_note(
 ) -> TicketEventOut:
     """Append an internal note to ``ticket_id``.
 
-    Body is plain text (1–4096 chars). Author is taken from the JWT
+    Body is plain text (1-4096 chars). Author is taken from the JWT
     ``sub`` claim — agents cannot post notes on behalf of other
     agents. Notes are NOT visible to end-customers; they live in
     the agent workspace and admin SPA only.

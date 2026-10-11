@@ -38,12 +38,11 @@ from conversation.models import Conversation
 from core.database import get_sessionmaker
 from core.id_gen import new_id
 from llm_client.models import LLMUsage
-from tenant.enums import TenantPlan, UserRole
+from tenant.enums import UserRole
 from tenant.models import Tenant, User
 from tests.admin.conftest import auth_headers
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.models import Ticket
-
 
 # ---------------------------------------------------------------------------
 # Seed helpers — each test seeds only what it needs.
@@ -121,7 +120,7 @@ async def _seed_user(
             id=new_id(),
             tenant_id=tenant_id,
             email=email or f"u-{new_id()}@example.com",
-            password_hash="x",
+            password_hash="x",  # noqa: S106 — placeholder for tests
             role=role,
             is_active=is_active,
             full_name="Seed",
@@ -337,12 +336,12 @@ async def test_dashboard_no_token_returns_401(
 
 
 __all__ = [
-    "test_dashboard_returns_zero_counts_when_tenant_is_empty",
-    "test_dashboard_counts_tickets_by_status_and_priority",
-    "test_dashboard_open_conversations_include_pending",
-    "test_dashboard_sums_llm_tokens_this_period",
     "test_dashboard_counts_active_and_total_users",
+    "test_dashboard_counts_tickets_by_status_and_priority",
     "test_dashboard_cross_tenant_access_returns_404",
-    "test_dashboard_non_admin_role_returns_403",
     "test_dashboard_no_token_returns_401",
+    "test_dashboard_non_admin_role_returns_403",
+    "test_dashboard_open_conversations_include_pending",
+    "test_dashboard_returns_zero_counts_when_tenant_is_empty",
+    "test_dashboard_sums_llm_tokens_this_period",
 ]

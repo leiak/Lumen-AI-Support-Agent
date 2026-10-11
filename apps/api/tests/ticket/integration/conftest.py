@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete as sql_delete
 
 from auth.jwt import create_access_token
 from channel.enums import ChannelStatus, ChannelType
@@ -38,8 +39,6 @@ from channel.repository import ChannelRepository
 from conversation.enums import ConversationStatus
 from conversation.models import Conversation
 from conversation.repository import ConversationRepository
-from sqlalchemy import delete as sql_delete
-
 from core.database import get_session, reset_engine, reset_sessionmaker
 from core.id_gen import new_id
 from tenant.enums import TenantPlan

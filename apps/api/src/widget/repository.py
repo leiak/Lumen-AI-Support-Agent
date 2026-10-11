@@ -6,8 +6,6 @@ serialization.
 """
 from __future__ import annotations
 
-from typing import Any
-
 from sqlalchemy import select
 
 from core.database import get_session

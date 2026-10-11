@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from admin.repository import (
@@ -65,7 +65,6 @@ from admin.schemas.llm_chain import (
     LLMProviderInfo,
 )
 from admin.schemas.search import SearchResultsOut
-from admin.search import AdminSearchService
 from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
@@ -86,6 +85,7 @@ from admin.schemas.widget_config import (
     WidgetConfigResetResponse,
     WidgetConfigUpdate,
 )
+from admin.search import AdminSearchService
 from auth.dependencies import require_admin
 from auth.password import hash_password
 from budget.cleanup import run_budget_cleanup
@@ -93,6 +93,8 @@ from budget.credits import CreditService
 from budget.per_model import PerModelService, get_per_model_cache
 from budget.repository import TenantBudgetSnapshotRepository
 from budget.resolver import _current_period
+from conversation.enums import ConversationStatus
+from conversation.models import Conversation
 from core.config import get_settings
 from core.database import get_sessionmaker
 from core.id_gen import new_id
@@ -103,21 +105,17 @@ from knowledge.models import (
     KbArticleDraft,
     KnowledgeBase,
 )
-from tenant.enums import UserRole
-from tenant.models import User
-from tenant.repository import TenantRepository, UserRepository
-from ticket.enums import TicketPriority, TicketStatus
-from ticket.models import SlaPolicy, Ticket
-from ticket.repository import TicketRepository
-from widget.repository import WidgetConfigRepository
-from conversation.enums import ConversationStatus
-from conversation.models import Conversation
 from llm_client.models import LLMUsage
 from llm_client.provider_registry import build_provider_registry
 from llm_client.runtime_chain import (
     ChainStep,
     get_runtime_chain,
 )
+from tenant.models import User
+from tenant.repository import TenantRepository, UserRepository
+from ticket.enums import TicketPriority, TicketStatus
+from ticket.models import SlaPolicy, Ticket
+from ticket.repository import TicketRepository
 from ticket.schemas import (
     SlaPolicyCreate,
     SlaPolicyRead,
@@ -125,6 +123,7 @@ from ticket.schemas import (
     TicketListRead,
     TicketOut,
 )
+from widget.repository import WidgetConfigRepository
 
 logger = logging.getLogger(__name__)
 
