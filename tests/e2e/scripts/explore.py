@@ -919,6 +919,168 @@ def _read_metric_value(
     return 0.0
 
 
+# =============================================================================
+# Round 11 — Tenant LLM config audit log (M5.3)
+# =============================================================================
+
+async def round11_audit_log() -> None:
+    """M5.3 — verify the ``tenant_llm_config_audit_log`` table receives
+    rows from the admin REST surface.
+
+    Mirrors the spec's E2E: POST a config (writes 4 audit rows for
+    api_key + base_url + model + enabled), PATCH ``model`` (1 row),
+    PATCH ``enabled=False`` (1 row), DELETE (1 ``__deleted__`` row).
+    Then ``SELECT field, COUNT(*) FROM tenant_llm_config_audit_log
+    WHERE tenant_id = X GROUP BY field`` and assert every expected
+    field is present.
+
+    Gated on ``ANTHROPIC_API_KEY`` for consistency with other
+    rounds — the admin POST requires a non-empty plaintext key (any
+    string works for Fernet), but the round is skipped without
+    creds to keep the explore script's "set ANTHROPIC_API_KEY
+    first" rule uniform.
+    """
+    print("\n" + "=" * 70)
+    print("Round 11 — Tenant LLM config audit log (M5.3)")
+    print("=" * 70)
+    rid = "R11"
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        _record(
+            rid, "WARN",
+            "no ANTHROPIC_API_KEY — skipping audit log round "
+            "(structure check lives in test_tenant_llm_config_audit_e2e.py)",
+        )
+        return
+
+    # 1. Mint a fresh tenant (no widget channel — admin only).
+    from tenant.repository import TenantRepository
+
+    repo = TenantRepository()
+    tenant = await repo.create(
+        name=f"round11-audit-{uuid.uuid4().hex[:8]}",
+        plan=TenantPlan.PRO, status=TenantStatus.ACTIVE,
+    )
+    tenant_id = tenant.id
+    _record(rid, "OK", f"seeded tenant_id={tenant_id}")
+
+    # 2. Mint an admin JWT.
+    from auth.jwt import create_access_token
+
+    token = create_access_token(
+        tenant_id=tenant_id, user_id=f"round11-{tenant_id}", role="admin",
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 3. POST → 4 audit rows (api_key + base_url + model + enabled).
+    payload = {
+        "provider_name": "anthropic",
+        "api_key": "sk-round11-e2e",
+        "base_url": "https://proxy.example",
+        "model": "claude-haiku-4-5",
+    }
+    try:
+        r = requests.post(
+            f"{API}/api/v1/admin/tenants/{tenant_id}/llm-configs",
+            json=payload, headers=headers, timeout=10,
+        )
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"POST audit: {type(exc).__name__}: {exc}")
+        return
+    if r.status_code != 201:
+        _record(rid, "FAIL", f"POST status={r.status_code} body={r.text[:200]!r}")
+        return
+    _record(rid, "OK", "POST /admin/.../llm-configs 201 → expect 4 audit rows")
+
+    # 4. PATCH model → 1 audit row.
+    try:
+        r = requests.patch(
+            f"{API}/api/v1/admin/tenants/{tenant_id}/llm-configs/anthropic",
+            json={"model": "claude-3-5-sonnet-20241022"},
+            headers=headers, timeout=10,
+        )
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"PATCH model: {type(exc).__name__}: {exc}")
+        return
+    if r.status_code != 200:
+        _record(rid, "FAIL", f"PATCH model status={r.status_code}")
+        return
+    _record(rid, "OK", "PATCH model → expect 1 audit row")
+
+    # 5. PATCH enabled=False → 1 audit row.
+    try:
+        r = requests.patch(
+            f"{API}/api/v1/admin/tenants/{tenant_id}/llm-configs/anthropic",
+            json={"enabled": False},
+            headers=headers, timeout=10,
+        )
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"PATCH enabled: {type(exc).__name__}: {exc}")
+        return
+    if r.status_code != 200:
+        _record(rid, "FAIL", f"PATCH enabled status={r.status_code}")
+        return
+    _record(rid, "OK", "PATCH enabled=False → expect 1 audit row")
+
+    # 6. DELETE → 1 __deleted__ marker.
+    try:
+        r = requests.delete(
+            f"{API}/api/v1/admin/tenants/{tenant_id}/llm-configs/anthropic",
+            headers=headers, timeout=10,
+        )
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"DELETE: {type(exc).__name__}: {exc}")
+        return
+    if r.status_code != 204:
+        _record(rid, "FAIL", f"DELETE status={r.status_code}")
+        return
+    _record(rid, "OK", "DELETE → expect 1 __deleted__ audit marker")
+
+    # 7. SELECT count by field + assert >= 7 rows total.
+    try:
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from sqlalchemy import text as sql_text
+
+        eng = create_async_engine(os.environ["DATABASE_URL"])
+        async with eng.connect() as conn:
+            result = await conn.execute(sql_text(
+                "SELECT field, COUNT(*) AS n "
+                "FROM tenant_llm_config_audit_log "
+                "WHERE tenant_id = :tid "
+                "GROUP BY field ORDER BY field"
+            ), {"tid": tenant_id})
+            rows = list(result.fetchall())
+        await eng.dispose()
+    except Exception as exc:
+        _record(rid, "WARN", f"SQL inspection failed: {type(exc).__name__}: {exc}")
+        return
+
+    counts = {row[0]: int(row[1]) for row in rows}
+    total = sum(counts.values())
+    expected_min = {
+        "api_key": 1,
+        "base_url": 1,
+        "model": 1,  # the PATCH (the POST also writes a model row but it's >= 1)
+        "enabled": 1,
+        "__deleted__": 1,
+    }
+    missing = [f for f, n in expected_min.items() if counts.get(f, 0) < n]
+    if missing:
+        _record(
+            rid, "FAIL",
+            f"audit log missing fields {missing} — counts: {counts} (total {total})",
+        )
+        return
+    if total < 7:
+        _record(rid, "FAIL", f"audit log has only {total} rows (expected >=7)")
+        return
+    _record(
+        rid, "OK",
+        f"audit log has {total} rows for tenant: {counts}",
+    )
+
+
 # Main
 # =============================================================================
 
@@ -933,6 +1095,7 @@ ALL_ROUNDS = {
     "8": ("Round 8 — Streaming stability", round8_streaming),
     "9": ("Round 9 — Per-tenant fallback chain (M5.1)", round9_tenant_fallback_chain),
     "10": ("Round 10 — Per-tenant model override (M5.2)", round10_tenant_model_override),
+    "11": ("Round 11 — Tenant LLM config audit log (M5.3)", round11_audit_log),
 }
 
 
