@@ -20,6 +20,30 @@ vi.mock('@/lib/api-client', async () => {
   };
 });
 
+// Admin reassign needs the tenant user roster. Tests opt in to a
+// canned roster by overriding the mock in their setup; the default
+// returns a single agent so fetchTenantUsers is at least callable.
+vi.mock('@/lib/tenant-users', async () => {
+  const actual = await vi.importActual<typeof TenantUsers>('@/lib/tenant-users');
+  return {
+    ...actual,
+    fetchTenantUsers: vi.fn(async () => [
+      {
+        id: 'u_agent_roster',
+        tenant_id: 'demo',
+        email: 'roster@example.com',
+        full_name: 'Roster Agent',
+        role: 'agent',
+        is_active: true,
+        created_at: '2026-09-01T00:00:00Z',
+        updated_at: '2026-09-01T00:00:00Z',
+      },
+    ]),
+  };
+});
+
+import type * as TenantUsers from '@/lib/tenant-users';
+
 vi.mock('@/lib/use-current-user', () => ({
   useCurrentUser: vi.fn(),
 }));
@@ -264,5 +288,62 @@ describe('InboxDetailPage', () => {
       '/api/v1/conversations',
       expect.anything(),
     );
+  });
+
+  it('admin role sees the reassign control; opening it loads the tenant roster', async () => {
+    // Admin opens the detail page → "分配给…" button is visible.
+    // Clicking it opens the inline select and lazy-loads the tenant
+    // user roster from /admin/tenants/{tid}/users.
+    vi.mocked(useCurrentUser).mockReturnValue({
+      user: {
+        user_id: 'u_admin',
+        email: 'admin@example.com',
+        tenant_id: 'demo',
+        tenant_name: 'Demo',
+        role: 'admin',
+      },
+      isLoading: false,
+      isError: false,
+    });
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
+    vi.mocked(apiClient.get).mockImplementation((url) => {
+      if (typeof url === 'string' && url.endsWith('/messages')) {
+        return Promise.resolve({ data: { items: [] } });
+      }
+      return Promise.resolve({ data: { items: [sampleConversation] } });
+    });
+    renderPage();
+
+    const toggle = await screen.findByTestId('action-reassign-toggle');
+    expect(toggle).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(toggle);
+
+    // Roster panel + select visible after the toggle.
+    const select = await screen.findByTestId('reassign-select');
+    expect(select).toBeInTheDocument();
+    // The canned mock returns the roster agent; its email should be
+    // rendered as an <option> once the query resolves.
+    await waitFor(() =>
+      expect(screen.getByRole('option', { name: /roster@example.com/ })).toBeInTheDocument(),
+    );
+  });
+
+  it('agent role does not see the reassign control', async () => {
+    // Default mockCurrentUser already returns role='agent'.
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
+    vi.mocked(apiClient.get).mockImplementation((url) => {
+      if (typeof url === 'string' && url.endsWith('/messages')) {
+        return Promise.resolve({ data: { items: [] } });
+      }
+      return Promise.resolve({ data: { items: [sampleConversation] } });
+    });
+    renderPage();
+
+    // Wait for the detail page to render, then assert the toggle is absent.
+    await screen.findByTestId('conversation-header');
+    expect(screen.queryByTestId('action-reassign-toggle')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('reassign-panel')).not.toBeInTheDocument();
   });
 });
