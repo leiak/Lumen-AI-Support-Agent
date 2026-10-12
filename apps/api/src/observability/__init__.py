@@ -42,4 +42,11 @@ HTTPXClientInstrumentor().instrument(excluded_urls=_EXCLUDED_URLS)
 # cheap; calling it on every import is fine.
 tracer = trace.get_tracer("lumen")
 
-__all__ = ["tracer"]
+# M6.2 — re-export the @traced decorator + PII constants
+from observability.tracing import (  # noqa: E402
+    PII_FORBIDDEN,
+    PII_WHITELIST,
+    traced,
+)
+
+__all__ = ["tracer", "traced", "PII_WHITELIST", "PII_FORBIDDEN"]
