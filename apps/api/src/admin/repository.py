@@ -48,6 +48,7 @@ from budget.models import TenantBudget
 from budget.repository import TenantBudgetRepository
 from core.config import get_settings
 from core.id_gen import new_id
+from observability import traced
 from llm_client.tenant_config_audit_models import (
     TenantLLMConfigAuditLog,
     TenantLLMConfigAuditRepository,
@@ -254,6 +255,7 @@ class AdminTenantLLMConfigRepository:
         self._tenants = TenantRepository()
         self._audit_repo = TenantLLMConfigAuditRepository()
 
+    @traced("admin.llm_config.upsert")
     async def upsert(
         self,
         *,
@@ -365,6 +367,7 @@ class AdminTenantLLMConfigRepository:
             raise ValueError(f"unknown tenant: {tenant_id!r}")
         return await self._inner.list_by_tenant(tenant_id, enabled_only=False)
 
+    @traced("admin.llm_config.update")
     async def update(
         self,
         *,
@@ -463,6 +466,7 @@ class AdminTenantLLMConfigRepository:
         _log_audit_mutation(tenant_id, provider_name, "patch", diffs, changed_by)
         return new_row
 
+    @traced("admin.llm_config.delete")
     async def delete(
         self,
         *,

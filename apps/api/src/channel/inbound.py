@@ -33,6 +33,7 @@ from conversation.service import ConversationService
 from qa.worker import build_arq_redis
 from ticket.repository import TicketRepository
 from ticket.service import TicketService
+from observability import tracer
 
 
 def _build_ticket_service_factory() -> Callable[..., TicketService]:
@@ -266,6 +267,27 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
 
     Returns nothing. A ``None`` from ``find_or_create_for_inbound`` indicates
     the cross-tenant guard tripped — we log and drop.
+    """
+    # M6.4 — wrap the entire inbound-envelope pipeline (find/create
+    # conversation, persist customer message, AI auto-response, all
+    # broadcasts) in a single ``channel.inbound`` span. Whitelisted
+    # attributes only (``channel.name``, ``tenant_id``); message
+    # bodies and customer ids are deliberately excluded.
+    with tracer.start_as_current_span(
+        "channel.inbound",
+        attributes={
+            "channel.name": envelope.channel_id,
+            "tenant_id": envelope.tenant_id,
+        },
+    ):
+        await _process_inbound_envelope_inner(envelope)
+
+
+async def _process_inbound_envelope_inner(envelope: MessageEnvelope) -> None:
+    """Inner body of :func:`process_inbound_envelope` — separated so the
+    M6.4 ``channel.inbound`` span wraps the whole try block without a
+    span-around-try anti-pattern. The original exception-swallow contract
+    is preserved.
     """
     try:
         conv_service = ConversationService(

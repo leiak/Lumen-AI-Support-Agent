@@ -34,6 +34,10 @@ from core.database import get_session, get_sessionmaker, reset_engine, reset_ses
 from tenant.enums import TenantPlan
 from tenant.models import Tenant
 from tenant.repository import TenantRepository
+from tests.observability.conftest import (  # noqa: F401 — side-effect import:  # noqa: E501
+    clear_memory_exporter,
+    memory_exporter,
+)
 from ticket.models import SlaPolicy, Ticket
 
 

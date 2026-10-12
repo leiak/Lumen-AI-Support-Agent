@@ -17,6 +17,7 @@ import httpx
 from botocore.auth import SigV4Auth  # type: ignore[import-untyped]
 from botocore.awsrequest import AWSRequest  # type: ignore[import-untyped]
 from botocore.credentials import Credentials  # type: ignore[import-untyped]
+from observability import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,40 @@ class EmailOutbound:
             "EmailTags": [{"Name": "tenant_id", "Value": tenant_id}],
         }
 
+        # M6.4 — wrap the entire outbound-send (including the SES
+        # retry loop) in a single ``channel.outbound`` span. The
+        # span covers BOTH the httpx POST to SES and the in-process
+        # exponential backoff sleep, so an operator can attribute
+        # the full wall-clock duration of a flaky SES exchange to
+        # one trace. Whitelisted attributes only (``channel.name``
+        # is constant ``email`` here, ``tenant_id`` from the
+        # caller); to / from email addresses are deliberately NOT
+        # attached — they're PII-bearing.
+        with tracer.start_as_current_span(
+            "channel.outbound",
+            attributes={
+                "channel.name": "email",
+                "tenant_id": tenant_id,
+            },
+        ):
+            return await self._send_with_retries(
+                url=url,
+                payload=payload,
+                tenant_id=tenant_id,
+            )
+
+    async def _send_with_retries(
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        tenant_id: str,
+    ) -> str:
+        """Inner retry loop extracted from ``send_reply`` so the M6.4
+        ``channel.outbound`` span wraps the WHOLE call (including
+        backoff sleeps) without a span-around-try anti-pattern. The
+        outer ``EmailOutbound.send_reply`` signature is unchanged.
+        """
         last_exc: Exception | None = None
         for attempt in range(self._max_retries):
             try:

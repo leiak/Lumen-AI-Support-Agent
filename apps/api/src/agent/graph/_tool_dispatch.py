@@ -80,6 +80,7 @@ from agent.graph.prompts import ESCALATION_TOOL_NAME, FALLBACK_MESSAGE
 from agent.graph.state import AgentState
 from core.logging import get_logger
 from llm_client.client import LLMClient
+from observability import tracer
 from llm_client.exceptions import (
     InvalidRequest,
     OutputInvalid,
@@ -258,8 +259,31 @@ async def dispatch_tool_calls(
                     # helper handles both shapes so the
                     # dispatcher stays provider-agnostic.
                     args = _extract_tool_args(tc)
+                    # M6.4 — wrap each tool invocation in an
+                    # ``agent.tool.<name>`` span. Tool name is
+                    # the LLM-supplied ``tool_call.name`` (e.g.
+                    # ``search_internal_kb`` /
+                    # ``escalate_to_human``); pinning it to the
+                    # span name gives us per-tool timing /
+                    # failure metrics without parsing log
+                    # breadcrumbs. Whitelisted attributes only
+                    # (tenant_id + conversation.id); tool args
+                    # are deliberately NOT attached — they can
+                    # carry customer text and are PII-bearing.
+                    tool_span_name = (
+                        f"agent.tool.{tool_name}"
+                        if isinstance(tool_name, str) and tool_name
+                        else "agent.tool.unknown"
+                    )
                     try:
-                        tool_result = await tool_obj.ainvoke(args)
+                        with tracer.start_as_current_span(
+                            tool_span_name,
+                            attributes={
+                                "tenant_id": tenant_id,
+                                "conversation.id": conversation_id,
+                            },
+                        ):
+                            tool_result = await tool_obj.ainvoke(args)
                     except Exception as exc:
                         # Tool failure MUST NOT abort the
                         # turn. Write the error into the

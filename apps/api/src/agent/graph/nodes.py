@@ -72,6 +72,7 @@ from llm_client.exceptions import (
     ProviderUnavailable,
     RateLimited,
 )
+from observability import tracer
 from llm_client.types import (
     ChatMessage as LLMChatMessage,
 )
@@ -169,6 +170,21 @@ def make_retrieve_node(
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
+        # M6.4 — wrap each LangGraph node body in an
+        # ``agent.node.retrieve`` span. Whitelisted attributes
+        # only (``tenant_id``, ``conversation.id``); everything
+        # else (chunk text, query) stays out of the span
+        # attributes entirely.
+        with tracer.start_as_current_span(
+            "agent.node.retrieve",
+            attributes={
+                "tenant_id": state["tenant_id"],
+                "conversation.id": state["conversation_id"],
+            },
+        ):
+            return await _node_body(state)
+
+    async def _node_body(state: AgentState) -> dict[str, Any]:
         # Defensive guard — Stage 7.1 review nit. A caller that
         # forgets to populate ``state["messages"]`` (or passes
         # ``None`` explicitly) should not crash the node with
@@ -346,6 +362,23 @@ def make_llm_node(
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
+        # M6.4 — wrap the entire LLM-node body (initial request,
+        # streaming, tool dispatch loop, error fallbacks) in a
+        # single ``agent.node.llm`` span. Tool-call dispatches
+        # inside the loop open their own ``agent.tool.*`` child
+        # spans, so the parent-child tree makes a full agent
+        # turn traceable from one node down to each retrieval
+        # and each side-effect. Whitelisted attributes only.
+        with tracer.start_as_current_span(
+            "agent.node.llm",
+            attributes={
+                "tenant_id": state["tenant_id"],
+                "conversation.id": state["conversation_id"],
+            },
+        ):
+            return await _node_body(state)
+
+    async def _node_body(state: AgentState) -> dict[str, Any]:
         tenant_id = state["tenant_id"]
 
         # Stage 12 / Task 2 — seed the iteration counter from the
@@ -578,6 +611,22 @@ def make_escalation_node() -> Callable[[AgentState], Coroutine[Any, Any, dict[st
     """
 
     async def _node(state: AgentState) -> dict[str, Any]:
+        # M6.4 — wrap the escalation terminal in an
+        # ``agent.node.escalation`` span. The conversation-side
+        # state flips (status=QUEUED, ai_handling=False) were
+        # already applied by the ``escalate_to_human`` tool —
+        # this node just reads the breadcrumb and copies it
+        # into ``final_text``. Whitelisted attributes only.
+        with tracer.start_as_current_span(
+            "agent.node.escalation",
+            attributes={
+                "tenant_id": state["tenant_id"],
+                "conversation.id": state["conversation_id"],
+            },
+        ):
+            return await _node_body(state)
+
+    async def _node_body(state: AgentState) -> dict[str, Any]:
         message = state.get("escalation_message")
         if not isinstance(message, str) or not message.strip():
             # Defensive: if the upstream node failed to populate

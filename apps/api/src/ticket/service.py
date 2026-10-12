@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from core.logging import get_logger
+from observability import traced
 from ticket.enums import TicketPriority, TicketStatus
 from ticket.repository import TicketRepository
 from ticket.state_machine import transition as sm_transition
@@ -72,6 +73,7 @@ class TicketService:
 
     # ---- create ----
 
+    @traced("ticket.create")
     async def create(
         self,
         *,
@@ -125,6 +127,7 @@ class TicketService:
 
     # ---- transition ----
 
+    @traced("ticket.transition")
     async def transition(
         self,
         ticket_id: str,
@@ -235,6 +238,7 @@ class TicketService:
 
     # ---- notes (Tier 2 Task 2.6) ----
 
+    @traced("ticket.add_note")
     async def add_note(
         self,
         ticket_id: str,
@@ -280,6 +284,7 @@ class TicketService:
         )
         return event
 
+    @traced("ticket.delete_note")
     async def delete_note(
         self,
         ticket_id: str,
