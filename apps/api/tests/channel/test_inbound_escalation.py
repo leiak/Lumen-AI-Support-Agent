@@ -280,3 +280,125 @@ async def test_email_normal_response_does_not_escalate() -> None:
         )
 
         mock_service.escalate_to_human_queue.assert_not_awaited()
+
+
+# ---- Customer message broadcast (regression: agent SPA didn't see new
+#      customer rows until manual page refresh) ------------------------
+
+
+@pytest.mark.asyncio
+async def test_widget_customer_message_triggers_broadcast() -> None:
+    """Widget: every persisted customer message must broadcast ``message.created``.
+
+    Regression: the agent SPA's ``useConversationWebSocket`` hook only
+    refetches when it sees a ``message.created`` or ``message.complete``
+    frame. Without a customer-side broadcast, a fresh customer message
+    only appeared in the agent UI on a manual page refresh — the live
+    customer felt "stuck" because the agent had no idea they were still
+    typing.
+    """
+    from widget.ws import manager as widget_ws_manager
+
+    captured: dict = {}
+
+    async def fake_broadcast(
+        self,
+        *,
+        channel_id: str,
+        payload: dict,
+        exclude: str | None = None,
+    ) -> int:
+        captured["channel_id"] = channel_id
+        captured["payload"] = payload
+        return 0
+
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch.object(
+             widget_ws_manager.ConnectionManager,
+             "broadcast_to_channel",
+             fake_broadcast,
+         ):
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            customer_external_id="visitor-widget-1",
+            ai_handling=False,           # skip AI path; focus on the broadcast
+            status=ConversationStatus.PENDING,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        # customer row is the one we care about — give it a stable id
+        # and return it from record_message so the broadcast can quote it.
+        mock_service.record_message = AsyncMock(
+            side_effect=lambda **kwargs: MagicMock(
+                id="msg-cust-1", role=kwargs["role"], content_text=kwargs["content_text"]
+            )
+        )
+        mock_service.escalate_to_human_queue = AsyncMock()
+
+        # No responder needed (ai_handling=False), but the test runner
+        # imports it; provide a stub.
+        mock_resp_cls.return_value.respond = AsyncMock()
+
+        await process_inbound_envelope(_envelope(text="客户想问点事"))
+
+    assert captured, "broadcast_to_channel was not called for the customer message"
+    assert captured["channel_id"] == "ch1"
+    payload = captured["payload"]
+    assert payload["type"] == "message.created"
+    assert payload["conversation_id"] == "c1"
+    assert payload["message_id"] == "msg-cust-1"
+    assert payload["role"] == "customer"
+    assert payload["sender_id"] == "visitor-widget-1"
+    # The full content must be on the wire so the agent SPA can dedupe
+    # against a subsequent REST refetch and so any future push-only
+    # consumer (mirroring the widget path) renders the text directly.
+    assert payload["content"] == "客户想问点事"
+
+
+@pytest.mark.asyncio
+async def test_widget_customer_broadcast_failure_does_not_abort_inbound() -> None:
+    """Widget: a WS broadcast failure on the customer row must NOT abort inbound.
+
+    The customer message is already durably persisted by the time we
+    attempt the broadcast. If the WS layer is dead we log and move on —
+    the same swallow-and-warn contract that the AI broadcast already
+    guarantees.
+    """
+    from widget.ws import manager as widget_ws_manager
+
+    async def boom(
+        self,
+        *,
+        channel_id: str,
+        payload: dict,
+        exclude: str | None = None,
+    ) -> int:
+        raise RuntimeError("ws manager offline")
+
+    with patch("channel.inbound.ConversationService") as mock_svc_cls, \
+         patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
+         patch.object(
+             widget_ws_manager.ConnectionManager,
+             "broadcast_to_channel",
+             boom,
+         ):
+        mock_service = mock_svc_cls.return_value
+        mock_conv = MagicMock(
+            id="c1",
+            tenant_id="t1",
+            customer_external_id="v1",
+            ai_handling=False,
+            status=ConversationStatus.PENDING,
+        )
+        mock_service.find_or_create_for_inbound = AsyncMock(return_value=mock_conv)
+        mock_service.record_message = AsyncMock(
+            return_value=MagicMock(id="msg-cust-1")
+        )
+        mock_service.escalate_to_human_queue = AsyncMock()
+        mock_resp_cls.return_value.respond = AsyncMock()
+
+        # Must NOT raise even though broadcast exploded.
+        await process_inbound_envelope(_envelope(text="ok"))
+        mock_service.record_message.assert_awaited()

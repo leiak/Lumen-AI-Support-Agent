@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from channel.outbound_email import EmailOutbound, EmailSendError
 from agent.graph.prompts import FALLBACK_MESSAGE
+from channel.inbound import _broadcast_customer_message
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation
 from conversation.service import ConversationService
@@ -200,6 +201,17 @@ async def handle_email_inbound(
                 conversation_id=conversation.id,
                 role=MessageRole.CUSTOMER,
                 content_text=parsed.body_text,
+            )
+            # Mirror widget path: broadcast so the agent SPA's WS hook
+            # invalidates and refetches the new customer row. Without
+            # this, agents on 8080 would only see email customer
+            # messages on a manual page refresh.
+            await _broadcast_customer_message(
+                channel_id=channel_id,
+                conversation_id=conversation.id,
+                message_id=customer_message.id,
+                content_text=parsed.body_text,
+                sender_id=conversation.customer_external_id,
             )
 
             # 4. Trigger AI auto-response (mirrors widget path)

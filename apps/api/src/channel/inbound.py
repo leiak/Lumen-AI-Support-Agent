@@ -165,6 +165,55 @@ async def _broadcast_ai_complete(
         )
 
 
+async def _broadcast_customer_message(
+    *,
+    channel_id: str,
+    conversation_id: str,
+    message_id: str,
+    content_text: str,
+    sender_id: str | None,
+) -> None:
+    """Best-effort WS broadcast of a customer ``message.created`` event.
+
+    The agent SPA's ``useConversationWebSocket`` hook subscribes to a
+    channel-wide broadcast and invalidates the messages query on every
+    ``message.created`` frame so the message stream refetches. Without
+    this broadcast, a new customer message only shows up in the agent
+    UI on a manual page refresh — the live customer would feel "stuck".
+
+    Uses the same ``message.created`` event type the agent-reply
+    path emits (see :func:`conversation.api._broadcast_agent_message`)
+    so the frontend has one handler for both customer and agent rows;
+    ``role`` in the payload tells the SPA which side of the thread the
+    row belongs to. ``sender_id`` is the customer external id so the
+    SPA can render "来自 访客-xxx" without a second lookup.
+
+    Wrapped in try/except for the same reason as the AI broadcast.
+    """
+    try:
+        await _wsm.broadcast_to_channel(
+            channel_id=channel_id,
+            payload={
+                "type": "message.created",
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "role": MessageRole.CUSTOMER.value,
+                "sender_id": sender_id,
+                "content": content_text,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "channel inbound: customer broadcast failed",
+            extra={
+                "channel_id": channel_id,
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+            },
+            exc_info=True,
+        )
+
+
 async def _enqueue_qa_judge(*, message_id: str, tenant_id: str) -> None:
     """Stage 14 / Task 8 — enqueue a QA judge task for one AI message.
 
@@ -249,11 +298,21 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
                 },
             )
             return
-        await conv_service.record_message(
+        customer_message = await conv_service.record_message(
             tenant_id=envelope.tenant_id,
             conversation_id=conversation.id,
             role=MessageRole.CUSTOMER,
             content_text=envelope.text,
+        )
+        # Broadcast so the agent SPA's WS hook invalidates and refetches.
+        # Without this, agent 8080 detail page only sees new customer
+        # messages on a manual page refresh.
+        await _broadcast_customer_message(
+            channel_id=envelope.channel_id,
+            conversation_id=conversation.id,
+            message_id=customer_message.id,
+            content_text=envelope.text,
+            sender_id=conversation.customer_external_id,
         )
         # Trigger AI auto-response when the conversation is still in
         # AI-handling state. Transferred / closed conversations fall
