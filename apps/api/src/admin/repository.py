@@ -27,6 +27,11 @@ M4.D Task 4 — admin budget config repository.
 check pattern. Budget config carries no secrets, so there is no
 encryption layer — just the existence check + delegation to the inner
 :class:`TenantBudgetRepository`.
+
+M5.2 — added ``model`` column handling on POST/PATCH. PATCH uses
+``payload.model_fields_set`` to distinguish "field omitted entirely"
+(no-op) from "field sent as null or empty string" (explicit clear),
+so the inner repo's ``_UNSET`` sentinel contract still holds.
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ from budget.repository import TenantBudgetRepository
 from core.config import get_settings
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import (
+    _UNSET,
     TenantLLMConfig,
     TenantLLMConfigRepository,
 )
@@ -84,6 +90,7 @@ class AdminTenantLLMConfigRepository:
             provider_name=payload.provider_name,
             encrypted_api_key=encrypted,
             base_url=payload.base_url,
+            model=payload.model,
             enabled=payload.enabled,
         )
 
@@ -120,12 +127,24 @@ class AdminTenantLLMConfigRepository:
         base_url = payload.base_url
         if base_url == "":
             base_url = None
+        # ``model`` (M5.2) — distinguish "omitted" from "explicit null/empty".
+        # Pydantic exposes ``model_fields_set`` = field names the client
+        # actually sent. If ``model`` was omitted entirely, pass the
+        # ``_UNSET`` sentinel so the inner repo skips the column; if it
+        # was sent as ``""``, normalise to ``None`` (DB NULL).
+        if "model" in payload.model_fields_set:
+            model = payload.model
+            if model == "":
+                model = None
+        else:
+            model = _UNSET
         # ``enabled`` is bool | None in the schema; pass through as-is.
         return await self._inner.update(
             tenant_id=tenant_id,
             provider_name=provider_name,
             enabled=payload.enabled,
             base_url=base_url,
+            model=model,
         )
 
     async def delete(self, *, tenant_id: str, provider_name: str) -> bool:

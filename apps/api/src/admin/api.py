@@ -701,6 +701,7 @@ async def create_or_update_tenant_llm_config(
     return TenantLLMConfigRead(
         provider_name=row.provider_name,
         base_url=row.base_url,
+        model=row.model,
         enabled=row.enabled,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -744,6 +745,7 @@ async def list_tenant_llm_configs(
         TenantLLMConfigRead(
             provider_name=r.provider_name,
             base_url=r.base_url,
+            model=r.model,
             enabled=r.enabled,
             created_at=r.created_at,
             updated_at=r.updated_at,
@@ -817,6 +819,7 @@ async def patch_tenant_llm_config(
     return TenantLLMConfigRead(
         provider_name=row.provider_name,
         base_url=row.base_url,
+        model=row.model,
         enabled=row.enabled,
         created_at=row.created_at,
         updated_at=row.updated_at,

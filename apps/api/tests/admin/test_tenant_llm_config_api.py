@@ -321,16 +321,165 @@ async def test_delete_removes_provider_config(
         await _delete_tenant(tenant.id)
 
 
+# ---------------------------------------------------------------------------
+# M5.2 — per-tenant model override field on POST/PATCH.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_creates_row_with_model(
+    async_client: AsyncClient, admin_token_for,
+) -> None:
+    """POST with ``model`` persists the override; GET reflects it."""
+    tenant = await TenantRepository().create(name="Admin LLM Model Post", plan=TenantPlan.PRO)
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        resp = await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            json={
+                "provider_name": "anthropic",
+                "api_key": "sk-m-post",
+                "model": "claude-haiku-4-5",
+            },
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["model"] == "claude-haiku-4-5"
+        # GET reflects the field too.
+        listing = await async_client.get(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            headers=auth_headers(token),
+        )
+        assert listing.status_code == 200, listing.text
+        assert listing.json()[0]["model"] == "claude-haiku-4-5"
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_post_without_model_persists_null(
+    async_client: AsyncClient, admin_token_for,
+) -> None:
+    """POST without ``model`` → row.model is None (back-compat)."""
+    tenant = await TenantRepository().create(name="Admin LLM Model NoOp", plan=TenantPlan.PRO)
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        resp = await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            json={"provider_name": "anthropic", "api_key": "sk-noop"},
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["model"] is None
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_updates_model(
+    async_client: AsyncClient, admin_token_for,
+) -> None:
+    """PATCH ``model`` updates the row."""
+    tenant = await TenantRepository().create(name="Admin LLM Model Patch", plan=TenantPlan.PRO)
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            json={
+                "provider_name": "anthropic",
+                "api_key": "sk-patch",
+                "model": "claude-haiku-4-5",
+            },
+            headers=auth_headers(token),
+        )
+        resp = await async_client.patch(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs/anthropic",
+            json={"model": "claude-3-5-sonnet-20241022"},
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["model"] == "claude-3-5-sonnet-20241022"
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_omits_model_no_op(
+    async_client: AsyncClient, admin_token_for,
+) -> None:
+    """PATCH with no ``model`` field → row.model unchanged."""
+    tenant = await TenantRepository().create(name="Admin LLM Model NoModel", plan=TenantPlan.PRO)
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            json={
+                "provider_name": "anthropic",
+                "api_key": "sk-omit",
+                "model": "claude-haiku-4-5",
+            },
+            headers=auth_headers(token),
+        )
+        # PATCH with only `enabled` — `model` is omitted.
+        resp = await async_client.patch(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs/anthropic",
+            json={"enabled": False},
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["model"] == "claude-haiku-4-5"
+    finally:
+        await _delete_tenant(tenant.id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_patch_model_empty_string_clears(
+    async_client: AsyncClient, admin_token_for,
+) -> None:
+    """PATCH ``model=""`` → row.model becomes None (frontend-friendly clear)."""
+    tenant = await TenantRepository().create(name="Admin LLM Model Clear", plan=TenantPlan.PRO)
+    try:
+        token = admin_token_for(tenant_id=tenant.id)
+        await async_client.post(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs",
+            json={
+                "provider_name": "anthropic",
+                "api_key": "sk-clear",
+                "model": "claude-haiku-4-5",
+            },
+            headers=auth_headers(token),
+        )
+        resp = await async_client.patch(
+            f"/api/v1/admin/tenants/{tenant.id}/llm-configs/anthropic",
+            json={"model": ""},
+            headers=auth_headers(token),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["model"] is None
+    finally:
+        await _delete_tenant(tenant.id)
+
+
 __all__ = [
     "test_delete_removes_provider_config",
     "test_get_returns_404_for_unknown_tenant",
     "test_get_returns_provider_names_without_keys",
     "test_get_with_cross_tenant_admin_returns_404",
     "test_get_without_token_returns_401",
+    "test_patch_model_empty_string_clears",
+    "test_patch_omits_model_no_op",
     "test_patch_toggles_enabled_preserves_key",
+    "test_patch_updates_model",
     "test_post_creates_row_with_encrypted_key",
+    "test_post_creates_row_with_model",
     "test_post_upserts_existing_row",
     "test_post_with_cross_tenant_admin_returns_404",
     "test_post_with_non_admin_token_returns_403",
+    "test_post_without_model_persists_null",
     "test_post_without_token_returns_401",
 ]

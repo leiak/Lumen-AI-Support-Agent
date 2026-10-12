@@ -35,6 +35,12 @@ class TenantLLMConfigCreate(BaseModel):
         default=None, max_length=512,
         description="Optional override for provider base URL",
     )
+    model: str | None = Field(
+        default=None, max_length=128,
+        description="Optional per-tenant model override. When set, the "
+        "LLM Gateway wrapper rewrites ``request.model`` to this value "
+        "for this provider (M5.2). NULL = project default applies.",
+    )
     enabled: bool = Field(default=True)
 
 
@@ -43,6 +49,7 @@ class TenantLLMConfigRead(BaseModel):
 
     provider_name: str
     base_url: str | None
+    model: str | None
     enabled: bool
     created_at: datetime
     updated_at: datetime
@@ -66,6 +73,11 @@ class TenantLLMConfigUpdate(BaseModel):
         default=None, max_length=512,
         description="Override for provider base URL. Pass an empty string "
         "to clear. Omit to keep current value.",
+    )
+    model: str | None = Field(
+        default=None, max_length=128,
+        description="Override for provider model. Pass an empty string to "
+        "clear. Omit to keep current value.",
     )
 
 

@@ -768,6 +768,157 @@ async def round9_tenant_fallback_chain() -> None:
     )
 
 
+# =============================================================================
+# Round 10 — Per-tenant model override (M5.2)
+# =============================================================================
+
+async def round10_tenant_model_override() -> None:
+    """Per-tenant model override rewrites ``request.model`` at the resolver seam.
+
+    M5.2 closes [[m4-c-progress]] tech-debt #6. Each tenant can pin a
+    per-provider model name that the gateway rewrites to after the
+    inner resolver picks a provider. This round probes whether the
+    override actually fires end-to-end against the live API.
+
+    Structure checks (always run):
+      * Row written via the admin POST with ``model=claude-haiku-4-5``.
+      * Repo confirms ``row.model`` persisted with the expected value.
+
+    Wire assertion (gated on ``ANTHROPIC_API_KEY``):
+      Without creds we cannot reach the live LLM endpoint, so we
+      skip the round-trip and mark [WARN]. With creds we drive a
+      chat through the widget WS and inspect the
+      ``lumen_llm_tenant_model_override_total{outcome="hit"}`` counter
+      — a non-zero value proves the wrapper fired.
+
+    The actual model rewrite is unit-tested at the resolver seam in
+    ``tests/llm_client/test_tenant_model_override_resolver.py`` (9
+    tests). This round exists to prove the FULL path (DB row →
+    cache → resolver wrap → wire) under a real stack.
+    """
+    print("\n" + "=" * 70)
+    print("Round 10 — Per-tenant model override (M5.2)")
+    print("=" * 70)
+    rid = "R10"
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    has_creds = bool(api_key)
+
+    # Structure-only path: seed tenant with anthropic BYOK + model override.
+    import agent.llm_factory
+
+    # A widget channel so the cred-gated round-trip below can reach the
+    # gateway resolver via the tenant's BYOK credentials.
+    tenant_id, channel_id = await _seed_fresh_tenant(
+        name="round10-model-override", channel_type=ChannelType.WEB,
+    )
+
+    # Post the tenant_llm_configs row with model=claude-haiku-4-5.
+    from llm_client.tenant_config_models import TenantLLMConfigRepository
+
+    repo = TenantLLMConfigRepository()
+    row = await repo.upsert(
+        tenant_id=tenant_id,
+        provider_name="anthropic",
+        encrypted_api_key=bytearray(b"\x00" * 16),  # placeholder; not used here
+        base_url=None,
+        model="claude-haiku-4-5",
+        enabled=True,
+    )
+    if row is None or row.model != "claude-haiku-4-5":
+        _record(rid, "FAIL", f"DB row missing or wrong model — {row!r}")
+        return
+    _record(
+        rid, "OK",
+        f"seeded tenant_llm_configs row: tenant_id={tenant_id} model=claude-haiku-4-5",
+    )
+
+    # Confirm the underlying tenant's seed (round10 has model=None in _seed_fresh_tenant)
+    # is overridden by the row we just wrote.
+    _record(rid, "INSIGHT", "M5.2 model column is nullable — DB write succeeded via repo.upsert")
+
+    # Cred-gated: drive a real widget message through the gateway.
+    if not has_creds:
+        _record(
+            rid, "WARN",
+            "ANTHROPIC_API_KEY not set — wire assertion SKIPPED. "
+            "The repo+DB path above proves persistence; the actual "
+            "model rewrite is unit-tested at the resolver seam.",
+        )
+        return  # pragma: no cover — gate stays closed when creds absent
+
+    # Capture baseline counter value before the round-trip.
+    baseline_hit = _read_metric_value(
+        "lumen_llm_tenant_model_override_total",
+        labels={"outcome": "hit"},
+    )
+
+    resp = await _widget_round_trip(channel_id=channel_id, text="Reply PONG.")
+    if not resp.get("ok"):
+        _record(
+            rid, "FAIL",
+            f"widget round-trip failed: {resp.get('error') or resp.get('text', '')[:80]!r}",
+        )
+        return
+
+    # Inspect the metric — non-zero delta = wrapper fired.
+    after_hit = _read_metric_value(
+        "lumen_llm_tenant_model_override_total",
+        labels={"outcome": "hit"},
+    )
+    delta = after_hit - baseline_hit
+    if delta > 0:
+        _record(
+            rid, "OK",
+            f"model override fired: lumen_llm_tenant_model_override_total{{outcome=hit}} "
+            f"increased by {delta}",
+        )
+    else:
+        _record(
+            rid, "FAIL",
+            f"override metric unchanged (baseline={baseline_hit}, after={after_hit}) "
+            "— wrapper did NOT rewrite the model. Investigate "
+            "TenantModelOverrideResolver wiring at tenant_resolver.py:433.",
+        )
+
+
+def _read_metric_value(
+    metric_name: str, *, labels: dict[str, str] | None = None,
+) -> float:
+    """Return the current value of a Prometheus counter at /metrics.
+
+    Works for ``Counter`` (no labels) and ``Counter.labels(...)``;
+    labels are matched with a simple substring scan, so order does
+    not matter. Returns 0.0 if the metric isn't present (e.g. the
+    process hasn't imported it yet).
+    """
+    try:
+        text = requests.get(f"{API}/metrics", timeout=5).text
+    except Exception as exc:
+        _record("R10", "WARN", f"metrics fetch failed: {exc}")
+        return 0.0
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        if not line.startswith(metric_name):
+            continue
+        # Counter format: ``name{label="v",...} 7.0`` (with labels)
+        # or ``name 7.0`` (without).
+        body = line[len(metric_name):]
+        if labels:
+            ok = all(f'{k}="{v}"' in body for k, v in labels.items())
+        else:
+            ok = not body.strip().startswith("{")
+        if not ok:
+            continue
+        try:
+            value = float(body.rsplit(" ", 1)[-1])
+        except ValueError:
+            continue
+        return value
+    return 0.0
+
+
 # Main
 # =============================================================================
 
@@ -781,6 +932,7 @@ ALL_ROUNDS = {
     "7": ("Round 7 — Ticket escalation", round7_ticket),
     "8": ("Round 8 — Streaming stability", round8_streaming),
     "9": ("Round 9 — Per-tenant fallback chain (M5.1)", round9_tenant_fallback_chain),
+    "10": ("Round 10 — Per-tenant model override (M5.2)", round10_tenant_model_override),
 }
 
 
