@@ -55,6 +55,7 @@ PII_WHITELIST: frozenset[str] = frozenset({
     "ticket.id",
     "worker.job_name",
     "worker.attempt",
+    "outcome",
     # OpenTelemetry semantic conventions (read-only, safe)
     "http.request.method",
     "url.path",
