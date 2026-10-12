@@ -91,6 +91,10 @@ from admin.schemas.widget_config import (
     WidgetConfigResetResponse,
     WidgetConfigUpdate,
 )
+from assignment.schemas import (
+    AssignmentPolicyRead,
+    AssignmentPolicyUpdate,
+)
 from admin.search import AdminSearchService
 from agent.llm_factory import _build_fallback_chain_cache
 from auth.dependencies import require_admin
@@ -693,8 +697,14 @@ async def create_or_update_tenant_llm_config(
         # unknown tenant — see the ``ValueError`` branch below.
         raise HTTPException(status_code=404, detail="not found")
     try:
+        api_key_sha256 = hashlib.sha256(
+            payload.api_key.encode("utf-8")
+        ).hexdigest()
         row = await AdminTenantLLMConfigRepository().upsert(
-            tenant_id=tenant_id, payload=payload,
+            tenant_id=tenant_id,
+            payload=payload,
+            changed_by=claims["sub"],
+            api_key_sha256=api_key_sha256,
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -811,6 +821,7 @@ async def patch_tenant_llm_config(
             tenant_id=tenant_id,
             provider_name=provider_name,
             payload=payload,
+            changed_by=claims["sub"],
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -852,7 +863,9 @@ async def delete_tenant_llm_config(
         raise HTTPException(status_code=404, detail="not found")
     try:
         await AdminTenantLLMConfigRepository().delete(
-            tenant_id=tenant_id, provider_name=provider_name,
+            tenant_id=tenant_id,
+            provider_name=provider_name,
+            changed_by=claims["sub"],
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -1763,6 +1776,107 @@ async def reset_widget_config(
         raise HTTPException(status_code=404, detail="not found")
     await WidgetConfigRepository().delete(tenant_id)
     return WidgetConfigResetResponse(tenant_id=tenant_id, reset=True)
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant assignment policy (auto-assign on escalate).
+#
+# GET /api/v1/admin/tenants/{tid}/assignment-policy
+# PATCH /api/v1/admin/tenants/{tid}/assignment-policy
+#
+# Storage: tenants.settings['assignment_policy'] (JSONB). The strategy
+# field picks the resolver at escalate time — see
+# ``assignment.service.AssignmentPolicyService.select_agent``. Today
+# only ``least_busy`` is implemented; ``manual`` is the explicit
+# opt-out sentinel.
+#
+# Anti-enumeration 404 on cross-tenant access, matching the rest of
+# the admin surface. Missing policy → materialised default response
+# (enabled=False, strategy='manual') so the SPA can render the form
+# without a special-cased null branch.
+# ---------------------------------------------------------------------------
+
+
+def _materialise_assignment_policy(
+    tenant_id: str, policy: dict[str, Any] | None
+) -> AssignmentPolicyRead:
+    """Build the read response from the (possibly None) policy sub-dict.
+
+    Pulled out so GET and PATCH share the same shape. Defaults to
+    ``enabled=False, strategy='manual'`` when no policy has ever
+    been set OR the policy shape is missing a field — the SPA
+    treats both as the same "feature not configured" state.
+    """
+    if not policy:
+        return AssignmentPolicyRead(enabled=False, strategy="manual")
+    return AssignmentPolicyRead(
+        enabled=bool(policy.get("enabled", False)),
+        strategy=policy.get("strategy", "manual"),  # type: ignore[arg-type]
+    )
+
+
+@router.get(
+    "/tenants/{tenant_id}/assignment-policy",
+    response_model=AssignmentPolicyRead,
+)
+async def get_assignment_policy(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> AssignmentPolicyRead:
+    """Read the tenant's auto-assignment policy.
+
+    Returns a materialised default (``enabled=False,
+    strategy='manual'``) when the policy has never been set, so
+    the SPA renders the form pre-filled with the opt-out state.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    policy = await TenantRepository().get_assignment_policy(tenant_id)
+    return _materialise_assignment_policy(tenant_id, policy)
+
+
+@router.patch(
+    "/tenants/{tenant_id}/assignment-policy",
+    response_model=AssignmentPolicyRead,
+)
+async def patch_assignment_policy(
+    tenant_id: str,
+    payload: AssignmentPolicyUpdate,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> AssignmentPolicyRead:
+    """Upsert the tenant's auto-assignment policy.
+
+    PATCH semantics: missing fields preserve the current value. A
+    PATCH on a tenant that has never set the policy writes the
+    full dict (defaults to ``enabled=False, strategy='manual'``,
+    then merged with the supplied fields).
+
+    Anti-enumeration: cross-tenant access returns 404, matching
+    the rest of the admin surface. Pydantic validates ``strategy``
+    against the enum before this handler runs, so unknown values
+    surface as 422 rather than 500.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    repo = TenantRepository()
+    existing = await repo.get_settings(tenant_id) or {}
+    # Read-modify-write on the assignment_policy sub-dict so we
+    # never stomp other settings keys (forward-compatible with
+    # future config like working-hours).
+    policy = dict(existing.get("assignment_policy") or {})
+    if payload.enabled is not None:
+        policy["enabled"] = payload.enabled
+    if payload.strategy is not None:
+        policy["strategy"] = payload.strategy
+    # If the merged result is the explicit opt-out, leave a stable
+    # shape so the response reflects the user's intent.
+    if "enabled" not in policy:
+        policy["enabled"] = False
+    if "strategy" not in policy:
+        policy["strategy"] = "manual"
+    existing["assignment_policy"] = policy
+    await repo.update_settings(tenant_id, settings=existing)
+    return _materialise_assignment_policy(tenant_id, policy)
 
 
 # ---------------------------------------------------------------------------
