@@ -59,10 +59,21 @@ def _cors_startup_warnings(settings: Any) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> Any:
+    # M6.1 — wire httpx auto-instrumentation. Importing the module is
+    # enough; it patches httpx.Client / httpx.AsyncClient globally so
+    # every outbound HTTP call (including the ones made by the
+    # anthropic / openai SDKs, which use httpx under the hood) emits a
+    # span that nests under whatever current span is active. ``tracer``
+    # is also imported so the rest of the codebase can ``from
+    # observability import tracer`` without paying an extra import
+    # cost; the side effect at module import is the instrument() call.
+    import observability  # noqa: F401  — M6.1: wires httpx auto-instrumentation
+    from observability import tracer  # noqa: F401  — M6.1: shared tracer
     settings = get_settings()
     configure_logging()
     log = get_logger("startup")
     log.info("api.starting", environment=settings.environment, service=settings.service_name)
+    log.info("otel.tracing_initialized", endpoint=settings.otel_exporter_otlp_endpoint)
     _cors_startup_warnings(settings)
     # Eagerly create the redis client pool so the first request doesn't pay
     # connection-setup latency. (The pool itself connects lazily on first command.)

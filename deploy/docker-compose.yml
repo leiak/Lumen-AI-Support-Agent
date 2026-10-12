@@ -240,7 +240,34 @@ services:
       timeout: 5s
       retries: 5
 
+  # M6.1 — OpenTelemetry tracing stack. The api + workers export
+  # OTLP to otel-collector:4317; the collector batches and forwards
+  # to Tempo. Open Tempo UI at http://localhost:33000.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.107.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "33000:3100"   # Tempo UI + query API
+    restart: unless-stopped
+
 volumes:
   pgdata:
   qdrantdata:
   minio-data:
+  tempo-data:

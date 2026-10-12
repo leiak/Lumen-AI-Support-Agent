@@ -108,6 +108,16 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     service_name: str = "ai-customer-api"
 
+    # M6.1 — OpenTelemetry OTLP endpoint. Read from
+    # ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var; the local-dev default
+    # points at the ``otel-collector`` service in docker-compose.
+    # Production overrides this with the real backend URL (Honeycomb
+    # / Tempo Cloud / self-hosted) via .env.
+    otel_exporter_otlp_endpoint: str = Field(
+        default="http://otel-collector:4317",
+        alias="OTEL_EXPORTER_OTLP_ENDPOINT",
+    )
+
     # Stage 11.4: build-time service version. The Dockerfile passes
     # ``--build-arg GIT_SHA=$(git rev-parse --short HEAD)`` which surfaces
     # here as ``SERVICE_VERSION``; the default ``dev`` keeps local

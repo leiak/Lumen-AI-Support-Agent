@@ -37,6 +37,11 @@ dependencies = [
     "Pillow>=10.0",
     "hdbscan>=0.8",  # also Stage 18
     "numpy>=1.26",  # Stage 18 (clusterer input embeddings)
+    # M6 — OpenTelemetry tracing (SDK + httpx auto-instrumentation + OTLP exporter).
+    "opentelemetry-api>=1.27.0",
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-instrumentation-httpx>=0.48b0",
+    "opentelemetry-exporter-otlp>=1.27.0",
 ]
 
 [project.optional-dependencies]

@@ -1,0 +1,26 @@
+# M6.1 — Tempo local-dev config. 12h retention, local FS storage.
+# In production this whole service is replaced by a managed Tempo or
+# honeycomb; the api container points at the real backend via
+# OTEL_EXPORTER_OTLP_ENDPOINT.
+server:
+  http_listen_port: 3100
+  log_level: info
+
+distributor:
+  receivers:
+    otlp:
+      protocol:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+compactor:
+  compaction:
+    block_retention: 12h
