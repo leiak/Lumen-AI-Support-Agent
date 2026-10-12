@@ -23,13 +23,24 @@ from pathlib import Path
 def _find_repo_root(start: Path) -> Path:
     cur = start.resolve()
     for candidate in (cur, *cur.parents):
-        if (candidate / "apps" / "api" / "src").is_dir() and (
-            candidate / "tests" / "e2e"
-        ).is_dir():
+        # The api source tree exists in one of two shapes depending on
+        # the runtime:
+        #
+        # * Dev machine: ``<repo>/apps/api/src`` (full checkout).
+        # * Docker compose: ``/app/src`` (volume-bind of ``apps/api/src``).
+        #
+        # Either is sufficient — both contain the python packages the
+        # script imports (``knowledge``, ``channel``, ``llm_client``).
+        # We also accept ``tests/e2e`` as a sibling (dev layout only)
+        # but it is NOT required, so the container-only shape still
+        # resolves.
+        if (candidate / "apps" / "api" / "src").is_dir():
+            return candidate
+        if (candidate / "src").is_dir() and (candidate / "src" / "knowledge").is_dir():
             return candidate
     raise RuntimeError(
         f"could not locate repo root from {start} — "
-        "expected to find apps/api/src and tests/e2e as siblings",
+        "expected apps/api/src or src/ in a parent directory",
     )
 
 
@@ -50,7 +61,9 @@ from knowledge.enums import ArticleStatus  # noqa: E402
 # tenants.id target. tenant.models is also imported below for the same
 # reason — Channel / KB / Article all FK to tenants.id.
 from ticket import models as ticket_models  # noqa: E401,F401,E402  -- needed for FK resolution
+from tenant import models as tenant_models  # noqa: E401,F401,E402  -- Channel / KB / Article all FK to tenants.id; importing only Channel + KB + Article leaves SQLAlchemy unable to walk the FK graph at flush() time
 from knowledge.models import Article, ArticleVersion, KnowledgeBase  # noqa: E402
+from knowledge.worker import index_article  # noqa: E402  -- Explore #2: actually run the chunk+embed pipeline (seed previously created articles with status=INDEXED but no chunks — RAG returned 0 citations)
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher  # noqa: E402
 from llm_client.tenant_config_models import (  # noqa: E402
     TenantLLMConfigRepository,
@@ -137,19 +150,44 @@ async def _seed_feishu_channel(s) -> None:
 
 
 async def _seed_kb(s) -> None:
-    """NOTE: KnowledgeBase has NO status field and KBStatus doesn't exist.
+    """Upsert the demo KB.
 
-    Only ArticleStatus (DRAFT/INDEXING/INDEXED/FAILED) is defined in
-    knowledge.enums.
+    Picks the embedding model from runtime settings so the seed is
+    deployment-aware:
+
+    * If ``$DOUBAO_API_KEY`` is set (DOUBAO-only deployment, the normal
+      case for our docker-compose), the default embedding model is a
+      Doubao name like ``doubao-embedding-vision`` and the request
+      goes to ``$DOUBAO_BASE_URL``. Inserting an OpenAI model name
+      here would make ``index_article`` raise EmbeddingError against
+      the Doubao endpoint (Explore #2 fallout: even with a working
+      chunk pipeline the embedding call would 4xx and the article
+      would land in FAILED with 0 chunks).
+    * If only ``$OPENAI_API_KEY`` is set, the default is an OpenAI
+      model and the request goes to api.openai.com.
+
+    ``default_embedding_model`` is read from ``get_settings()`` so the
+    seed stays in lockstep with whatever the api process resolves at
+    startup — no hard-coded model name to drift out of sync.
+
+    Idempotent: only inserts when the row is missing. An existing KB
+    with a stale ``embedding_model`` is left alone; the operator can
+    fix it with ``UPDATE knowledge_bases SET embedding_model=...`` and
+    re-run the index loop below.
     """
     if await s.get(KnowledgeBase, DEMO_KB_ID) is not None:
         return
+    from core.config import get_settings
+    settings = get_settings()
     s.add(
         KnowledgeBase(
             id=DEMO_KB_ID,
             tenant_id=DEMO_TENANT_ID,
             slug=DEMO_KB_SLUG,
             name="Demo KB",
+            embedding_model=settings.default_embedding_model,
+            chunk_size=800,
+            chunk_overlap=100,
         )
     )
     await s.flush()
@@ -230,6 +268,28 @@ async def main() -> None:
                 ),
             )
             await s.commit()
+        # Explore #2: the seed used to mark articles ``status=INDEXED`` but
+        # never ran the chunk+embed pipeline — leaving ``chunks`` empty and
+        # making RAG return 0 citations. After commit, run the same
+        # ``index_article`` coroutine the upload API schedules via
+        # ``asyncio.create_task``. Awaits inline (not fire-and-forget) so
+        # the operator can tell from the seed's exit code whether the KB
+        # is ready; PII discipline kept (class name only on failure).
+        for article_id in (ARTICLE_RESET_ID, ARTICLE_REFUND_ID):
+            try:
+                result = await index_article(article_id=article_id)
+                print(
+                    f"  indexed article: id={article_id} "
+                    f"chunks={result.chunks_indexed} status={result.status.value}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  indexed article: id={article_id} FAILED "
+                    f"({type(exc).__name__}) — article row exists but "
+                    f"chunks table may be empty. Re-run or call "
+                    f"POST /api/v1/knowledge/articles/{article_id}/reindex.",
+                    file=sys.stderr,
+                )
         # Tenant LLM config uses the Repository (its own sessionmaker)
         # so it can't share the session above.
         await _seed_tenant_llm_config()

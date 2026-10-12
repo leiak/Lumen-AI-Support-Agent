@@ -38,7 +38,7 @@
 | 25 (Tier 1/2/3) | 14 任务 gap-fill — **Tier 1**: admin tickets/channel CRUD/LLM Config/budget mutation (4 commit, 155 tests); **Tier 2**: 已知 nitpick 整理 (14 任务,5 commit + silent-observability 修复 + session bug); **Tier 3**: i18n + Playwright CI + cross-domain admin search + runtime LLM provider chain admin (5 commit, 219 frontend + 120 backend tests) | ✅ | 155 (Tier 1) + 79 (Tier 2) + 38 (Tier 3) = **272 new tests** |
 | 26 (Quick Wins) | **A**: HttpClientPool `aclose_all` failure injection + 5 个 XFF whitespace parametrize + 顺手修 `http_pool.py` 没迁到 structlog 的 bug (1 commit, 10 new tests); **B**: ruff sweep 41 → 0 (1 commit); **C**: demo-act4-02 spec 启用 — `test.skip` 移除 + captureFlow 实际写盘 + `playwright.docker.config.ts` 绕过端口冲突 + 跑通产生 `images/demo-act4-02.png` (1 commit); **D**: `scripts/bring-up.sh` + `scripts/teardown.sh` + `scripts/wait-ready.sh` 一键全栈 + 4 个种子脚本加 `--help` 和退出码 (1 commit) | ✅ | 10 (A) + 0 (B) + 1 (C) + 0 (D) = **11 new tests + 1 captured PNG + 3 root scripts + 4 `--help` flags** |
 | 顺手 bugfixes | `BudgetResolver._PrefixResolver` 单 provider 处理 + `stream_chat` async-context guard (loop-running detect) | ✅ | 2 new tests (prefix resolver + stream_chat loop) |
-| 探索性测试 (2026-10-11) | 8 轮端到端探索 (`tests/e2e/scripts/explore.py`):多轮上下文 / 边界输入 / 并发与隔离 / Budget / KB RAG / suggest-reply / Ticket / 流式稳定性 — 发现 **3 个产品级 bug** | ✅ | 27 OK / 2 WARN / 2 FAIL / 11 INSIGHT |
+| 探索性测试 (2026-10-11) | 8 轮端到端探索 (`tests/e2e/scripts/explore.py`):多轮上下文 / 边界输入 / 并发与隔离 / Budget / KB RAG / suggest-reply / Ticket / 流式稳定性 — 发现 **3 个产品级 bug**(已修 2:#1 widget external_user_id / #2 KB seed 缺 indexing pipeline) | ✅ | 28 OK / 2 WARN / 0 FAIL / 13 INSIGHT |
 
 设计文档:`docs/superpowers/specs/2026-09-10-ai-customer-service-design.md`
 M1 实施计划:`docs/superpowers/plans/2026-09-10-ai-customer-m1.md`
@@ -388,8 +388,8 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 - [ ] **Nitpick S3** — X-Forwarded-For trust gate (Task 2 of this plan)
 - [ ] **Nitpick S4** — httpx connection pool caching (Task 7 of this plan)
 - [ ] **Nitpick S5** — budget pre-check short-circuit (Task 8 of this plan)
-- [ ] **Explore #1** — widget `WebWidgetAdapter.parse_inbound` 没用 JWT `sub` 作为 `external_user_id`,所有访客共享同一空字符串会话(Round 3 DB 验证:5 个 widget 用户 → 1 个 conversation / 10 messages);隐私 + 数据污染;`apps/api/src/widget/adapter.py:39` 修法 = signature 加 `external_user_id` 参数,`apps/api/src/widget/ws/router.py:175` 调 adapter 时把 JWT sub 传过去
-- [ ] **Explore #2** — KB 种子后没跑 chunking/embedding pipeline → `articles` 有行但 `chunks` 永远空,RAG `search_internal_kb` 返回 0 citations(Round 5 实测);`seed.py` / `seed_demo_rich.py` 末尾跑一次 chunk+embed;或在 README 注明 demo KB 需手动 reindex
+- [x] **Explore #1** — widget `WebWidgetAdapter.parse_inbound` 没用 JWT `sub` 作为 `external_user_id`,所有访客共享同一空字符串会话(Round 3 DB 验证:5 个 widget 用户 → 1 个 conversation / 10 messages);隐私 + 数据污染;`apps/api/src/widget/adapter.py:39` 修法 = signature 加 `external_user_id` 参数,`apps/api/src/widget/ws/router.py:175` 调 adapter 时把 JWT sub 传过去 — FIXED (commit `9b450be`)
+- [x] **Explore #2** — KB 种子后没跑 chunking/embedding pipeline → `articles` 有行但 `chunks` 永远空,RAG `search_internal_kb` 返回 0 citations(Round 5 实测);`extend-seed.py` 末尾 await `index_article()`(inline,不是 fire-and-forget — 让 seed 退出码反映 KB 状态);KB 的 `embedding_model` 现在从 `get_settings().default_embedding_model` 取(部署感知:DOUBAO-only 容器不再撞 EmbeddingError) — FIXED
 - [ ] **Explore #3** — `LLMClient.stream_chat` 走 sync `__call__` 路径时绕过 budget 跟踪:`_pre_check_sync` 跳过(ac276d async guard)后无对应 `_post_record`(Round 4 实测:hard_cap=200 / soft_warn=160 → 2 次 PONG 都成功但 `llm_usage` + `tenant_budget_snapshots` 0 行);修复 = `stream_chat` 末尾拿 response 的 token 数 → 注册异步 `_post_record` 任务,或者提供同步版本
 
 ### M4.C — Tenant Resolver (BYOK)
