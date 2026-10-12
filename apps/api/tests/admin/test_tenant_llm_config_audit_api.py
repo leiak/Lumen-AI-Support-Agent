@@ -113,8 +113,14 @@ async def test_get_audit_filter_by_provider(
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert all(e["provider_name"] == "anthropic" for e in body["entries"])
-        # And the total reflects the filter, not the global count.
-        assert body["total"] < sum(1 for _ in body["entries"]) + 100  # at least non-zero
+        # Expect exactly 5 anthropic audit rows: 1 POST insert writes 4
+        # audit rows (api_key + base_url + model + enabled) and 1 PATCH
+        # on model writes 1 audit row. The openai POST contributes 4
+        # more rows but must be filtered out — if count_by_tenant ever
+        # dropped the provider_name filter, total would be 9 and this
+        # assertion would catch it.
+        assert body["total"] == len(body["entries"])
+        assert body["total"] == 5
     finally:
         await _delete_tenant(tenant.id)
 
