@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from channel.outbound_email import EmailOutbound, EmailSendError
+from agent.graph.prompts import FALLBACK_MESSAGE
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.models import Conversation
 from conversation.service import ConversationService
@@ -222,6 +223,33 @@ async def handle_email_inbound(
                     )
                     ai_message_id = ai_msg.id
                     ai_content = ai_response.content_text
+                    # AI failure handoff: mirror the widget path — when
+                    # the responder returns ``FALLBACK_MESSAGE`` (LLM
+                    # budget / provider / output / graph exception),
+                    # flip the conversation to the human queue so an
+                    # agent can pick it up. The customer has already
+                    # seen the polite fallback reply above (record_message
+                    # just persisted it); the flip is a soft state
+                    # change and a failure here must NOT fail the email
+                    # webhook. Same swallow-and-warn shape as
+                    # ``channel.inbound`` — see that module's comment
+                    # for the full rationale.
+                    if ai_response.content_text == FALLBACK_MESSAGE:
+                        try:
+                            await conv_service.escalate_to_human_queue(
+                                tenant_id=tenant_id,
+                                conversation_id=conversation.id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "email.inbound: escalate after FALLBACK_MESSAGE failed",
+                                extra={
+                                    "tenant_id": tenant_id,
+                                    "conversation_id": conversation.id,
+                                    "message_id": parsed.message_id,
+                                },
+                                exc_info=True,
+                            )
 
             await session.commit()
     except Exception as e:

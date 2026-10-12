@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
+from agent.graph.prompts import FALLBACK_MESSAGE
 from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
@@ -300,6 +301,35 @@ async def process_inbound_envelope(envelope: MessageEnvelope) -> None:
                     message_id=ai_message.id,
                     tenant_id=envelope.tenant_id,
                 )
+                # AI failure handoff: when the responder returns
+                # ``FALLBACK_MESSAGE`` (LLM budget / provider / output /
+                # empty / graph exception), the customer has already
+                # seen the polite fallback reply above, but the
+                # conversation row is still ``status=OPEN,
+                # ai_handling=True, assigned_agent_id=NULL`` — invisible
+                # to every agent's ``/inbox`` queue. Flip it to the
+                # human queue so a human can pick it up. Done AFTER
+                # ``record_message`` so the customer-facing message
+                # stays durable even if the flip fails. Failure to flip
+                # is a soft miss on agent pickup, not a customer-facing
+                # error — same swallow-and-warn shape as the
+                # ``_broadcast_ai_complete`` / ``_enqueue_qa_judge``
+                # helpers above.
+                if ai_response.content_text == FALLBACK_MESSAGE:
+                    try:
+                        await conv_service.escalate_to_human_queue(
+                            tenant_id=envelope.tenant_id,
+                            conversation_id=conversation.id,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "channel inbound: escalate after FALLBACK_MESSAGE failed",
+                            extra={
+                                "conversation_id": conversation.id,
+                                "channel_id": envelope.channel_id,
+                            },
+                            exc_info=True,
+                        )
                 logger.info(
                     "channel inbound: AI auto-response recorded",
                     extra={
