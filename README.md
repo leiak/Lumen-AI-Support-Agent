@@ -37,6 +37,7 @@
 | 24 (M4.D) | LLM Gateway Budget Layer — per-tenant monthly token hard cap (`tenant_budgets` + `tenant_budget_snapshots` tables + LRU/TTL snapshot cache + `BudgetResolver` pre-check/post-record + opt-in factory wiring + admin POST/GET/usage + `LLM_TENANT_BUDGET_EXCEEDED_TOTAL` + `LLM_TENANT_BUDGET_SOFT_WARN_TOTAL` zero-label metrics; **Pack A**: sticky soft-warn (`soft_warn_fired_at`) + DB-direct pre-check + `pg_advisory_xact_lock` in `refresh()` + daily cleanup cron + `/admin/budget/cleanup` super-admin endpoint; **Pack B**: `tenant_budget_credits` (immutable grant audit log) + `CreditService` + `PerModelBreakdown` cache + `LLM_BUDGET_GATE_TOTAL` 429 gate; **Pack C**: Docker 部署验证(端口偏移 25432/26333/26379 + migrate/seed one-shots + `seed_budget.py` + `main.py` startup typo 修复)) | ✅ | 1 smoke + 5 repo + 4 cache + 6 resolver + 2 TZ + 7 admin + 3 e2e + **Pack A: 2 migration + 2 repo + 6 resolver + 4 cleanup + 1 admin + 3 e2e** + **Pack B: 27 tests** + **Pack C: end-to-end Docker bring-up** |
 | 25 (Tier 1/2/3) | 14 任务 gap-fill — **Tier 1**: admin tickets/channel CRUD/LLM Config/budget mutation (4 commit, 155 tests); **Tier 2**: 已知 nitpick 整理 (14 任务,5 commit + silent-observability 修复 + session bug); **Tier 3**: i18n + Playwright CI + cross-domain admin search + runtime LLM provider chain admin (5 commit, 219 frontend + 120 backend tests) | ✅ | 155 (Tier 1) + 79 (Tier 2) + 38 (Tier 3) = **272 new tests** |
 | 26 (Quick Wins) | **A**: HttpClientPool `aclose_all` failure injection + 5 个 XFF whitespace parametrize + 顺手修 `http_pool.py` 没迁到 structlog 的 bug (1 commit, 10 new tests); **B**: ruff sweep 41 → 0 (1 commit); **C**: demo-act4-02 spec 启用 — `test.skip` 移除 + captureFlow 实际写盘 + `playwright.docker.config.ts` 绕过端口冲突 + 跑通产生 `images/demo-act4-02.png` (1 commit); **D**: `scripts/bring-up.sh` + `scripts/teardown.sh` + `scripts/wait-ready.sh` 一键全栈 + 4 个种子脚本加 `--help` 和退出码 (1 commit) | ✅ | 10 (A) + 0 (B) + 1 (C) + 0 (D) = **11 new tests + 1 captured PNG + 3 root scripts + 4 `--help` flags** |
+| 27 (M5.1) | LLM Gateway per-tenant fallback chain — `tenant_fallback_chains` (JSONB steps, GIN index) + `TenantFallbackChainCache` (LRU+TTL singleton in `_build_fallback_chain_cache()`) + admin POST/GET/DELETE `/api/v1/admin/tenants/{id}/fallback-chain` (cache invalidation on write) + strict-mode `TenantFallbackChainNotConfigured` + `lumen_llm_tenant_fallback_chain_total{outcome}` zero-label counter + 3 settings (`LLM_TENANT_FALLBACK_CHAIN_REQUIRED` / `_TTL_S` / `_CACHE_MAXSIZE`) | ✅ | 11 repo + 10 cache + 9 resolver + 16 admin + 1 e2e = **47 new tests** |
 | 顺手 bugfixes | `BudgetResolver._PrefixResolver` 单 provider 处理 + `stream_chat` async-context guard (loop-running detect) | ✅ | 2 new tests (prefix resolver + stream_chat loop) |
 | 探索性测试 (2026-10-11) | 8 轮端到端探索 (`tests/e2e/scripts/explore.py`):多轮上下文 / 边界输入 / 并发与隔离 / Budget / KB RAG / suggest-reply / Ticket / 流式稳定性 — 发现 **3 个产品级 bug**(已修 2:#1 widget external_user_id / #2 KB seed 缺 indexing pipeline) | ✅ | 28 OK / 2 WARN / 0 FAIL / 13 INSIGHT |
 
@@ -378,7 +379,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 ### Tech debt follow-ups (actionable, scheduled)
 
 - [ ] **M4.A #24** — `_default_llm_client_factory` per-call `httpx.AsyncClient` 构造 (Task 7 of this plan: 改 per-`(base_url, headers)` 缓存)
-- [ ] **M4.C #4** — per-tenant fallback chain (chain 升级为 tenant-scoped)
+- [x] **M4.C #4** — per-tenant fallback chain (chain 升级为 tenant-scoped) — DONE (M5.1, commit `6ca2e1b`/`3941a02`/`6612b05`)
 - [ ] **M4.C #6** — per-tenant model override (model 选择升级为 tenant-scoped)
 - [ ] **M4.D known #6** — Non-LLM cost budget (SES / SMS / KB / embedding 计入 cap)
 - [x] **M4.D known #3** (closed in Pack A) — snapshot inconsistency window — DONE
@@ -437,6 +438,33 @@ monthly cap. See `docs/superpowers/specs/2026-10-05-m4-d-budget-layer-design`.
 | **Pack B** — `?breakdown=true` query on snapshot endpoint | shipped |
 | **Pack B** — `TenantBudgetRateLimited` exception + post-mortem gate | shipped |
 | **Pack B** — `LLM_BUDGET_GATE_TOTAL` metric + FastAPI handler → HTTP 429 | shipped |
+
+### M5.1 — Per-tenant LLM Fallback Chain
+
+Closes **M4.C tech-debt #4**. Each tenant can override the global
+`LLM_FALLBACK_CHAIN` env chain with its own ordered `[{provider, model,
+enabled}]` list. Resolver precedence on each call:
+
+1. Per-tenant row from `tenant_fallback_chains` (cache → DB on miss)
+2. Env chain (`LLM_FALLBACK_CHAIN`)
+3. Strict mode (`LLM_TENANT_FALLBACK_CHAIN_REQUIRED=true`) → `TenantFallbackChainNotConfigured`
+
+| Component | Status |
+|---|---|
+| `tenant_fallback_chains` table (JSONB steps + GIN index) | shipped |
+| `TenantFallbackChainRepository` (atomic upsert via `INSERT ... ON CONFLICT`) | shipped |
+| `TenantFallbackChainCache` (LRU + TTL singleton in `_build_fallback_chain_cache()`) | shipped |
+| Resolver wiring (`TenantLLMConfigCache._resolve_chain_steps` + `build_tenant_resolver`) | shipped |
+| `POST/GET/DELETE /api/v1/admin/tenants/{id}/fallback-chain` (cache invalidation on write) | shipped |
+| Strict-mode `TenantFallbackChainNotConfigured` exception | shipped |
+| `lumen_llm_tenant_fallback_chain_total{outcome}` zero-label counter (`hit`/`miss`/`disabled`/`unconfigured`) | shipped |
+| Settings: `LLM_TENANT_FALLBACK_CHAIN_REQUIRED` / `_TTL_S` / `_CACHE_MAXSIZE` | shipped |
+
+**Container default:** `LLM_TENANT_FALLBACK_CHAIN_REQUIRED=false` —
+tenants without an explicit chain row keep falling back to the env
+chain (back-compat). Flip to `true` only when every tenant is known to
+have its own chain configured. See `apps/api/.env.example` for the
+exact variables.
 
 ## 仓库信息
 
