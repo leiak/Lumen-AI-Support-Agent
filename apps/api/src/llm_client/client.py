@@ -352,9 +352,86 @@ class LLMClient:
         cannot be resumed after a partial response, so errors surface directly
         without retry — callers that need reliability for non-streaming turns
         should keep using :meth:`chat`.
+
+        Budget tracking for streaming
+        -----------------------------
+
+        When ``provider_resolver`` exposes an ``ainvoke_stream`` method
+        (added in M4.D Pack B follow-up #6 to close Explore #3's
+        bypass), the resolver runs the full async pre-check + post-record
+        cycle on each stream. We then iterate the items it yields,
+        attaching the same usage accounting we apply for the
+        non-streaming path. Resolvers without ``ainvoke_stream``
+        (``_PrefixResolver`` / ``PinnedResolver`` / plain
+        ``FallbackResolver`` used outside a budget wrapper) fall through
+        to the legacy sync ``__call__`` path — they have no budget to
+        enforce.
         """
         request, route_mode = self._resolve_request(request)
         request_id = uuid.uuid4().hex
+
+        # Budget-aware path: the resolver owns pre-check + post-record
+        # so the same enforcement that fires for ``chat`` also fires for
+        # ``stream_chat``. Resolve the inner provider via the resolver's
+        # sync ``__call__`` ONCE up front so we have its ``name`` for
+        # the UsageRecorder / metric labels — ``ainvoke_stream`` doesn't
+        # return the provider object, only the yielded items.
+        if hasattr(self.provider_resolver, "ainvoke_stream"):
+            provider = self.provider_resolver(request)
+            try:
+                async for item in self.provider_resolver.ainvoke_stream(request):
+                    if isinstance(item, ChatResponse):
+                        # ainvoke_stream already wrote to
+                        # tenant_budget_snapshots; this side fills
+                        # llm_usage + LLM_CALLS_TOTAL /
+                        # LLM_TOKENS_TOTAL.
+                        self.usage.enqueue(
+                            tenant_id=self.tenant_id,
+                            provider=provider.name,
+                            model=item.model,
+                            prompt_tokens=item.prompt_tokens,
+                            completion_tokens=item.completion_tokens,
+                            request_id=request_id,
+                        )
+                        _record_success(
+                            provider.name,
+                            item.model,
+                            route_mode,
+                            item.prompt_tokens,
+                            item.completion_tokens,
+                        )
+                    yield item
+                return
+            except (RateLimited, InvalidRequest, ProviderUnavailable, OutputInvalid) as e:
+                outcome_map = {
+                    RateLimited: "rate_limited",
+                    InvalidRequest: "invalid_request",
+                    ProviderUnavailable: "unavailable",
+                    OutputInvalid: "output_invalid",
+                }
+                _record_failure(
+                    provider.name,
+                    request.model,
+                    route_mode,
+                    outcome_map[type(e)],
+                )
+                raise
+            except UnknownModelError:
+                _record_failure(
+                    _UNKNOWN_PROVIDER_LABEL,
+                    request.model,
+                    ROUTE_UNKNOWN_MODEL,
+                    "invalid_request",
+                )
+                raise InvalidRequest(  # noqa: B904
+                    f"No LLM provider registered for model {request.model!r}"
+                )
+
+        # Legacy sync path — resolver has no async streaming seam
+        # (non-budget tenants). Pre-check is best-effort via the sync
+        # ``__call__``; post-record is the responsibility of the
+        # resolver (none today, except BudgetResolver.ainvoke_stream
+        # handled above).
         provider: BaseProvider | None = None
         try:
             provider = self.provider_resolver(request)

@@ -802,3 +802,212 @@ def test_sync_call_outside_async_context_enforces_cap() -> None:
     with pytest.raises(TenantBudgetExceeded):
         resolver(MagicMock(spec=ChatRequest))
     snap_cache.get_or_load.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# ainvoke_stream — Explore #3 fix: closes the pre-check + post-record
+# bypass that ``LLMClient.stream_chat`` previously suffered through the
+# loop-running guard in ``_pre_check_sync``.
+# ---------------------------------------------------------------------------
+
+
+def _async_iter(items: list[Any]) -> Any:
+    """Return an async iterator yielding ``items`` one at a time."""
+    async def _gen() -> Any:
+        for item in items:
+            yield item
+    return _gen()
+
+
+def _make_streaming_provider(*, items: list[Any]) -> Any:
+    """Build a provider-like with a sync ``__call__`` returning self and
+    async ``stream()`` yielding the supplied items.
+
+    Note: setting ``p.__call__`` after construction does NOT override a
+    MagicMock's callable behavior — the trick is to set
+    ``return_value`` on a Mock used AS ``__call__``. We do the simpler
+    thing here: build a plain class with the right surface.
+    """
+
+    class _Provider:
+        name = "fake-stream"
+
+        async def stream(self, request: Any) -> Any:
+            for item in items:
+                yield item
+
+    return _Provider()
+
+
+def _make_inner_with_provider(provider: Any) -> Any:
+    """Build a resolver-shaped fake whose ``__call__`` returns the provider.
+
+    Plain class (not MagicMock) — MagicMock's instance ``__call__``
+    can't be cleanly overridden, which silently breaks the streaming
+    seam.
+    """
+
+    class _Inner:
+        def __call__(self, request: Any) -> Any:
+            return provider
+
+        async def ainvoke(self, request: Any) -> Any:
+            raise AssertionError(
+                "ainvoke_stream must not call inner.ainvoke — "
+                "it delegates to provider.stream directly"
+            )
+
+    return _Inner()
+
+
+async def test_ainvoke_stream_pre_check_under_cap_runs_post_record() -> None:
+    """Under-cap tenant → pre-check passes, items forwarded, post-record runs."""
+    from llm_client.types import ChatResponse as RealChatResponse
+
+    items = [
+        "delta-1",
+        "delta-2",
+        RealChatResponse(
+            content="done",
+            model="m",
+            prompt_tokens=10,
+            completion_tokens=5,
+            finish_reason="stop",
+        ),
+    ]
+    provider = _make_streaming_provider(items=items)
+    inner = _make_inner_with_provider(provider)
+
+    cache = MagicMock()
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 50)
+    )
+    repo.set_tokens_used = AsyncMock()
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=200),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    out = [item async for item in resolver.ainvoke_stream(MagicMock(spec=ChatRequest))]
+
+    # Items forwarded in order, deltas + final ChatResponse
+    assert out[0] == "delta-1"
+    assert out[1] == "delta-2"
+    assert isinstance(out[2], RealChatResponse)
+
+    # Pre-check + post-record each read the snapshot (pre-check for the
+    # cap decision, post-record for the UPSERT — same DB-direct path).
+    assert repo.get_for_tenant_period.await_count == 2
+    # Post-record wrote the new total (50 + 10 + 5 = 65).
+    repo.set_tokens_used.assert_awaited_once()
+    last_kwargs = repo.set_tokens_used.await_args.kwargs
+    assert last_kwargs["tokens_used"] == 65
+    assert last_kwargs["period"] == "2026-10"
+    # Cache invalidated so the next pre-check sees the fresh total.
+    cache.invalidate.assert_called_once_with("t1", period="2026-10")
+
+
+async def test_ainvoke_stream_at_cap_raises_before_stream() -> None:
+    """At-cap tenant → TenantBudgetExceeded; provider.stream never invoked."""
+    provider = _make_streaming_provider(items=[])
+    inner = _make_inner_with_provider(provider)
+
+    cache = MagicMock()
+    repo = MagicMock()
+    # At-cap snapshot — 200 used == hard_cap_tokens.
+    repo.get_for_tenant_period = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 200)
+    )
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=200),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    with pytest.raises(TenantBudgetExceeded):
+        async for _ in resolver.ainvoke_stream(MagicMock(spec=ChatRequest)):
+            pass
+
+    # Inner provider never iterated. set_tokens_used was never called
+    # because pre-check blocked the stream before any post-record could
+    # fire.
+    repo.set_tokens_used.assert_not_called()
+
+
+async def test_ainvoke_stream_no_budget_is_passthrough() -> None:
+    """budget=None → no pre-check, no post-record; items just forwarded."""
+    from llm_client.types import ChatResponse as RealChatResponse
+
+    items = ["a", "b", RealChatResponse(
+        content="x", model="m",
+        prompt_tokens=1, completion_tokens=1, finish_reason="stop",
+    )]
+    provider = _make_streaming_provider(items=items)
+    inner = _make_inner_with_provider(provider)
+
+    cache = MagicMock()
+    repo = MagicMock()
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=None,  # no enforcement contract
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    out = [item async for item in resolver.ainvoke_stream(MagicMock(spec=ChatRequest))]
+
+    assert len(out) == 3
+    # No DB read (no budget → no enforcement)
+    repo.get_for_tenant_period.assert_not_called()
+    repo.set_tokens_used.assert_not_called()
+
+
+async def test_ainvoke_stream_post_record_failure_does_not_abort_stream() -> None:
+    """A post-record exception must NOT abort the customer's stream.
+
+    Token consumption already happened at the provider — failing to
+    record it is a soft miss on the budget tracking, not a stream
+    error. The customer must still see the full response.
+    """
+    from llm_client.types import ChatResponse as RealChatResponse
+
+    items = [
+        "delta",
+        RealChatResponse(
+            content="done",
+            model="m",
+            prompt_tokens=4,
+            completion_tokens=6,
+            finish_reason="stop",
+        ),
+    ]
+    provider = _make_streaming_provider(items=items)
+    inner = _make_inner_with_provider(provider)
+
+    cache = MagicMock()
+    repo = MagicMock()
+    repo.get_for_tenant_period = AsyncMock(
+        return_value=_make_snapshot("t1", "2026-10", 10)
+    )
+    repo.set_tokens_used = AsyncMock(
+        side_effect=RuntimeError("simulated DB blip on UPSERT")
+    )
+    resolver = BudgetResolver(
+        inner=inner,
+        tenant_id="t1",
+        budget=_make_budget(hard_cap_tokens=200),
+        snapshot_cache=cache,
+        snapshot_repo=repo,
+    )
+
+    # Should not raise.
+    out = [item async for item in resolver.ainvoke_stream(MagicMock(spec=ChatRequest))]
+    assert out[0] == "delta"
+    assert isinstance(out[1], RealChatResponse)

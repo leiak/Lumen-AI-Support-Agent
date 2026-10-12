@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -165,6 +166,70 @@ class BudgetResolver:
         if tokens_consumed > 0:
             await self._post_record(period, period_start, tokens_consumed)
         return resp
+
+    async def ainvoke_stream(
+        self, request: ChatRequest
+    ) -> AsyncIterator[ChatResponse | str]:
+        """Async streaming seam that mirrors :meth:`ainvoke`'s budget contract.
+
+        Pre-checks (async — raises ``TenantBudgetExceeded`` when at cap),
+        streams items from the inner provider, then on the final
+        ``ChatResponse`` fires :meth:`_post_record` with the token count
+        the provider reported. Closes Explore #3's bypass: without this
+        path, ``LLMClient.stream_chat`` resolved the provider via the
+        sync ``__call__`` shim whose ``_pre_check_sync`` silently
+        skipped (loop-running guard) and whose ``__call__`` never runs
+        post-record — so streaming tenants accumulated no
+        ``tenant_budget_snapshots`` rows and the cap was never enforced.
+
+        Drop this method only when the budget row is missing or
+        ``hard_cap_tokens is None`` (no enforcement contract). Callers
+        that don't have a budget (``LLMClient.provider_resolver`` is a
+        non-budget resolver) won't have this method and the legacy
+        sync path stays in effect.
+
+        Failure isolation: a post-record failure must NOT abort the
+        stream the customer is already consuming — log + swallow at
+        WARNING with class name only (PII discipline). The token
+        consumption already happened at the provider; not recording it
+        is a soft budget-tracking miss, not a stream error.
+
+        PII discipline: no raw text, no token strings in the log line —
+        only opaque IDs, counts, and the exception class name.
+        """
+        # No budget configured: just delegate to inner's stream without
+        # any bookkeeping. Mirrors __call__'s "no enforcement, no
+        # snapshot reads or writes" branch.
+        if self._budget is None or self._budget.hard_cap_tokens is None:
+            primary = self._inner(request)
+            async for item in primary.stream(request):
+                yield item
+            return
+
+        period, period_start = await self._pre_check()
+        primary = self._inner(request)
+        async for item in primary.stream(request):
+            if isinstance(item, ChatResponse):
+                tokens_consumed = (
+                    getattr(item, "prompt_tokens", 0)
+                    + getattr(item, "completion_tokens", 0)
+                )
+                if tokens_consumed > 0:
+                    try:
+                        await self._post_record(
+                            period, period_start, tokens_consumed
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "tenant_budget.stream_post_record_failed",
+                            extra={
+                                "tenant_id": self._tenant_id,
+                                "period": period,
+                                "tokens_consumed": tokens_consumed,
+                                "error_type": type(exc).__name__,
+                            },
+                        )
+            yield item
 
     async def _invoke_inner(self, request: ChatRequest) -> ChatResponse:
         """Delegate to the inner resolver uniformly across resolver shapes.
