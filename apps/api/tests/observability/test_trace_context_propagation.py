@@ -85,13 +85,24 @@ def test_traceparent_flag_01_means_sampled() -> None:
 
 
 def test_tracestate_header_preserved() -> None:
-    """The ``tracestate`` header (vendor-specific data) round-trips."""
+    """The ``tracestate`` header (vendor-specific data) round-trips.
+
+    ``propagate.inject`` reads from a Context object. We pass the
+    extracted context explicitly via the ``context=`` kwarg so the
+    propagator can serialize the upstream ``tracestate``. The
+    default (no context) reads the current span, which is empty
+    here — tracestate is dropped.
+    """
+    upstream_trace_id = "0af7651916cd43dd8448eb211c80319c"
+    upstream_span_id = "b7ad6b7169203331"
     carrier = {
-        "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        "traceparent": f"00-{upstream_trace_id}-{upstream_span_id}-01",
         "tracestate": "lumen=abc123",
     }
     extracted = propagate.extract(carrier)
     out: dict[str, str] = {}
-    propagate.inject(out)
-    # tracestate is not re-injected without a current span; just check no crash
-    assert extracted is not None
+    propagate.inject(out, context=extracted)
+    assert "traceparent" in out
+    assert out.get("tracestate") == "lumen=abc123", (
+        f"tracestate did not round-trip; got {out.get('tracestate')!r}"
+    )

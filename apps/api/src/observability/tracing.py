@@ -77,20 +77,20 @@ PII_FORBIDDEN: tuple[str, ...] = (
 )
 
 
-def _check_attribute_whitelist(name: str, value: Any) -> None:
-    """Runtime check: fail fast if a non-whitelisted attribute is set.
+def _log_attribute_not_whitelisted(name: str, value: Any) -> None:
+    """Log + drop a non-whitelisted span attribute (defense in depth).
 
     The static-scan test catches most violations, but this runtime
     guard catches anything that slips through (e.g. a dynamic key
-    constructed from a variable).
+    constructed from a variable). The attribute is NOT passed to the
+    span — it is dropped after logging, so an accidental PII leak from
+    an unknown key never reaches the OTel exporter.
     """
-    if name not in PII_WHITELIST:
-        # Don't raise — log + skip. Span emission is best-effort.
-        structlog.get_logger("otel").warning(
-            "otel.attribute_not_whitelisted",
-            name=name,
-            value_type=type(value).__name__,
-        )
+    structlog.get_logger("otel").warning(
+        "otel.attribute_not_whitelisted",
+        name=name,
+        value_type=type(value).__name__,
+    )
 
 
 def traced(
@@ -115,7 +115,9 @@ def traced(
         name_or_fn: Either the function being decorated (bare form) or
             the explicit span name (parameterized form).
         attributes: Static attribute dict. Apply PII whitelist — keys
-            outside ``PII_WHITELIST`` log a warning at runtime.
+            outside ``PII_WHITELIST`` are logged as a warning at
+            runtime AND dropped (not attached to the span). This is
+            defense-in-depth on top of the static PII scan.
         record_exception: If True (default), exceptions raised inside
             the span are recorded as a span event and the status is
             set to ERROR. If False, the exception still propagates but
@@ -153,9 +155,17 @@ def _build_wrapper(
         # would include the enclosing test class/function, which makes
         # span queries noisy.
         span_name = name or fn.__name__
-        attrs = attributes or {}
-        for k in attrs:
-            _check_attribute_whitelist(k, attrs[k])
+        # Filter the attribute dict against PII_WHITELIST BEFORE passing
+        # to start_as_current_span — non-whitelisted keys are logged and
+        # dropped, not attached to the span. This is defense-in-depth
+        # on top of the static PII scan.
+        all_attrs = attributes or {}
+        attrs: dict[str, AttributeValue] = {}
+        for k, v in all_attrs.items():
+            if k in PII_WHITELIST:
+                attrs[k] = v
+            else:
+                _log_attribute_not_whitelisted(k, v)
         with tracer.start_as_current_span(
             span_name,
             attributes=attrs,

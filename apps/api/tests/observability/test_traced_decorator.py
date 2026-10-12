@@ -111,17 +111,34 @@ async def test_nested_traced_calls_create_child_spans(memory_exporter) -> None:
 
 
 @pytest.mark.asyncio
-async def test_warning_logged_for_non_whitelisted_attribute(memory_exporter, caplog) -> None:
-    """Setting an attribute outside the whitelist logs a warning."""
+async def test_warning_logged_for_non_whitelisted_attribute(memory_exporter, capsys) -> None:
+    """Non-whitelisted attributes are logged AND dropped (defense in depth).
+
+    The runtime guard must NOT pass non-whitelisted keys through to the
+    span — they're logged as a warning and silently filtered out. This
+    is the behavior that protects against accidental PII leaks from
+    dynamic keys that the static-scan test can't see.
+
+    Note: structlog is configured with ``PrintLoggerFactory`` (writes
+    to stdout directly, bypassing the stdlib logging module), so we
+    capture stdout with ``capsys`` rather than ``caplog``.
+    """
     @traced("x", attributes={"random.field": "value"})  # not in whitelist
     async def f() -> None:
         return None
 
-    with caplog.at_level("WARNING", logger="otel"):
-        await f()
+    await f()
+    captured = capsys.readouterr()
+    # The warning must mention both the event name and the offending
+    # attribute key — the runtime guard has zero value otherwise.
+    assert "otel.attribute_not_whitelisted" in captured.out
+    assert "random.field" in captured.out
 
-    # Either the warning was logged, or the attribute is silently dropped.
-    # We don't strictly require the warning — the static-scan test catches
-    # most violations. Just verify the span was opened.
     spans = memory_exporter.get_finished_spans()
     assert len(spans) == 1
+    span_attrs = dict(spans[0].attributes or {})
+    # The non-whitelisted attribute must NOT be on the span — this is
+    # the actual P1 fix.
+    assert "random.field" not in span_attrs, (
+        f"non-whitelisted attribute leaked onto span: {span_attrs}"
+    )
