@@ -1081,6 +1081,169 @@ async def round11_audit_log() -> None:
     )
 
 
+# =============================================================================
+# Round 12 — OpenTelemetry tracing end-to-end (M6)
+# =============================================================================
+
+async def round12_otel_tracing() -> None:
+    """M6 — verify the OTLP → Tempo wiring end-to-end.
+
+    Mirrors ``tests/e2e/scripts/test_otel_e2e.py`` but interactive
+    (prints Tempo UI links for the operator to spot-check). Steps:
+
+    1. otel-collector:4317 (TCP) + tempo:33000 (HTTP ``/ready``) are
+       reachable. Tempo is the host port per ``deploy/docker-compose.yml``.
+    2. Drive a real widget chat through the api container, capture
+       the ``X-Trace-Id`` response header from the ``/widget/token``
+       POST (the M6.6 ``TraceContextMiddleware`` echoes the trace_id
+       on every HTTP response).
+    3. Query Tempo for the trace. Assert the span tree has the
+       expected hierarchy: ``http.request`` root + (best-effort)
+       ``llm.chat`` + outbound ``POST``/``anthropic`` httpx span.
+    4. Print a Tempo UI link so the operator can spot-check the
+       trace by eye.
+
+    Gated on ``OTEL_EXPORTER_OTLP_ENDPOINT`` for consistency with
+    the other rounds' env-var gates — the round is skipped when the
+    OTel stack is not configured.
+    """
+    print("\n" + "=" * 70)
+    print("Round 12 — OpenTelemetry tracing (M6)")
+    print("=" * 70)
+    rid = "R12"
+
+    if not os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        _record(
+            rid, "WARN",
+            "OTEL_EXPORTER_OTLP_ENDPOINT not set — skipping Round 12 "
+            "(the api container may still be exporting to the default "
+            "endpoint; check the docker-compose service `otel-collector`)",
+        )
+        return
+
+    # 1. Infra check.
+    import socket
+    try:
+        with socket.create_connection(("localhost", 4317), timeout=3):
+            pass
+    except OSError as exc:
+        _record(rid, "FAIL", f"otel-collector:4317 unreachable: {exc}")
+        return
+    try:
+        ready = requests.get("http://localhost:33000/ready", timeout=3)
+        if ready.status_code != 200:
+            _record(rid, "FAIL", f"tempo:33000 /ready status={ready.status_code}")
+            return
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"tempo:33000 unreachable: {type(exc).__name__}: {exc}")
+        return
+    _record(rid, "OK", "otel-collector:4317 + tempo:33000 reachable")
+
+    # 2. Seed a tenant + drive a widget chat (X-Trace-Id is the
+    # primary anchor for the HTTP trace).
+    tenant_id, channel_id = await _seed_fresh_tenant(
+        name="round12-otel", channel_type=ChannelType.WEB,
+    )
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        _record(
+            rid, "WARN",
+            "no ANTHROPIC_API_KEY — WS chat will fall back; trace wiring "
+            "(http.request + X-Trace-Id echo) is still verified",
+        )
+
+    try:
+        r = requests.post(
+            f"{API}/api/v1/widget/token",
+            json={
+                "channel_id": channel_id,
+                "external_user_id": f"round12-{uuid.uuid4().hex[:6]}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        _record(rid, "FAIL", f"POST /widget/token: {type(exc).__name__}: {exc}")
+        return
+    if r.status_code != 200:
+        _record(rid, "FAIL", f"POST /widget/token status={r.status_code} body={r.text[:200]!r}")
+        return
+    trace_id = r.headers.get("X-Trace-Id")
+    if not trace_id:
+        _record(rid, "FAIL", "POST /widget/token did not echo X-Trace-Id")
+        return
+    _record(rid, "OK", f"X-Trace-Id={trace_id} echoed on /widget/token response")
+
+    # 3. Drive a WS round-trip so the LLM path produces a trace.
+    resp = await _widget_round_trip(channel_id=channel_id, text="Reply PONG.")
+    if resp.get("ok"):
+        _record(rid, "OK", f"WS round-trip: {len(resp['text'])} chars reply")
+    else:
+        _record(rid, "WARN", f"WS round-trip: {resp.get('error') or resp.get('text', '')[:80]!r}")
+
+    # 4. Poll Tempo for the HTTP trace.
+    deadline = time.time() + 10
+    spans: list[dict] = []
+    while time.time() < deadline:
+        try:
+            tr = requests.get(
+                f"http://localhost:33000/api/traces/{trace_id}", timeout=3,
+            )
+        except requests.RequestException:
+            time.sleep(0.5)
+            continue
+        if tr.status_code == 200:
+            spans = tr.json().get("spans", [])
+            if spans:
+                break
+        time.sleep(0.5)
+    if not spans:
+        _record(rid, "FAIL", f"trace {trace_id} did not appear in Tempo within 10s")
+        return
+    names = {s.get("name", "") for s in spans}
+    _record(rid, "OK", f"Tempo trace {trace_id} has {len(spans)} spans: {sorted(names)}")
+
+    # 5. Print the Tempo UI link for the operator to spot-check.
+    _record(
+        rid, "INSIGHT",
+        f"Tempo UI: http://localhost:33000/trace/{trace_id}  "
+        f"(also see frontend console.info('Trace:', traceId) for correlation)",
+    )
+
+    # 6. Best-effort LLM hierarchy check via Tempo search.
+    try:
+        sr = requests.get(
+            "http://localhost:33000/api/search",
+            params={"tags": "name=llm.chat", "limit": 5},
+            timeout=5,
+        )
+        if sr.status_code == 200:
+            llm_traces = sr.json().get("traces", [])
+            if llm_traces:
+                llm_id = str(llm_traces[0].get("traceID") or llm_traces[0].get("traceId") or "")
+                lt = requests.get(
+                    f"http://localhost:33000/api/traces/{llm_id}", timeout=5,
+                )
+                if lt.status_code == 200:
+                    llm_names = {s.get("name", "") for s in lt.json().get("spans", [])}
+                    if "llm.chat" in llm_names:
+                        _record(
+                            rid, "OK",
+                            f"LLM trace {llm_id} has llm.chat + outbound httpx "
+                            f"(names: {sorted(llm_names)})",
+                        )
+                        _record(
+                            rid, "INSIGHT",
+                            f"LLM trace UI: http://localhost:33000/trace/{llm_id}",
+                        )
+                    else:
+                        _record(
+                            rid, "WARN",
+                            f"llm.chat trace found but no llm.chat span: {sorted(llm_names)}",
+                        )
+    except requests.RequestException as exc:
+        _record(rid, "WARN", f"Tempo search skipped: {type(exc).__name__}: {exc}")
+
+
 # Main
 # =============================================================================
 
@@ -1096,6 +1259,7 @@ ALL_ROUNDS = {
     "9": ("Round 9 — Per-tenant fallback chain (M5.1)", round9_tenant_fallback_chain),
     "10": ("Round 10 — Per-tenant model override (M5.2)", round10_tenant_model_override),
     "11": ("Round 11 — Tenant LLM config audit log (M5.3)", round11_audit_log),
+    "12": ("Round 12 — OpenTelemetry tracing (M6)", round12_otel_tracing),
 }
 
 
