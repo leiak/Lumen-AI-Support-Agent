@@ -49,6 +49,8 @@ from llm_client.exceptions import RateLimited, TenantBudgetExceeded
 from llm_client.resolvers import Resolver
 from llm_client.tenant_resolver import _NoChainConfigured
 from llm_client.types import ChatRequest, ChatResponse
+from observability import tracer
+from opentelemetry.trace import Status, StatusCode
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,14 @@ class BudgetResolver:
 
         PII discipline: no raw text, no token strings in the log line —
         only opaque IDs, counts, and the exception class name.
+
+        M6.3 OpenTelemetry tracing: the pre-check path is via
+        ``_pre_check`` and emits its own ``llm.budget.precheck`` span
+        from inside that helper. The post-record path on every final
+        ``ChatResponse`` is wrapped in a ``llm.budget.postrecord`` span
+        with ``tenant_id`` + ``model`` + ``llm.tokens.input`` +
+        ``llm.tokens.output`` attributes so the trace shows the
+        per-turn bookkeeping work.
         """
         # No budget configured: just delegate to inner's stream without
         # any bookkeeping. Mirrors __call__'s "no enforcement, no
@@ -229,6 +239,38 @@ class BudgetResolver:
                                 "error_type": type(exc).__name__,
                             },
                         )
+                        # Emit a span for the failed post-record so the
+                        # trace shows the bookkeeping miss, but DON'T
+                        # re-raise (the stream survives).
+                        with tracer.start_as_current_span(
+                            "llm.budget.postrecord",
+                            attributes={
+                                "tenant_id": self._tenant_id,
+                                "model": item.model,
+                                "llm.tokens.input": item.prompt_tokens,
+                                "llm.tokens.output": item.completion_tokens,
+                            },
+                        ) as failed_span:
+                            failed_span.record_exception(exc)
+                            failed_span.set_status(
+                                Status(StatusCode.ERROR),
+                            )
+                    else:
+                        # Success — emit the postrecord span with the
+                        # same token / model attrs that the failure
+                        # path would have set. We emit ONE span per
+                        # final ChatResponse (not per chunk) so the
+                        # trace volume stays bounded.
+                        with tracer.start_as_current_span(
+                            "llm.budget.postrecord",
+                            attributes={
+                                "tenant_id": self._tenant_id,
+                                "model": item.model,
+                                "llm.tokens.input": item.prompt_tokens,
+                                "llm.tokens.output": item.completion_tokens,
+                            },
+                        ):
+                            pass
             yield item
 
     async def _invoke_inner(self, request: ChatRequest) -> ChatResponse:
@@ -281,33 +323,45 @@ class BudgetResolver:
         surface soft-degrades (no usage recorded against the budget,
         but the LLM call proceeds — same trade-off the M4.A spec
         documents for non-tracked callers).
+
+        M6.3 OpenTelemetry tracing: wraps the sync pre-check body in a
+        ``llm.budget.precheck`` span with ``tenant_id`` + ``model``
+        attributes. The model is read from the ``ChatRequest`` carried
+        by the resolver's caller; we don't have direct access, so this
+        span only carries ``tenant_id`` (the runtime caller-level
+        ``llm.chat`` span carries the model attribute for cross-span
+        correlation).
         """
-        if self._budget is None or self._budget.hard_cap_tokens is None:
-            return
-        try:
-            loop_running = asyncio.get_event_loop().is_running()
-        except RuntimeError:
-            # No event loop in this thread — pure sync context, safe to proceed.
-            loop_running = False
-        if loop_running:
-            # Caller is in an async context (LLMClient.stream_chat);
-            # the async ainvoke path enforces the cap. Defer.
-            return
-        period, period_start = _current_period(self._budget.period_anchor_tz)
-        snap = self._snapshot_cache.get_or_load(
-            self._tenant_id,
-            period=period,
-            period_starts_at=period_start,
-        )
-        if snap.tokens_used >= self._budget.hard_cap_tokens:
-            LLM_TENANT_BUDGET_EXCEEDED_TOTAL.inc()
-            raise TenantBudgetExceeded(
-                tenant_id=self._tenant_id,
+        with tracer.start_as_current_span(
+            "llm.budget.precheck",
+            attributes={"tenant_id": self._tenant_id},
+        ):
+            if self._budget is None or self._budget.hard_cap_tokens is None:
+                return
+            try:
+                loop_running = asyncio.get_event_loop().is_running()
+            except RuntimeError:
+                # No event loop in this thread — pure sync context, safe to proceed.
+                loop_running = False
+            if loop_running:
+                # Caller is in an async context (LLMClient.stream_chat);
+                # the async ainvoke path enforces the cap. Defer.
+                return
+            period, period_start = _current_period(self._budget.period_anchor_tz)
+            snap = self._snapshot_cache.get_or_load(
+                self._tenant_id,
                 period=period,
-                tokens_used=snap.tokens_used,
-                hard_cap_tokens=self._budget.hard_cap_tokens,
                 period_starts_at=period_start,
             )
+            if snap.tokens_used >= self._budget.hard_cap_tokens:
+                LLM_TENANT_BUDGET_EXCEEDED_TOTAL.inc()
+                raise TenantBudgetExceeded(
+                    tenant_id=self._tenant_id,
+                    period=period,
+                    tokens_used=snap.tokens_used,
+                    hard_cap_tokens=self._budget.hard_cap_tokens,
+                    period_starts_at=period_start,
+                )
 
     async def _pre_check(self) -> tuple[str, datetime]:
         """Async pre-check: load snapshot from DB (Pack A #3) and raise if at cap.

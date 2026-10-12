@@ -14,10 +14,12 @@ asks the resolver once per request and forwards the resulting
 import asyncio
 import json
 import random
+import time
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from opentelemetry.trace import Status, StatusCode
 from pydantic import BaseModel
 
 from core.business_metrics import LLM_CALLS_TOTAL, LLM_TOKENS_TOTAL
@@ -36,6 +38,21 @@ from llm_client.resolvers import (
 )
 from llm_client.types import ChatMessage, ChatRequest, ChatResponse
 from llm_client.usage import UsageRecorder
+from observability import tracer
+
+
+# OTel span attribute keys — listed here so the linter picks up
+# typos and so the PII whitelist is enforced consistently from one
+# place. ``tenant_id``, ``provider_name``, ``model``, and the four
+# ``llm.*`` keys are all on the whitelist (see
+# observability/tracing.py::PII_WHITELIST).
+_SPAN_ATTR_MODEL = "model"
+_SPAN_ATTR_PROVIDER = "provider_name"
+_SPAN_ATTR_TENANT = "tenant_id"
+_SPAN_ATTR_TOKENS_IN = "llm.tokens.input"
+_SPAN_ATTR_TOKENS_OUT = "llm.tokens.output"
+_SPAN_ATTR_COST = "llm.cost_usd"
+_SPAN_ATTR_LATENCY = "llm.latency_ms"
 
 # Route-mode label values — keep them as constants so dashboards and
 # alerts reference the same string we increment with.
@@ -159,6 +176,41 @@ class LLMClient:
             )
         return request, self._route_mode
 
+    @staticmethod
+    def _set_llm_chat_attrs(
+        span: Any,
+        request: ChatRequest,
+        resp: ChatResponse,
+        t0: float,
+    ) -> None:
+        """Apply post-success llm.chat attributes (tokens / cost / latency).
+
+        Single source of truth for the success-path attribute set, shared
+        between :meth:`chat` (retry loop) and the FallbackResolver
+        ``ainvoke`` short-circuit so both paths produce identical spans.
+        Cost comes from :func:`estimate_cost_usd` so the value matches
+        what gets persisted in the ``llm_usage`` table (same
+        `_COST_PER_1K` table for consistency between the metric and the
+        trace).
+        """
+        from llm_client.usage import estimate_cost_usd
+
+        cost = estimate_cost_usd(
+            resp.model, resp.prompt_tokens, resp.completion_tokens,
+        )
+        # type ignore: opentelemetry stubs declare AttributeValue types
+        span.set_attribute(_SPAN_ATTR_TOKENS_IN, resp.prompt_tokens)
+        span.set_attribute(_SPAN_ATTR_TOKENS_OUT, resp.completion_tokens)
+        span.set_attribute(_SPAN_ATTR_COST, cost)
+        # model may have been rewritten by PinnedResolver or
+        # TenantModelOverrideResolver — set the final model now so the
+        # trace reflects what the provider actually saw.
+        if resp.model:
+            span.set_attribute(_SPAN_ATTR_MODEL, resp.model)
+        span.set_attribute(
+            _SPAN_ATTR_LATENCY, (time.perf_counter() - t0) * 1000.0,
+        )
+
     async def chat_with_structured_output(
         self,
         *,
@@ -229,16 +281,65 @@ class LLMClient:
         (FallbackResolver from M4.B), the chain IS the retry mechanism —
         we delegate and skip the local retry loop to avoid
         ``max_retries * chain_length`` attempt explosion.  # noqa: RUF002
-        """
-        # M4.B: FallbackResolver.ainvoke runs the whole chain (primary +
-        # backup, ...) and either returns success or raises
-        # FallbackChainExhausted. We deliberately do NOT wrap it in this
-        # method's retry loop — the chain already handles per-step retry
-        # semantics, and re-running it on exhaustion would compound.
-        if hasattr(self.provider_resolver, "ainvoke"):
-            return await self.provider_resolver.ainvoke(request)
 
+        M6.3 OpenTelemetry tracing: wraps the call in a ``llm.chat`` span
+        with attributes ``tenant_id``, ``provider_name``, ``model``,
+        ``llm.tokens.input`` (initial 0; updated from response after the
+        call returns), ``llm.tokens.output``, ``llm.cost_usd`` (computed
+        via :func:`estimate_cost_usd`), and ``llm.latency_ms``. Exceptions
+        mark the span as ERROR and the exception is recorded as a span
+        event before re-raise. The outbound HTTP call is auto-instrumented
+        by ``HTTPXClientInstrumentor`` (M6.1) and nests under
+        ``llm.chat`` as a child span.
+        """
+        # Open the llm.chat span up front so it nests the whole call —
+        # including the FallbackResolver.ainvoke path below (so every
+        # chat() invocation produces exactly one llm.chat span).
+        # ``provider_name`` and ``model`` are set inside the body once we
+        # actually resolve the provider — they aren't known at span start.
+        t0 = time.perf_counter()
+        with tracer.start_as_current_span(
+            "llm.chat",
+            attributes={
+                _SPAN_ATTR_TENANT: self.tenant_id,
+                # Initial values — final values are set after the call
+                # returns (see post-success attribute updates below).
+                _SPAN_ATTR_TOKENS_IN: 0,
+            },
+        ) as chat_span:
+            # M4.B: FallbackResolver.ainvoke runs the whole chain (primary +
+            # backup, ...) and either returns success or raises
+            # FallbackChainExhausted. We deliberately do NOT wrap it in
+            # this method's retry loop — the chain already handles
+            # per-step retry semantics, and re-running it on exhaustion
+            # would compound.
+            if hasattr(self.provider_resolver, "ainvoke"):
+                try:
+                    resp = await self.provider_resolver.ainvoke(request)
+                except Exception as exc:
+                    chat_span.record_exception(exc)
+                    chat_span.set_status(Status(StatusCode.ERROR))
+                    raise
+                self._set_llm_chat_attrs(
+                    chat_span, request, resp, t0,
+                )
+                return resp
+
+            return await self._chat_with_retry(
+                request, max_retries=max_retries, span=chat_span, t0=t0,
+            )
+
+    async def _chat_with_retry(
+        self,
+        request: ChatRequest,
+        *,
+        max_retries: int,
+        span: Any,
+        t0: float,
+    ) -> ChatResponse:
+        """Retry loop factored out so the llm.chat span wraps it cleanly."""
         request, route_mode = self._resolve_request(request)
+        span.set_attribute(_SPAN_ATTR_MODEL, request.model)
         request_id = uuid.uuid4().hex
         attempt = 0
         last_exc: Exception | None = None
@@ -247,6 +348,11 @@ class LLMClient:
             provider = None  # avoid stale binding from a prior iteration
             try:
                 provider = self.provider_resolver(request)
+                # provider_name becomes known ONLY after resolver —
+                # set the span attribute here so the trace shows which
+                # provider handled the request (PinnedResolver may have
+                # already rewritten ``request.model`` upstream).
+                span.set_attribute(_SPAN_ATTR_PROVIDER, getattr(provider, "name", "<unknown>"))
                 resp = await provider.chat(request)
                 self.usage.enqueue(
                     tenant_id=self.tenant_id,
@@ -263,22 +369,31 @@ class LLMClient:
                     resp.prompt_tokens,
                     resp.completion_tokens,
                 )
+                # Final attributes — token counts + cost + latency are
+                # only known after the provider returns.
+                self._set_llm_chat_attrs(
+                    span, request, resp, t0,
+                )
                 return resp
-            except RateLimited:
+            except RateLimited as exc:
                 _record_failure(
                     provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
                     request.model,
                     route_mode,
                     "rate_limited",
                 )
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR))
                 raise
-            except InvalidRequest:
+            except InvalidRequest as exc:
                 _record_failure(
                     provider.name if provider is not None else _UNKNOWN_PROVIDER_LABEL,
                     request.model,
                     route_mode,
                     "invalid_request",
                 )
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR))
                 raise
             except ProviderUnavailable as e:
                 _record_failure(
@@ -289,6 +404,8 @@ class LLMClient:
                 )
                 last_exc = e
                 if attempt == max_retries:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR))
                     break
                 backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
                 await asyncio.sleep(backoff)
@@ -302,11 +419,13 @@ class LLMClient:
                 )
                 last_exc = e
                 if attempt == max_retries:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR))
                     break
                 backoff = min(2 ** attempt, 8) + random.uniform(0, 0.5)  # noqa: S311
                 await asyncio.sleep(backoff)
                 attempt += 1
-            except UnknownModelError:
+            except UnknownModelError as exc:
                 # Resolver couldn't match the model to a registered
                 # provider — 4xx-equivalent. Propagate as InvalidRequest
                 # so callers see a uniform "bad request" surface and
@@ -319,9 +438,12 @@ class LLMClient:
                     ROUTE_UNKNOWN_MODEL,
                     "invalid_request",
                 )
-                raise InvalidRequest(  # noqa: B904
+                wrapped = InvalidRequest(
                     f"No LLM provider registered for model {request.model!r}"
                 )
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR))
+                raise wrapped  # noqa: B904
             except Exception as exc:
                 # Resolver raised a non-UnknownModelError (config bug,
                 # runtime crash). Surface as ProviderUnavailable so the
@@ -337,9 +459,13 @@ class LLMClient:
                     ROUTE_RESOLVER_ERROR,
                     "unavailable",
                 )
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR))
                 raise ProviderUnavailable("LLM provider resolver failed") from exc
 
         assert last_exc is not None
+        span.record_exception(last_exc)
+        span.set_status(Status(StatusCode.ERROR))
         raise last_exc
 
     async def stream_chat(
@@ -366,8 +492,67 @@ class LLMClient:
         ``FallbackResolver`` used outside a budget wrapper) fall through
         to the legacy sync ``__call__`` path — they have no budget to
         enforce.
+
+        M6.3 OpenTelemetry tracing: wraps the whole stream in a
+        ``llm.chat.stream`` span. We open the span at the start of the
+        generator and close it after the last item is yielded (or on
+        exception). The token / cost / latency attributes are set when
+        the final ``ChatResponse`` is produced, just like :meth:`chat`.
+        HTTPX auto-instrumentation (M6.1) emits a child span for the
+        outbound POST; we deliberately do NOT span per chunk to avoid
+        span-volume explosion.
+        """
+        # Open the llm.chat.stream span up front. We can't use a
+        # ``with tracer.start_as_current_span(...)`` context manager
+        # directly inside a generator (the ``__exit__`` runs only when
+        # the generator is GC'd or closed), so we delegate to a private
+        # helper that drives the span lifecycle explicitly via
+        # ``__enter__`` / ``__exit__`` calls.
+        span_ctx = tracer.start_as_current_span(
+            "llm.chat.stream",
+            attributes={
+                _SPAN_ATTR_TENANT: self.tenant_id,
+                _SPAN_ATTR_TOKENS_IN: 0,
+            },
+        )
+        stream_span = span_ctx.__enter__()
+        t0 = time.perf_counter()
+        final_chat_response: ChatResponse | None = None
+        try:
+            async for item in self._stream_chat_inner(request, stream_span):
+                if isinstance(item, ChatResponse):
+                    final_chat_response = item
+                yield item
+        except Exception as exc:
+            stream_span.record_exception(exc)
+            stream_span.set_status(Status(StatusCode.ERROR))
+            # Close the span BEFORE re-raising so its lifecycle is
+            # correct regardless of whether the caller catches the
+            # exception.
+            span_ctx.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+        if final_chat_response is not None:
+            self._set_llm_chat_attrs(
+                stream_span, request, final_chat_response, t0,
+            )
+        # Normal completion — close the span.
+        span_ctx.__exit__(None, None, None)
+
+    async def _stream_chat_inner(
+        self,
+        request: ChatRequest,
+        stream_span: Any,
+    ) -> AsyncIterator["ChatResponse | str"]:
+        """Inner generator for :meth:`stream_chat` — carries the tracing work.
+
+        Splitting the inner generator out lets the outer ``stream_chat``
+        wrap the actual iteration in a span context without fighting the
+        Python async-generator / context-manager interaction (the span's
+        ``__exit__`` would otherwise fire only on generator GC or explicit
+        ``aclose()``).
         """
         request, route_mode = self._resolve_request(request)
+        stream_span.set_attribute(_SPAN_ATTR_MODEL, request.model)
         request_id = uuid.uuid4().hex
 
         # Budget-aware path: the resolver owns pre-check + post-record
@@ -378,6 +563,11 @@ class LLMClient:
         # return the provider object, only the yielded items.
         if hasattr(self.provider_resolver, "ainvoke_stream"):
             provider = self.provider_resolver(request)
+            # provider_name becomes known only after resolution.
+            stream_span.set_attribute(
+                _SPAN_ATTR_PROVIDER,
+                getattr(provider, "name", "<unknown>"),
+            )
             try:
                 async for item in self.provider_resolver.ainvoke_stream(request):
                     if isinstance(item, ChatResponse):
@@ -435,6 +625,10 @@ class LLMClient:
         provider: BaseProvider | None = None
         try:
             provider = self.provider_resolver(request)
+            stream_span.set_attribute(
+                _SPAN_ATTR_PROVIDER,
+                getattr(provider, "name", "<unknown>"),
+            )
             async for item in provider.stream(request):
                 if isinstance(item, ChatResponse):
                     self.usage.enqueue(

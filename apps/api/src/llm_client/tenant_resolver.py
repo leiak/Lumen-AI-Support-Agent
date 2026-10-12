@@ -42,6 +42,7 @@ from core.business_metrics import LLM_TENANT_FALLBACK_CHAIN_TOTAL
 from llm_client.exceptions import TenantLlmNotConfigured
 from llm_client.resolvers import Resolver
 from llm_client.tenant_config_models import TenantLLMConfigRepository
+from observability import tracer
 
 if TYPE_CHECKING:
     from llm_client.gateway import LLMGateway
@@ -501,14 +502,40 @@ class TenantResolver:
     (M4.A protocol); ``ainvoke`` delegates to the inner fallback chain
     if present, otherwise raises :class:`_NoChainConfigured` so
     ``LLMClient`` can use its own retry loop on the single provider.
+
+    M6.3 OpenTelemetry tracing: wraps ``__call__`` in a ``llm.resolve``
+    span. The span attributes ``tenant_id`` and ``provider_name`` are on
+    the PII whitelist. ``provider_name`` is set after delegation (we
+    don't know which provider the inner gateway picked until we ask).
     """
 
-    def __init__(self, *, gateway: LLMGateway) -> None:
+    def __init__(self, *, gateway: LLMGateway, tenant_id: str | None = None) -> None:
         self._gateway = gateway
         self._delegate = gateway.default_resolver
+        # ``tenant_id`` is best-effort — the cache builder doesn't always
+        # thread it through here (it stores by tenant_id in the cache
+        # wrapper), so we accept ``None`` and just skip the attribute.
+        # In production callers (``build_tenant_resolver``) we always set
+        # the attribute via the constructor when wiring TenantResolver.
+        self._tenant_id = tenant_id
 
     def __call__(self, request: ChatRequest) -> Any:
-        return self._delegate(request)
+        with tracer.start_as_current_span(
+            "llm.resolve",
+            attributes=(
+                {"tenant_id": self._tenant_id} if self._tenant_id else None
+            ),
+        ) as resolve_span:
+            provider = self._delegate(request)
+            # ``provider_name`` is the inner provider's ``.name`` attr
+            # (e.g. ``anthropic`` / ``minimax`` / ``openai``). All
+            # BaseProvider subclasses set this — fall back to
+            # ``<unknown>`` defensively for mocks.
+            resolve_span.set_attribute(
+                "provider_name",
+                getattr(provider, "name", "<unknown>"),
+            )
+            return provider
 
     async def ainvoke(self, request: ChatRequest) -> ChatResponse:
         if hasattr(self._delegate, "ainvoke"):

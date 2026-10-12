@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from core.business_metrics import LLM_TENANT_MODEL_OVERRIDE_TOTAL
+from observability import tracer
 
 if TYPE_CHECKING:
     from llm_client.providers.base import BaseProvider
@@ -93,23 +94,56 @@ class TenantModelOverrideResolver:
         configured for that provider, the request is untouched and
         ``outcome="unset"`` fires. Missing provider name → no-op
         (defensive for mock providers in tests).
+
+        M6.3 OpenTelemetry tracing: wraps the override logic in an
+        ``llm.override`` span with ``provider_name`` + ``outcome``
+        attributes (``hit`` | ``miss`` | ``unset``). The ``miss``
+        outcome fires when the provider has no ``.name`` attribute
+        (defensive for mock providers); ``unset`` fires when the
+        provider has a name but no override entry; ``hit`` fires
+        when the rewrite actually happened.
         """
         provider_name = getattr(provider, "name", None)
         if provider_name is None:
-            return
+            # Wrap in the span even when we can't extract the name
+            # so the trace still shows the resolve-wrapper fired
+            # (with outcome="miss"). Use ``<unknown>`` for the
+            # provider_name attribute when we can't resolve it.
+            with tracer.start_as_current_span(
+                "llm.override",
+                attributes={
+                    "provider_name": "<unknown>",
+                    "outcome": "miss",
+                },
+            ):
+                return
         override = self._overrides.get(provider_name)
         if override is None:
-            LLM_TENANT_MODEL_OVERRIDE_TOTAL.labels(
-                provider=provider_name, outcome="unset",
-            ).inc()
+            with tracer.start_as_current_span(
+                "llm.override",
+                attributes={
+                    "provider_name": provider_name,
+                    "outcome": "unset",
+                },
+            ):
+                LLM_TENANT_MODEL_OVERRIDE_TOTAL.labels(
+                    provider=provider_name, outcome="unset",
+                ).inc()
             return
-        # Rewrite in-place. ``request.model`` is a regular attribute
+        # Hit — rewrite in-place. ``request.model`` is a regular attribute
         # on the Pydantic model; ``LLMClient`` and providers do not
         # mutate the model field after they receive it.
-        request.model = override  # type: ignore[misc]
-        LLM_TENANT_MODEL_OVERRIDE_TOTAL.labels(
-            provider=provider_name, outcome="hit",
-        ).inc()
+        with tracer.start_as_current_span(
+            "llm.override",
+            attributes={
+                "provider_name": provider_name,
+                "outcome": "hit",
+            },
+        ):
+            request.model = override  # type: ignore[misc]
+            LLM_TENANT_MODEL_OVERRIDE_TOTAL.labels(
+                provider=provider_name, outcome="hit",
+            ).inc()
 
 
 __all__ = ["TenantModelOverrideResolver"]
