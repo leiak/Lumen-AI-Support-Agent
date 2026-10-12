@@ -23,6 +23,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from core.database import Base, get_sessionmaker
@@ -93,6 +94,7 @@ class TenantLLMConfigRepository:
         base_url: str | None,
         enabled: bool = True,
         model: str | None = None,
+        session: AsyncSession | None = None,
     ) -> TenantLLMConfig:
         """Insert or update a (tenant_id, provider_name) row.
 
@@ -103,36 +105,52 @@ class TenantLLMConfigRepository:
         default) means "no override; project default applies". Existing
         callers that don't pass ``model`` keep their current behavior
         (NULL column = no override).
+
+        ``session`` (M5.3 Task 2) — when provided, the call uses the
+        caller's session and does NOT commit (caller owns the
+        transaction; the wrapper composes the upsert + audit INSERT
+        into one atomic operation). When ``None`` (default,
+        back-compat for the seed script + existing tests), the call
+        opens its own session and commits at the end.
         """
-        sm = get_sessionmaker()
-        async with sm() as session:
-            stmt = (
-                pg_insert(TenantLLMConfig)
-                .values(
-                    id=new_id(),
-                    tenant_id=tenant_id,
-                    provider_name=provider_name,
-                    encrypted_api_key=encrypted_api_key,
-                    base_url=base_url,
-                    model=model,
-                    enabled=enabled,
-                )
-                .on_conflict_do_update(
-                    constraint="uq_tenant_llm_configs_tenant_provider",
-                    set_={
-                        "encrypted_api_key": encrypted_api_key,
-                        "base_url": base_url,
-                        "model": model,
-                        "enabled": enabled,
-                        "updated_at": func.now(),
-                    },
-                )
-                .returning(TenantLLMConfig)
+        stmt = (
+            pg_insert(TenantLLMConfig)
+            .values(
+                id=new_id(),
+                tenant_id=tenant_id,
+                provider_name=provider_name,
+                encrypted_api_key=encrypted_api_key,
+                base_url=base_url,
+                model=model,
+                enabled=enabled,
             )
+            .on_conflict_do_update(
+                constraint="uq_tenant_llm_configs_tenant_provider",
+                set_={
+                    "encrypted_api_key": encrypted_api_key,
+                    "base_url": base_url,
+                    "model": model,
+                    "enabled": enabled,
+                    "updated_at": func.now(),
+                },
+            )
+            .returning(TenantLLMConfig)
+        )
+        if session is not None:
+            # Caller-managed transaction (e.g. wrapper composing
+            # audit INSERT in the same TX).
             result = await session.execute(stmt)
             row_obj = result.scalar_one()
-            await session.commit()
+            await session.flush()
             await session.refresh(row_obj)
+            return row_obj
+        # Back-compat path: own session + commit.
+        sm = get_sessionmaker()
+        async with sm() as own_session:
+            result = await own_session.execute(stmt)
+            row_obj = result.scalar_one()
+            await own_session.commit()
+            await own_session.refresh(row_obj)
             return row_obj
 
     async def update(
@@ -143,6 +161,7 @@ class TenantLLMConfigRepository:
         enabled: bool | None = None,
         base_url: str | object | None = _UNSET,
         model: str | object | None = _UNSET,
+        session: AsyncSession | None = None,
     ) -> TenantLLMConfig | None:
         """Update mutable sidecar fields without rotating the API key.
 
@@ -154,34 +173,50 @@ class TenantLLMConfigRepository:
         / ``model``). Omitting a field is a no-op; passing ``None`` for
         ``base_url`` / ``model`` clears it. Returns ``None`` if no row
         matches.
+
+        ``session`` (M5.3 Task 2) — when provided, the call uses the
+        caller's session and does NOT commit (wrapper composes the
+        update + audit INSERT in one TX). When ``None`` (default,
+        back-compat), the call opens its own session + commits.
         """
-        sm = get_sessionmaker()
-        async with sm() as session:
-            values: dict[str, object] = {"updated_at": func.now()}
-            if enabled is not None:
-                values["enabled"] = enabled
-            if base_url is not _UNSET:
-                values["base_url"] = base_url  # may be None to clear
-            if model is not _UNSET:
-                values["model"] = model  # may be None to clear
-            stmt = (
-                update(TenantLLMConfig)
-                .where(
-                    TenantLLMConfig.tenant_id == tenant_id,
-                    TenantLLMConfig.provider_name == provider_name,
-                )
-                .values(**values)
-                .returning(TenantLLMConfig)
+        values: dict[str, object] = {"updated_at": func.now()}
+        if enabled is not None:
+            values["enabled"] = enabled
+        if base_url is not _UNSET:
+            values["base_url"] = base_url  # may be None to clear
+        if model is not _UNSET:
+            values["model"] = model  # may be None to clear
+        stmt = (
+            update(TenantLLMConfig)
+            .where(
+                TenantLLMConfig.tenant_id == tenant_id,
+                TenantLLMConfig.provider_name == provider_name,
             )
+            .values(**values)
+            .returning(TenantLLMConfig)
+        )
+        if session is not None:
             result = await session.execute(stmt)
             row_obj = result.scalar_one_or_none()
-            await session.commit()
+            await session.flush()
             if row_obj is not None:
                 await session.refresh(row_obj)
             return row_obj
+        sm = get_sessionmaker()
+        async with sm() as own_session:
+            result = await own_session.execute(stmt)
+            row_obj = result.scalar_one_or_none()
+            await own_session.commit()
+            if row_obj is not None:
+                await own_session.refresh(row_obj)
+            return row_obj
 
     async def delete_by_tenant_provider(
-        self, *, tenant_id: str, provider_name: str,
+        self,
+        *,
+        tenant_id: str,
+        provider_name: str,
+        session: AsyncSession | None = None,
     ) -> bool:
         """Delete the row matching ``(tenant_id, provider_name)``.
 
@@ -189,15 +224,24 @@ class TenantLLMConfigRepository:
         matched (idempotent). Used by the admin SPA's "remove BYOK"
         action — the operator can always re-add the provider with
         POST afterwards.
+
+        ``session`` (M5.3 Task 2) — when provided, uses the caller's
+        session and does NOT commit (wrapper composes the delete +
+        audit INSERT in one TX). When ``None`` (default, back-compat),
+        opens own session + commits.
         """
-        sm = get_sessionmaker()
-        async with sm() as session:
-            stmt = delete(TenantLLMConfig).where(
-                TenantLLMConfig.tenant_id == tenant_id,
-                TenantLLMConfig.provider_name == provider_name,
-            )
+        stmt = delete(TenantLLMConfig).where(
+            TenantLLMConfig.tenant_id == tenant_id,
+            TenantLLMConfig.provider_name == provider_name,
+        )
+        if session is not None:
             result = await session.execute(stmt)
-            await session.commit()
+            await session.flush()
+            return (result.rowcount or 0) > 0
+        sm = get_sessionmaker()
+        async with sm() as own_session:
+            result = await own_session.execute(stmt)
+            await own_session.commit()
             return (result.rowcount or 0) > 0
 
 

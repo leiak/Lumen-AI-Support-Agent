@@ -54,6 +54,98 @@ from llm_client.tenant_fallback_chain_models import (
 from tenant.repository import TenantRepository
 
 
+def _diff_upsert(
+    *,
+    old: TenantLLMConfig | None,
+    payload_model_fields_set: set[str] | None,
+    new_base_url: str | None,
+    new_model: str | None,
+    new_enabled: bool | None,
+    new_api_key_sha256: str | None,
+    old_api_key_sha256: str | None = None,
+) -> list[tuple[str, str | None, str | None]]:
+    """Produce list of (field, old_repr, new_repr) audit tuples.
+
+    Behavior (M5.3 spec §6.5):
+    - POST (insert): ``payload_model_fields_set=None`` → diff all
+      fields. ``old is None``, so every field's old_repr is None
+      (or the literal "sha256:initial" for api_key).
+    - PATCH: ``payload_model_fields_set`` is the set of fields in
+      the payload. Each field is included in the diff ONLY if its
+      new value differs from the DB row's old value.
+    - DELETE is not handled here; wrapper writes ('__deleted__',
+      provider, None) directly.
+
+    ``new_api_key_sha256`` is required on POST (passed by the route
+    layer after computing ``hashlib.sha256(plaintext).hexdigest()``)
+    and is None on PATCH (PATCH never rotates the key).
+
+    ``old_api_key_sha256`` (M5.3 — Task 2 implementation note) is the
+    SHA-256 fingerprint of the previously stored plaintext, fetched
+    by the wrapper from the most recent prior audit row's
+    ``new_value`` (for the same ``(tenant, provider, field=api_key)``).
+    It is optional; when provided AND equal to ``new_api_key_sha256``
+    the helper emits no api_key diff (no-op rotation = no audit
+    row). When omitted, the helper emits unconditionally on POST.
+    """
+    diffs: list[tuple[str, str | None, str | None]] = []
+
+    # --- api_key ---
+    # POST always has a new SHA-256; PATCH never does. On insert, the
+    # old_repr is the sentinel "sha256:initial" (not None — the spec
+    # wants a first-class audit record of the initial key). On
+    # update, the spec (§5.2) lets us record the prior hash when the
+    # wrapper fetched it; if the new hash equals the prior hash the
+    # operator didn't actually rotate and we skip the audit row
+    # entirely (no churn).
+    if new_api_key_sha256 is not None:
+        if old is None:
+            diffs.append(("api_key", "sha256:initial", new_api_key_sha256))
+        elif (
+            old_api_key_sha256 is not None
+            and old_api_key_sha256 == new_api_key_sha256
+        ):
+            # No-op rotation — same plaintext → no diff.
+            pass
+        else:
+            # Real rotation (or no prior hash available for
+            # comparison). When ``old_api_key_sha256`` is None the
+            # auditor can still recover the prior hash by reading
+            # the most recent prior audit row's ``new_value`` for
+            # the same (tenant, provider, field=api_key).
+            diffs.append(
+                ("api_key", old_api_key_sha256, new_api_key_sha256),
+            )
+
+    # --- base_url / model / enabled ---
+    # On POST (fields_set=None) we always include these. On PATCH we
+    # only include fields the operator actually sent.
+    def _maybe(
+        field_name: str,
+        new_value: str | None,
+        old_value: str | None,
+    ) -> None:
+        if payload_model_fields_set is not None and field_name not in payload_model_fields_set:
+            return
+        if old is None:
+            # Insert — every non-key field is "new". The diff is
+            # always written because the value is brand-new (None →
+            # something).
+            diffs.append((field_name, None, new_value))
+        else:
+            if new_value != old_value:
+                diffs.append((field_name, old_value, new_value))
+
+    _maybe("base_url", new_base_url, old.base_url if old else None)
+    _maybe("model", new_model, old.model if old else None)
+    _maybe(
+        "enabled",
+        str(new_enabled) if new_enabled is not None else None,
+        str(old.enabled) if old else None,
+    )
+    return diffs
+
+
 class AdminTenantLLMConfigRepository:
     """Admin-facing wrapper around :class:`TenantLLMConfigRepository`.
 

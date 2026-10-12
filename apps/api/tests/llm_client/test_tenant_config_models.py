@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import delete
 from sqlalchemy.exc import IntegrityError
 
+from core.database import get_sessionmaker
 from core.id_gen import new_id
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import (
@@ -11,6 +13,7 @@ from llm_client.tenant_config_models import (
     TenantLLMConfigRepository,
 )
 from tenant.enums import TenantPlan
+from tenant.models import Tenant
 from tenant.repository import TenantRepository
 
 pytestmark = pytest.mark.integration
@@ -118,3 +121,83 @@ async def test_cascade_delete_with_tenant(cipher: TenantLLMConfigCipher) -> None
         await session.commit()
     rows = await repo.list_by_tenant(tenant.id)
     assert rows == []
+
+
+# --- M5.3 Task 2 back-compat: session=... kwarg is optional ---
+#
+# The inner repo gained an optional ``session: AsyncSession | None`` parameter
+# on its three mutating methods (``upsert`` / ``update`` /
+# ``delete_by_tenant_provider``) so the M5.3 wrapper can compose the
+# configuration mutation + audit INSERT in a single transaction. When
+# ``session`` is omitted (the back-compat branch), the method must keep
+# the old behavior: open its own session and commit at the end. These
+# tests pin that behavior — extend-seed.py + existing callers depend on
+# the None branch.
+
+
+async def test_upsert_without_session_arg_still_works(cipher: TenantLLMConfigCipher) -> None:
+    """M5.3 — inner repo's ``upsert`` must still work when called
+    WITHOUT a session=... kwarg (extend-seed.py + existing tests rely
+    on the back-compat branch)."""
+    tenant = await TenantRepository().create(
+        name="M5.3 back-compat upsert", plan=TenantPlan.PRO,
+    )
+    try:
+        repo = TenantLLMConfigRepository()
+        ciphertext = cipher.encrypt("sk-bc-upsert")
+        row = await repo.upsert(
+            tenant_id=tenant.id,
+            provider_name="minimax",
+            encrypted_api_key=ciphertext,
+            base_url=None,
+            enabled=True,
+        )
+        assert row.tenant_id == tenant.id
+        assert cipher.decrypt(row.encrypted_api_key) == "sk-bc-upsert"
+    finally:
+        async with get_sessionmaker()() as session:
+            await session.execute(delete(Tenant).where(Tenant.id == tenant.id))
+            await session.commit()
+
+
+async def test_update_without_session_arg_still_works(cipher: TenantLLMConfigCipher) -> None:
+    """M5.3 — ``update`` back-compat: no session=... kwarg."""
+    tenant = await TenantRepository().create(
+        name="M5.3 back-compat update", plan=TenantPlan.PRO,
+    )
+    try:
+        repo = TenantLLMConfigRepository()
+        await repo.upsert(
+            tenant_id=tenant.id, provider_name="minimax",
+            encrypted_api_key=cipher.encrypt("sk-bc-upd"),
+            base_url=None, enabled=True,
+        )
+        row = await repo.update(tenant_id=tenant.id, provider_name="minimax", enabled=False)
+        assert row is not None
+        assert row.enabled is False
+    finally:
+        async with get_sessionmaker()() as session:
+            await session.execute(delete(Tenant).where(Tenant.id == tenant.id))
+            await session.commit()
+
+
+async def test_delete_without_session_arg_still_works(cipher: TenantLLMConfigCipher) -> None:
+    """M5.3 — ``delete_by_tenant_provider`` back-compat: no session=... kwarg."""
+    tenant = await TenantRepository().create(
+        name="M5.3 back-compat delete", plan=TenantPlan.PRO,
+    )
+    try:
+        repo = TenantLLMConfigRepository()
+        await repo.upsert(
+            tenant_id=tenant.id, provider_name="minimax",
+            encrypted_api_key=cipher.encrypt("sk-bc-del"),
+            base_url=None, enabled=True,
+        )
+        deleted = await repo.delete_by_tenant_provider(
+            tenant_id=tenant.id, provider_name="minimax",
+        )
+        assert deleted is True
+    finally:
+        async with get_sessionmaker()() as session:
+            await session.execute(delete(Tenant).where(Tenant.id == tenant.id))
+            await session.commit()
