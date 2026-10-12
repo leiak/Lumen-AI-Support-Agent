@@ -26,6 +26,15 @@ vi.mock('@/lib/use-current-user', () => ({
 
 import { useCurrentUser } from '@/lib/use-current-user';
 
+// Default to agent role so the legacy tests in this file keep
+// their ``/api/v1/conversations/inbox`` expectation. The
+// admin-routing tests override this in their own setup.
+vi.mock('@/lib/use-is-admin', () => ({
+  useIsAdmin: vi.fn(),
+}));
+import { useIsAdmin } from '@/lib/use-is-admin';
+const mockedUseIsAdmin = vi.mocked(useIsAdmin);
+
 import type * as ReactRouterDom from 'react-router-dom';
 
 vi.mock('react-router-dom', async () => {
@@ -112,6 +121,10 @@ beforeEach(() => {
   vi.mocked(apiClient.post).mockReset();
   vi.mocked(useCurrentUser).mockReset();
   mockCurrentUser();
+  // Default to agent role so the legacy tests' URL expectation
+  // (``/api/v1/conversations/inbox``) is preserved. Admin-routing
+  // tests override this in their own setup.
+  mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
   FakeWebSocket.instances = [];
   // @ts-expect-error -- install fake WS for the hook.
   globalThis.WebSocket = FakeWebSocket;
@@ -200,5 +213,56 @@ describe('InboxDetailPage', () => {
     const error = await screen.findByTestId('inbox-detail-error');
     expect(error).toHaveTextContent('conversation not found');
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
+  });
+
+  it('admin role fetches detail from the tenant-wide /api/v1/conversations list', async () => {
+    // Regression: before the fix, InboxDetailPage hard-coded the
+    // agent-only ``/api/v1/conversations/inbox`` endpoint, so an
+    // admin who opened any non-assigned conversation from the
+    // "收件箱(全部)" list hit the 404 "conversation not found"
+    // branch even though the row existed on the server.
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
+    vi.mocked(apiClient.get).mockImplementation((url) => {
+      if (typeof url === 'string' && url.endsWith('/messages')) {
+        return Promise.resolve({ data: { items: [] } });
+      }
+      return Promise.resolve({ data: { items: [sampleConversation] } });
+    });
+    renderPage();
+
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/conversations',
+        expect.objectContaining({ params: {} }),
+      ),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations/inbox',
+      expect.anything(),
+    );
+    // And the detail page actually rendered the conversation.
+    expect(await screen.findByTestId('conversation-header')).toBeInTheDocument();
+  });
+
+  it('agent role still fetches detail from /api/v1/conversations/inbox', async () => {
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
+    vi.mocked(apiClient.get).mockImplementation((url) => {
+      if (typeof url === 'string' && url.endsWith('/messages')) {
+        return Promise.resolve({ data: { items: [] } });
+      }
+      return Promise.resolve({ data: { items: [sampleConversation] } });
+    });
+    renderPage();
+
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/conversations/inbox',
+        expect.objectContaining({ params: {} }),
+      ),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations',
+      expect.anything(),
+    );
   });
 });
