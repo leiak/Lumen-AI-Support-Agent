@@ -88,3 +88,28 @@ export async function fetchConversations(
   // as the total so pagination math stays consistent in the UI.
   return { items: parsed.items, total: parsed.items.length };
 }
+
+/**
+ * GET /api/v1/conversations — list ALL conversations in the caller's
+ * tenant (admin/owner only, enforced by ``require_admin`` on the
+ * backend at ``apps/api/src/conversation/api.py``).
+ *
+ * Mirror of :func:`fetchConversations` for the admin/owner role. The
+ * shape is identical so callers can swap implementations behind the
+ * same ``ConversationFilters`` object (the ``InboxPage`` does this
+ * based on ``useIsAdmin()``).
+ */
+export async function fetchAllConversations(
+  filters: ConversationFilters,
+): Promise<ConversationListResponse> {
+  const params: Record<string, string> = {};
+  if (filters.status) {
+    params.status = filters.status;
+  }
+  if (filters.search.trim()) {
+    params.q = filters.search.trim();
+  }
+  const { data } = await apiClient.get('/api/v1/conversations', { params });
+  const parsed = ConversationListSchema.parse(data);
+  return { items: parsed.items, total: parsed.items.length };
+}

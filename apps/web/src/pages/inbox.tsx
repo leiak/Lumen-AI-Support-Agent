@@ -10,10 +10,12 @@ import { ConversationFilters } from '@/components/inbox/conversation-filters';
 import { ConversationRow } from '@/components/inbox/conversation-row';
 import { Pagination } from '@/components/inbox/pagination';
 import {
+  fetchAllConversations,
   fetchConversations,
   type ConversationFilters as ConversationFiltersT,
   type ConversationStatus,
 } from '@/lib/conversations';
+import { useIsAdmin } from '@/lib/use-is-admin';
 
 // Page size for client-side pagination. The inbox endpoint returns the
 // full agent queue in one shot; we slice on the client for now. Matches
@@ -86,6 +88,8 @@ export function InboxPage(): JSX.Element {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  const { isAdmin } = useIsAdmin();
+
   const filters = useMemo<ConversationFiltersT>(
     () => readFiltersFromParams(searchParams),
     [searchParams],
@@ -93,12 +97,20 @@ export function InboxPage(): JSX.Element {
   const page = parsePageParam(searchParams.get('page'));
 
   // Query key encodes every filter so cache partitions cleanly. The
-  // `keepPreviousData` placeholder keeps the previous list visible while
-  // the new filter set is fetching — feels faster for typing in the
-  // search box.
+  // ``isAdmin`` segment is part of the key so flipping the role (e.g.
+  // after a re-login) doesn't surface the wrong role's cached page.
+  // The ``keepPreviousData`` placeholder keeps the previous list
+  // visible while the new filter set is fetching — feels faster for
+  // typing in the search box.
   const query = useQuery({
-    queryKey: [...QUERY_KEY, filters.status ?? 'all', filters.search.trim()],
-    queryFn: () => fetchConversations(filters),
+    queryKey: [
+      ...QUERY_KEY,
+      isAdmin ? 'admin' : 'agent',
+      filters.status ?? 'all',
+      filters.search.trim(),
+    ],
+    queryFn: () =>
+      isAdmin ? fetchAllConversations(filters) : fetchConversations(filters),
     placeholderData: (previous) => previous,
   });
 
@@ -145,7 +157,9 @@ export function InboxPage(): JSX.Element {
       <div className="flex flex-1 flex-col overflow-hidden">
         <Card className="m-4 flex flex-1 flex-col overflow-hidden">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-lg">收件箱</CardTitle>
+            <CardTitle className="text-lg">
+              {isAdmin ? '收件箱(全部)' : '收件箱'}
+            </CardTitle>
             <Button
               type="button"
               size="sm"
@@ -206,7 +220,11 @@ export function InboxPage(): JSX.Element {
                 data-testid="inbox-empty"
               >
                 <p className="text-base text-foreground">暂无会话</p>
-                <p>当前筛选条件下没有匹配的会话。</p>
+                <p>
+                  {isAdmin
+                    ? '当前筛选条件下没有匹配的会话。'
+                    : '当前筛选条件下没有分配给您的会话。'}
+                </p>
               </div>
             ) : (
               <div className="flex-1 overflow-auto" data-testid="inbox-list">

@@ -7,6 +7,7 @@ import { AxiosError } from 'axios';
 
 import { apiClient, JWT_STORAGE_KEY } from '@/lib/api-client';
 import { InboxPage } from '@/pages/inbox';
+import { useIsAdmin } from '@/lib/use-is-admin';
 import type * as ApiClient from '@/lib/api-client';
 
 // Mock the api-client module so the page never touches a real network.
@@ -20,6 +21,14 @@ vi.mock('@/lib/api-client', async () => {
     },
   };
 });
+
+// Default to agent role so the legacy tests in this file keep the
+// "calls /api/v1/conversations/inbox" expectation. Tests that need
+// the admin path override this in ``beforeEach`` / per-test.
+vi.mock('@/lib/use-is-admin', () => ({
+  useIsAdmin: vi.fn(),
+}));
+const mockedUseIsAdmin = vi.mocked(useIsAdmin);
 
 // Stub navigate so row-click assertions can verify routing.
 import type * as ReactRouterDom from 'react-router-dom';
@@ -78,6 +87,10 @@ beforeEach(() => {
   vi.mocked(apiClient.get).mockReset();
   // Silence "not implemented" warnings from the navigate mock.
   vi.mocked(useNavigate).mockReturnValue(vi.fn());
+  // Default to agent role — keeps the legacy tests' URL expectation
+  // (``/api/v1/conversations/inbox``) intact. Admin-routing tests
+  // override this in their own setup.
+  mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
 });
 
 afterEach(() => {
@@ -191,5 +204,57 @@ describe('InboxPage', () => {
         expect.objectContaining({ params: { q: 'customer-9' } }),
       ),
     );
+  });
+
+  it('admin role calls /api/v1/conversations (not /inbox)', async () => {
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { items: [sampleConversation] },
+    });
+
+    renderInbox();
+
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/conversations',
+        expect.objectContaining({ params: {} }),
+      ),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations/inbox',
+      expect.anything(),
+    );
+  });
+
+  it('agent role still calls /api/v1/conversations/inbox', async () => {
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
+    vi.mocked(apiClient.get).mockResolvedValue({
+      data: { items: [sampleConversation] },
+    });
+
+    renderInbox();
+
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        '/api/v1/conversations/inbox',
+        expect.objectContaining({ params: {} }),
+      ),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations',
+      expect.anything(),
+    );
+  });
+
+  it('admin role shows the "收件箱(全部)" title and admin empty-state copy', async () => {
+    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
+    vi.mocked(apiClient.get).mockResolvedValue({ data: { items: [] } });
+
+    renderInbox();
+
+    expect(await screen.findByText('收件箱(全部)')).toBeInTheDocument();
+    expect(
+      await screen.findByText('当前筛选条件下没有匹配的会话。'),
+    ).toBeInTheDocument();
   });
 });
