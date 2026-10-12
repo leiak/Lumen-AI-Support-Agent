@@ -74,6 +74,7 @@ from llm_client.exceptions import (
     ProviderUnavailable,
     RateLimited,
 )
+from observability.worker_context import job_span
 from qa.judge import JudgeClient, JudgeFailure, JudgeInput
 from qa.repository import QaScoreRepository
 from ticket.enums import TicketStatus
@@ -153,6 +154,25 @@ async def qa_judge_task(ctx: dict[str, Any], message_id: str) -> None:
     The ``rationale`` is PII-adjacent (the Judge's free-text
     explanation may quote the conversation turn) — it goes to the DB
     row for admin audit, NOT to the worker logs.
+    """
+    # M6.5 — wrap the worker body in ``job_span`` so the worker's
+    # spans are children of the HTTP request that enqueued this job.
+    # ``ctx`` is the merged Arq context: it includes the worker-level
+    # keys (judge_client, redis, …) AND the ``job_ctx`` we injected at
+    # enqueue time (traceparent, tracestate). ``job_try`` is the Arq
+    # attempt counter; default 1 for first-try jobs.
+    with job_span(
+        "qa_judge",
+        ctx,
+        attempt=int(ctx.get("job_try", 1) or 1),
+    ):
+        await _qa_judge_task_impl(ctx, message_id)
+
+
+async def _qa_judge_task_impl(ctx: dict[str, Any], message_id: str) -> None:
+    """Body of :func:`qa_judge_task`, split out so M6.5's ``job_span``
+    wrapper doesn't trigger a span-around-try anti-pattern. The
+    original algorithm and exception-swallow contract are unchanged.
     """
     judge: JudgeClient = ctx["judge_client"]
 
@@ -394,7 +414,24 @@ async def budget_cleanup_task(ctx: dict[str, Any]) -> None:
     The task wrapper exists so the arq ``cron_jobs`` registration has
     a stable import path; the cleanup logic lives in ``budget.cleanup``
     so admin/CLI tooling can also trigger it directly.
+
+    M6.5 — the body is wrapped in ``job_span`` so cron invocations
+    emit a ``worker.budget_cleanup`` span. Cron jobs don't have an
+    upstream enqueuing HTTP request, so the span is a root (no
+    parent); this is still useful for correlating the metric + log
+    line with a trace.
     """
+    with job_span(
+        "budget_cleanup",
+        ctx,
+        attempt=int(ctx.get("job_try", 1) or 1),
+    ):
+        await _budget_cleanup_task_impl(ctx)
+
+
+async def _budget_cleanup_task_impl(ctx: dict[str, Any]) -> None:
+    """Body of :func:`budget_cleanup_task`, split out so M6.5's
+    ``job_span`` wrapper sits cleanly above the actual work."""
     stats = await run_budget_cleanup()
     log.info(
         "qa.budget_cleanup.completed",

@@ -30,10 +30,11 @@ from agent.simple_responder import SimpleResponder
 from channel.messages import MessageEnvelope
 from conversation.enums import ConversationStatus, MessageRole
 from conversation.service import ConversationService
+from observability import tracer
+from observability.worker_context import enqueue_with_trace
 from qa.worker import build_arq_redis
 from ticket.repository import TicketRepository
 from ticket.service import TicketService
-from observability import tracer
 
 
 def _build_ticket_service_factory() -> Callable[..., TicketService]:
@@ -244,7 +245,16 @@ async def _enqueue_qa_judge(*, message_id: str, tenant_id: str) -> None:
         )
         return
     try:
-        await arq_redis.enqueue_job("qa_judge_task", message_id)
+        # M6.5 — inject the current trace context into job_ctx so the
+        # worker's spans are children of this inbound request's trace.
+        # ``enqueue_with_trace`` is async (arq's ``enqueue_job`` is
+        # async), and it preserves any pre-existing keys in job_ctx.
+        await enqueue_with_trace(
+            arq_redis,
+            "qa_judge_task",
+            job_ctx=None,
+            message_id=message_id,
+        )
     except Exception as exc:
         logger.warning(
             "channel inbound: QA enqueue failed",
