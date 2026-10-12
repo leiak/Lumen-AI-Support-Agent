@@ -129,6 +129,19 @@ LLM_TENANT_FALLBACK_CHAIN_TOTAL = Counter(
     ("outcome",),
 )
 
+# M5.2 — per-tenant model override observability.
+#
+# Zero-label by design; tenant_id stays in logs only. outcome ∈
+# {hit, miss, unset} where:
+#   hit   — resolver rewrote request.model to the tenant override
+#   miss  — resolver looked up an override but found None (back-compat)
+#   unset — no override configured for the resolved provider
+LLM_TENANT_MODEL_OVERRIDE_TOTAL = Counter(
+    "lumen_llm_tenant_model_override_total",
+    "Per-tenant model override outcomes, by provider.",
+    ("provider", "outcome"),
+)
+
 
 # Nitpick S2 — rate-limit fail-open observability.
 #
@@ -201,6 +214,7 @@ __all__ = [
     "LLM_TENANT_BUDGET_SOFT_WARN_TOTAL",
     "LLM_TENANT_FALLBACK_CHAIN_TOTAL",
     "LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL",
+    "LLM_TENANT_MODEL_OVERRIDE_TOTAL",
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",
     "LUMEN_QA_FLAGGED",
