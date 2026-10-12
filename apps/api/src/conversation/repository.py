@@ -245,6 +245,48 @@ class ConversationRepository:
         result = await session.execute(stmt)
         return result.rowcount > 0
 
+    async def count_open_pending_per_agent(
+        self,
+        *,
+        tenant_id: str,
+        candidate_ids: list[str],
+    ) -> dict[str, int]:
+        """Return ``{agent_id: load}`` for the given candidate agent ids.
+
+        ``load`` is the count of OPEN + PENDING conversations
+        currently assigned to that agent. Closed conversations are
+        excluded — they shouldn't bias routing decisions for
+        fresh inbound traffic.
+
+        Empty ``candidate_ids`` returns an empty dict (no SQL issued).
+        Agents in the candidate set with zero open + pending
+        conversations appear in the result as ``0`` so the
+        strategy layer can do a simple ``min(load)`` without
+        re-querying.
+        """
+        if not candidate_ids:
+            return {}
+        async with get_session() as session:
+            stmt = (
+                select(
+                    Conversation.assigned_agent_id,
+                    func.count().label("load"),
+                )
+                .where(
+                    Conversation.tenant_id == tenant_id,
+                    Conversation.assigned_agent_id.in_(candidate_ids),
+                    Conversation.status.in_(
+                        [ConversationStatus.OPEN, ConversationStatus.PENDING]
+                    ),
+                )
+                .group_by(Conversation.assigned_agent_id)
+            )
+            result = await session.execute(stmt)
+            found = {row[0]: int(row[1]) for row in result.all()}
+        # Make sure every candidate appears, even at 0 load, so the
+        # strategy layer doesn't need to seed defaults itself.
+        return {aid: found.get(aid, 0) for aid in candidate_ids}
+
     async def get_by_id_for_update(
         self,
         *,
