@@ -266,6 +266,29 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 `images/admin_pages/` 下 17 张 SPA 截图,以 admin (`admin@example.com` / `Demo123!`) 登录后抓取,
 覆盖全部 12 个 admin 页面 + 5 个通用页面。Playwright 脚本:[`images/shot_all_admin_pages.py`](images/shot_all_admin_pages.py)。
 
+**主要功能预览** — 核心 6 张直接渲染在 README:
+
+#### 收件箱 — AI 失败后自动进入待分配队列
+![收件箱](images/admin_pages/01_inbox.png)
+
+#### 租户设置 — 自动分配策略(least-busy,见 Row 30)
+![租户设置](images/admin_pages/19_admin_tenant_settings.png)
+
+#### LLM 链路 — per-tenant fallback chain (M5.1)
+![LLM 链路](images/admin_pages/16_admin_llm_chain.png)
+
+#### LLM 配置 — per-tenant model override (M5.2) + audit log
+![LLM 配置](images/admin_pages/17_admin_llm_configs.png)
+
+#### 预算 — token 硬上限 + 软告警 (M4.D)
+![预算](images/admin_pages/12_admin_budget.png)
+
+#### 工单详情 — SLA timer + 状态机 (M2.A / Stage 13)
+![工单详情](images/admin_pages/14_admin_ticket_detail.png)
+
+<details>
+<summary>完整 17 张索引(展开)</summary>
+
 | 截图 | 说明 |
 |---|---|
 | [`admin_pages/01_inbox.png`](images/admin_pages/01_inbox.png) | 收件箱 — 6 条会话,3 条 "未分配"(auto-assign 策略待启用) |
@@ -287,6 +310,7 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 | [`admin_pages/21_admin_search.png`](images/admin_pages/21_admin_search.png) | 跨租户搜索 — 全文检索 KB / 工单 / 会话 |
 
 复现:登录后跑 `python images/shot_all_admin_pages.py` 即可重新生成全部 17 张。
+</details>
 
 ## 关键设计
 
