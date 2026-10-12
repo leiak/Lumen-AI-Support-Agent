@@ -19,7 +19,7 @@ exporters:
   otlp/tempo:
     endpoint: tempo:4317
     tls:
-      secure: true
+      insecure: true
 
 service:
   pipelines:

@@ -9,7 +9,7 @@ server:
 distributor:
   receivers:
     otlp:
-      protocol:
+      protocols:
         grpc:
           endpoint: 0.0.0.0:4317
 
