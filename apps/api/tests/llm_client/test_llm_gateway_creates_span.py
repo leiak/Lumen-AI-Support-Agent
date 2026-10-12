@@ -354,6 +354,378 @@ async def test_resolve_span_emitted_when_using_tenant_resolver(
     await g.aclose_all()
 
 
+# ---------------------------------------------------------------------------
+# M6.3 fix — TenantResolverSpan wrapper wired into _raise_or_return
+# ---------------------------------------------------------------------------
+# The tests below exercise the production-wiring fix: ``_raise_or_return``
+# now wraps the (possibly model-override-wrapped) resolver in
+# :class:`TenantResolverSpan` so the ``llm.resolve`` span fires on every
+# LLM request in production. The earlier ``TenantResolver`` class above
+# is the historical (now-deprecated) implementation that was never
+# instantiated in production.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_resolve_span_unit_emits_on_sync_call(
+    memory_exporter: Any,
+) -> None:
+    """Unit: ``TenantResolverSpan.__call__`` emits a ``llm.resolve`` span.
+
+    Synchronous path used by ``LLMClient._chat_with_retry`` for
+    single-provider / non-fallback tenants. After delegation the span
+    has both ``tenant_id`` (set at start) and ``provider_name`` (set
+    after delegation).
+    """
+    from unittest.mock import MagicMock
+
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    provider = MagicMock()
+    provider.name = "anthropic"
+    span_wrapper = TenantResolverSpan(
+        inner=lambda req: provider,
+        tenant_id="t-unit-call",
+    )
+
+    req = _chat_request()
+    out = span_wrapper(req)
+    assert out is provider
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-unit-call"
+    assert attrs.get("provider_name") == "anthropic"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resolve_span_unit_emits_on_ainvoke_with_inner_ainvoke(
+    memory_exporter: Any,
+) -> None:
+    """Unit: ``TenantResolverSpan.ainvoke`` delegates to ``inner.ainvoke``.
+
+    The inner here exposes ``ainvoke`` (the typical
+    :class:`FallbackResolver` / :class:`TenantModelOverrideResolver`
+    shape). The span fires once and carries ``tenant_id``. ``provider_name``
+    is NOT set on the ainvoke path because the inner returns a
+    ``ChatResponse`` (not a provider) — the upstream ``llm.chat`` span
+    carries the resolved provider name.
+    """
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    class _Inner:
+        def __call__(self, request: Any) -> Any:
+            return None  # pragma: no cover - ainvoke path used
+
+        async def ainvoke(self, request: Any) -> Any:
+            # Return a ChatResponse-like (no ``.name`` attribute) so
+            # ``provider_name`` is left unset on the ainvoke path.
+            return _chat_request()  # ChatRequest has no .name attr
+
+    span_wrapper = TenantResolverSpan(
+        inner=_Inner(),
+        tenant_id="t-unit-ainvoke",
+    )
+    out = await span_wrapper.ainvoke(_chat_request())
+    assert out is not None  # whatever ChatRequest-like was returned
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-unit-ainvoke"
+    # provider_name is unset because inner.ainvoke returned a non-provider.
+    assert "provider_name" not in attrs
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_resolve_span_unit_ainvoke_falls_back_when_inner_lacks_ainvoke(
+    memory_exporter: Any,
+) -> None:
+    """Unit: when inner has no ``ainvoke``, ``TenantResolverSpan.ainvoke``
+    falls back to sync ``__call__`` and still emits one ``llm.resolve`` span.
+
+    This is the single-provider shape (``_PrefixResolver``) — the span
+    fires once with ``tenant_id`` + ``provider_name`` set after
+    delegation.
+    """
+    from unittest.mock import MagicMock
+
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    provider = MagicMock()
+    provider.name = "minimax"
+
+    class _Inner:
+        def __call__(self, request: Any) -> Any:
+            return provider
+
+    span_wrapper = TenantResolverSpan(
+        inner=_Inner(),
+        tenant_id="t-unit-fallback",
+    )
+    out = await span_wrapper.ainvoke(_chat_request())
+    assert out is provider
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-unit-fallback"
+    assert attrs.get("provider_name") == "minimax"
+
+
+@pytest.mark.integration
+def test_resolve_span_unit_provider_name_fallback_when_unknown(
+    memory_exporter: Any,
+) -> None:
+    """Unit: when the inner returns something with no ``.name`` attribute
+    the span still fires with ``provider_name="<unknown>"`` (defensive
+    for mock providers in tests)."""
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    # Inner returns a bare object (no .name attribute) — simulates a
+    # mock provider that hasn't set up .name.
+    bare = object()
+    span_wrapper = TenantResolverSpan(
+        inner=lambda req: bare,
+        tenant_id="t-unit-unknown",
+    )
+    out = span_wrapper(_chat_request())
+    assert out is bare
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-unit-unknown"
+    assert attrs.get("provider_name") == "<unknown>"
+
+
+@pytest.mark.integration
+def test_resolve_span_fires_via_raise_or_return(
+    memory_exporter: Any,
+) -> None:
+    """Integration: ``_raise_or_return`` wraps the resolver in
+    :class:`TenantResolverSpan` so the ``llm.resolve`` span fires on
+    every call. The production-wiring test.
+
+    No model-override rows in the input — the wrap happens
+    unconditionally, not gated on overrides existing.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    provider = MagicMock()
+    provider.name = "anthropic"
+    provider.aclose = AsyncMock()  # type: ignore[attr-defined]
+    cache = TenantLLMConfigCache(ttl_s=60.0, maxsize=16)
+    # ``_raise_or_return`` constructs the inner gateway from ``providers``
+    # — passing our mock directly. ``rows=None`` means no model-override
+    # wrap (the M5.2 conditional skip). The new M6.3 wrap still fires.
+    resolver = cache._raise_or_return(
+        tenant_id="t-m6-3",
+        providers={"anthropic": provider},
+        rows=None,
+    )
+
+    # Verify the resolver IS wrapped in TenantResolverSpan.
+    assert isinstance(resolver, TenantResolverSpan), (
+        f"expected TenantResolverSpan wrap, got {type(resolver).__name__}"
+    )
+
+    # Calling the resolver triggers a ``llm.resolve`` span.
+    out = resolver(_chat_request())
+    assert out is provider
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1, (
+        f"expected 1 llm.resolve span, got "
+        f"{[s.name for s in memory_exporter.get_finished_spans()]}"
+    )
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-m6-3"
+    assert attrs.get("provider_name") == "anthropic"
+
+
+@pytest.mark.integration
+def test_resolve_span_emitted_even_without_model_overrides(
+    memory_exporter: Any,
+) -> None:
+    """Integration: span fires when ``rows`` is ``None`` (no model
+    overrides configured for the tenant). Verifies the wrap is
+    unconditional, not gated on M5.2's model-override conditional."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    provider = MagicMock()
+    provider.name = "minimax"
+    provider.aclose = AsyncMock()  # type: ignore[attr-defined]
+    cache = TenantLLMConfigCache(ttl_s=60.0, maxsize=16)
+    # rows=[] (empty) — same effect as rows=None for the M5.2 wrap
+    # condition (empty overrides dict → no model-override wrap), but
+    # the M6.3 wrap still fires.
+    resolver = cache._raise_or_return(
+        tenant_id="t-m6-3-empty-rows",
+        providers={"minimax": provider},
+        rows=[],
+    )
+
+    assert isinstance(resolver, TenantResolverSpan)
+    out = resolver(_chat_request())
+    assert out is provider
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-m6-3-empty-rows"
+    assert attrs.get("provider_name") == "minimax"
+
+
+@pytest.mark.integration
+def test_resolve_span_fires_alongside_model_override_wrapper(
+    memory_exporter: Any,
+) -> None:
+    """Integration: when model overrides are configured, BOTH spans
+    fire on a single call — ``llm.resolve`` (outer) and ``llm.override``
+    (inner, from the M5.2 wrapper). The two wrappers compose
+    transparently."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_client.tenant_model_override_resolver import (
+        TenantModelOverrideResolver,
+    )
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
+    provider = MagicMock()
+    provider.name = "anthropic"
+    provider.aclose = AsyncMock()  # type: ignore[attr-defined]
+    cache = TenantLLMConfigCache(ttl_s=60.0, maxsize=16)
+
+    # Build a row with ``model`` set so the M5.2 wrap kicks in.
+    row = MagicMock()
+    row.provider_name = "anthropic"
+    row.enabled = True
+    row.model = "claude-haiku-4-5"
+
+    resolver = cache._raise_or_return(
+        tenant_id="t-m6-3-override",
+        providers={"anthropic": provider},
+        rows=[row],
+    )
+
+    # Layered wrap: TenantResolverSpan(TenantModelOverrideResolver(gateway)).
+    assert isinstance(resolver, TenantResolverSpan)
+    assert isinstance(resolver._inner, TenantModelOverrideResolver)
+
+    # Calling the resolver triggers BOTH spans on a single request:
+    # llm.resolve fires on the outer wrapper; llm.override fires on the
+    # inner wrapper's _maybe_rewrite.
+    resolver(_chat_request())
+
+    spans = memory_exporter.get_finished_spans()
+    resolve_spans = [s for s in spans if s.name == "llm.resolve"]
+    override_spans = [s for s in spans if s.name == "llm.override"]
+    assert len(resolve_spans) == 1, (
+        f"expected 1 llm.resolve, got span names={[s.name for s in spans]}"
+    )
+    assert len(override_spans) == 1, (
+        f"expected 1 llm.override, got span names={[s.name for s in spans]}"
+    )
+    assert dict(resolve_spans[0].attributes or {}).get("tenant_id") == "t-m6-3-override"
+    assert dict(override_spans[0].attributes or {}).get("outcome") == "hit"
+
+
+@pytest.mark.integration
+def test_resolve_span_carries_tenant_id_attribute(
+    memory_exporter: Any,
+) -> None:
+    """Integration: the ``llm.resolve`` span carries the tenant_id
+    attribute set to the value passed into ``_raise_or_return``."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+
+    provider = MagicMock()
+    provider.name = "anthropic"
+    provider.aclose = AsyncMock()  # type: ignore[attr-defined]
+    cache = TenantLLMConfigCache(ttl_s=60.0, maxsize=16)
+    resolver = cache._raise_or_return(
+        tenant_id="t-tenant-id-check",
+        providers={"anthropic": provider},
+        rows=None,
+    )
+
+    resolver(_chat_request())
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("tenant_id") == "t-tenant-id-check", (
+        f"tenant_id attribute missing or wrong: {attrs!r}"
+    )
+
+
+@pytest.mark.integration
+def test_resolve_span_carries_provider_name_attribute(
+    memory_exporter: Any,
+) -> None:
+    """Integration: the ``llm.resolve`` span carries the ``provider_name``
+    attribute set AFTER delegation — the inner resolver picks the
+    provider, we read its ``.name``, and set the span attribute."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+
+    provider = MagicMock()
+    provider.name = "openai"
+    provider.aclose = AsyncMock()  # type: ignore[attr-defined]
+    cache = TenantLLMConfigCache(ttl_s=60.0, maxsize=16)
+    resolver = cache._raise_or_return(
+        tenant_id="t-provider-name-check",
+        providers={"openai": provider},
+        rows=None,
+    )
+
+    resolver(_chat_request(model="gpt-4o-mini"))
+
+    resolve_spans = [
+        s for s in memory_exporter.get_finished_spans()
+        if s.name == "llm.resolve"
+    ]
+    assert len(resolve_spans) == 1
+    attrs = dict(resolve_spans[0].attributes or {})
+    assert attrs.get("provider_name") == "openai", (
+        f"provider_name attribute missing or wrong: {attrs!r}"
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_override_span_emitted_on_model_rewrite(

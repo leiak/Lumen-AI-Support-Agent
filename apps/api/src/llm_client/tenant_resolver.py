@@ -452,6 +452,20 @@ class TenantLLMConfigCache:
                     inner=resolver,
                     overrides=overrides,
                 )
+        # M6.3 — ALWAYS wrap the resolver (with or without model overrides)
+        # in :class:`TenantResolverSpan` so the ``llm.resolve`` span fires
+        # on every LLM request in production. Previously this was attempted
+        # via the (dead-code) ``TenantResolver`` class below; the cache
+        # returned ``gateway.default_resolver`` directly without ever
+        # instantiating it. The wrapper here is the production realisation
+        # of the same idea — much smaller, single responsibility, and
+        # unconditional. Mirrors the wrap pattern above.
+        from llm_client.tenant_resolver_span import TenantResolverSpan
+
+        resolver = TenantResolverSpan(
+            inner=resolver,
+            tenant_id=tenant_id,
+        )
         self.put(tenant_id, resolver)
         return resolver
 
@@ -495,7 +509,11 @@ async def build_tenant_resolver(
 
 
 class TenantResolver:
-    """Per-tenant resolver that satisfies the M4.A Resolver + M4.B ainvoke seam.
+    """DEPRECATED — kept for backward compatibility with callers that
+    construct it directly (e.g. tests). Production goes through
+    :class:`TenantResolverSpan` instead (M6.3 follow-up).
+
+    Per-tenant resolver that satisfies the M4.A Resolver + M4.B ainvoke seam.
 
     Built by :func:`build_tenant_resolver` once per (tenant, cache-miss)
     cycle. ``__call__`` returns the inner gateway's primary provider
@@ -507,6 +525,16 @@ class TenantResolver:
     span. The span attributes ``tenant_id`` and ``provider_name`` are on
     the PII whitelist. ``provider_name`` is set after delegation (we
     don't know which provider the inner gateway picked until we ask).
+
+    Why this class is not used in production: ``_raise_or_return`` (the
+    method that builds resolvers for tenants) used to return
+    ``TenantResolver(gateway=...)`` but now returns
+    ``TenantResolverSpan(inner=gateway.default_resolver, tenant_id=...)``
+    (M6.3 fix). Direct callers (e.g. ``test_resolve_span_emitted_when_using_tenant_resolver``
+    in ``tests/llm_client/test_llm_gateway_creates_span.py``) still work —
+    this class is structurally equivalent to wrapping the gateway
+    resolver in a span emitter, just done in a heavier class. New code
+    should construct :class:`TenantResolverSpan` directly.
     """
 
     def __init__(self, *, gateway: LLMGateway, tenant_id: str | None = None) -> None:

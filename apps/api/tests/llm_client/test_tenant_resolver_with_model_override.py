@@ -166,13 +166,25 @@ async def test_no_wrap_when_model_is_null(
     """model=None → resolver is NOT wrapped with TenantModelOverrideResolver.
 
     Pre-M5.2 behavior must be preserved when no row has a model override.
+    M6.3 adds a ``TenantResolverSpan`` outer wrap unconditionally, so
+    the assertion now checks the INNER resolver (which would be a
+    plain ``_PrefixResolver`` / ``FallbackResolver`` in this case).
     """
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
     tenant, _row = await tenant_with_optional_model(model=None)
     resolver = await build_tenant_resolver(tenant.id, cache=fresh_cache)
 
-    assert not isinstance(resolver, TenantModelOverrideResolver), (
-        "expected plain gateway resolver when no model override is set, "
+    # Outer is always TenantResolverSpan (M6.3); the inner must NOT be
+    # TenantModelOverrideResolver when no row has a model override.
+    assert isinstance(resolver, TenantResolverSpan), (
+        "expected TenantResolverSpan outer wrap (M6.3), "
         f"got {type(resolver).__name__}"
+    )
+    assert not isinstance(resolver._inner, TenantModelOverrideResolver), (
+        "expected plain gateway resolver inside the span wrap when no "
+        "model override is set, "
+        f"got inner={type(resolver._inner).__name__}"
     )
 
 
@@ -182,15 +194,28 @@ async def test_wrap_when_model_is_set(
     tenant_with_optional_model,
     fresh_cache: TenantLLMConfigCache,
 ) -> None:
-    """model set → resolver IS wrapped; overrides dict has the override."""
+    """model set → resolver IS wrapped; overrides dict has the override.
+
+    M6.3 fix: the resolver is now layered as
+    ``TenantResolverSpan(TenantModelOverrideResolver(gateway.default_resolver))``
+    so the ``llm.resolve`` span fires in production. The M5.2 wrapper
+    is still present as the INNER — we check ``resolver._inner`` for
+    the override dict.
+    """
+    from llm_client.tenant_resolver_span import TenantResolverSpan
+
     tenant, _row = await tenant_with_optional_model(model="claude-haiku-4-5")
     resolver = await build_tenant_resolver(tenant.id, cache=fresh_cache)
 
-    assert isinstance(resolver, TenantModelOverrideResolver), (
-        "expected TenantModelOverrideResolver when model is set, "
+    assert isinstance(resolver, TenantResolverSpan), (
+        "expected TenantResolverSpan outer wrap (M6.3), "
         f"got {type(resolver).__name__}"
     )
-    assert resolver._overrides == {"anthropic": "claude-haiku-4-5"}
+    assert isinstance(resolver._inner, TenantModelOverrideResolver), (
+        "expected TenantModelOverrideResolver inner wrap when model is set, "
+        f"got {type(resolver._inner).__name__}"
+    )
+    assert resolver._inner._overrides == {"anthropic": "claude-haiku-4-5"}
 
 
 @pytest.mark.integration
@@ -230,8 +255,13 @@ async def test_wrap_with_multiple_providers_partial_overrides(
 
         resolver = await build_tenant_resolver(tenant.id, cache=fresh_cache)
 
-        assert isinstance(resolver, TenantModelOverrideResolver)
-        assert resolver._overrides == {"anthropic": "claude-haiku-4-5"}, (
+        # M6.3 — outer wrap is TenantResolverSpan; the model-override
+        # wrap is now nested inside (resolver._inner).
+        from llm_client.tenant_resolver_span import TenantResolverSpan
+
+        assert isinstance(resolver, TenantResolverSpan)
+        assert isinstance(resolver._inner, TenantModelOverrideResolver)
+        assert resolver._inner._overrides == {"anthropic": "claude-haiku-4-5"}, (
             "openai should NOT appear in overrides because its row.model is None"
         )
     finally:
@@ -292,9 +322,11 @@ async def test_disabled_rows_excluded_from_overrides(
         # The only enabled row has model=None, so overrides is empty
         # → no wrap. If the disabled row leaked into the dict, the
         # wrapper would be installed with anthropic→claude-haiku-4-5.
-        assert not isinstance(resolver, TenantModelOverrideResolver), (
+        # M6.3 — outer is TenantResolverSpan; check the inner for
+        # the absence of TenantModelOverrideResolver.
+        assert not isinstance(resolver._inner, TenantModelOverrideResolver), (
             "disabled row must not contribute to overrides dict; "
-            f"got {type(resolver).__name__}"
+            f"got inner={type(resolver._inner).__name__}"
         )
     finally:
         sm = get_sessionmaker()
@@ -345,10 +377,16 @@ async def test_per_tenant_overrides_isolated(
         resolver_a = await build_tenant_resolver(tenant_a.id, cache=fresh_cache)
         resolver_b = await build_tenant_resolver(tenant_b.id, cache=fresh_cache)
 
-        assert isinstance(resolver_a, TenantModelOverrideResolver)
-        assert isinstance(resolver_b, TenantModelOverrideResolver)
-        assert resolver_a._overrides == {"anthropic": "claude-haiku-4-5"}
-        assert resolver_b._overrides == {"anthropic": "claude-sonnet-4-5"}
+        # M6.3 — outer wrap is TenantResolverSpan; the model-override
+        # wrap is nested inside (resolver._inner).
+        from llm_client.tenant_resolver_span import TenantResolverSpan
+
+        assert isinstance(resolver_a, TenantResolverSpan)
+        assert isinstance(resolver_b, TenantResolverSpan)
+        assert isinstance(resolver_a._inner, TenantModelOverrideResolver)
+        assert isinstance(resolver_b._inner, TenantModelOverrideResolver)
+        assert resolver_a._inner._overrides == {"anthropic": "claude-haiku-4-5"}
+        assert resolver_b._inner._overrides == {"anthropic": "claude-sonnet-4-5"}
         # Sanity: the two resolvers are distinct objects (no aliasing).
         assert resolver_a is not resolver_b
     finally:
