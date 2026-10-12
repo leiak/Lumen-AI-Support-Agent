@@ -21,22 +21,45 @@ logger = logging.getLogger(__name__)
 class WebWidgetAdapter:
     channel_type = ChannelType.WEB
 
-    async def parse_inbound(self, *, raw: dict[str, Any], channel: Channel) -> MessageEnvelope:
+    async def parse_inbound(
+        self,
+        *,
+        raw: dict[str, Any],
+        channel: Channel,
+        external_user_id: str | None = None,
+    ) -> MessageEnvelope:
         """Convert a widget frame into our MessageEnvelope.
 
         Defensive on frame_type — only ``message`` frames carry text. ``typing``
         and other frames yield an empty text envelope so downstream code can
         handle them uniformly without crashing.
+
+        ``external_user_id`` is the JWT-authenticated ``sub`` claim from the
+        WS connection — passed by the router, NOT trusted from the client
+        frame. The router value wins; ``raw.get("external_user_id")`` is
+        treated as a legacy fallback so old clients / tests that still send
+        the field don't silently degrade to the empty-string default (which
+        would collide every visitor into a single conversation — privacy hole
+        documented as Explore #1).
         """
         frame_type = raw.get("type", "")
         text = raw.get("text", "") if frame_type == "message" else ""
+        # Router-passed value (JWT sub) takes precedence over any client claim.
+        # Empty-string-from-JWT is rejected upstream by the router's
+        # `payload.get("sub")` validation, so an authenticated call always
+        # carries a non-empty ``external_user_id`` here.
+        resolved_user_id = (
+            external_user_id
+            if external_user_id
+            else raw.get("external_user_id", "")
+        )
         return MessageEnvelope(
             envelope_id=new_id(),
             tenant_id=channel.tenant_id,
             channel_type=ChannelType.WEB,
             channel_id=channel.id,
             external_conversation_id=raw.get("conversation_id", ""),
-            external_user_id=raw.get("external_user_id", ""),
+            external_user_id=resolved_user_id,
             external_message_id=raw.get("client_message_id", ""),
             text=text,
             attachments=[],

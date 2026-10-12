@@ -55,6 +55,54 @@ async def test_parse_unknown_frame_does_not_crash() -> None:
 
 
 @pytest.mark.asyncio
+async def test_parse_message_with_router_user_id_uses_jwt_sub() -> None:
+    """Regression test for Explore #1.
+
+    The widget client never sends ``external_user_id`` in the frame — the
+    server mints it via the JWT ``sub`` claim. The router passes that into
+    ``parse_inbound`` and the value MUST end up on the envelope. Without
+    this fix every visitor collapsed into one conversation keyed by the
+    empty string (privacy hole + data contamination).
+    """
+    raw = {"type": "message", "text": "hello"}
+    envelope = await WebWidgetAdapter().parse_inbound(
+        raw=raw, channel=_channel(), external_user_id="v-7e3d2c",
+    )
+    assert envelope.external_user_id == "v-7e3d2c"
+
+
+@pytest.mark.asyncio
+async def test_parse_message_router_user_id_overrides_frame_value() -> None:
+    """JWT-authenticated ``external_user_id`` MUST win over a client-supplied
+    field — clients must not be able to spoof their identity.
+    """
+    raw = {
+        "type": "message",
+        "text": "hello",
+        "external_user_id": "spoofed-by-client",
+    }
+    envelope = await WebWidgetAdapter().parse_inbound(
+        raw=raw, channel=_channel(), external_user_id="v-real-1",
+    )
+    assert envelope.external_user_id == "v-real-1"
+
+
+@pytest.mark.asyncio
+async def test_parse_message_without_router_user_id_falls_back_to_frame() -> None:
+    """Backwards compat: legacy callers that pre-date Explore #1 still pass
+    ``external_user_id`` in the frame. Preserve that behavior so existing
+    tests / clients don't silently degrade.
+    """
+    raw = {
+        "type": "message",
+        "text": "hello",
+        "external_user_id": "legacy-frame-user",
+    }
+    envelope = await WebWidgetAdapter().parse_inbound(raw=raw, channel=_channel())
+    assert envelope.external_user_id == "legacy-frame-user"
+
+
+@pytest.mark.asyncio
 async def test_send_outbound_broadcasts_to_channel(monkeypatch) -> None:
     """send_outbound should call manager.broadcast_to_channel with the right args."""
     captured: dict = {}

@@ -172,7 +172,16 @@ async def websocket_endpoint(
                 # so the frontend can refresh its state. Full WS protocol
                 # (broadcast envelope, etc.) is a Stage 5+ concern.
                 adapter = WebWidgetAdapter()
-                envelope = await adapter.parse_inbound(raw=frame, channel=channel)
+                # ``external_user_id`` is the JWT-authenticated ``sub`` claim
+                # (validated at connection time, lines 73–85). Forwarding it
+                # here is the fix for Explore #1 — without it every widget
+                # visitor collapsed into one conversation keyed by
+                # ``external_user_id=""``.
+                envelope = await adapter.parse_inbound(
+                    raw=frame,
+                    channel=channel,
+                    external_user_id=external_user_id,
+                )
                 await process_inbound_envelope(envelope)
                 await websocket.send_json({
                     "type": "ack",
