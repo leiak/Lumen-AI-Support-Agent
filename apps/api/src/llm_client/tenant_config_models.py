@@ -85,6 +85,26 @@ class TenantLLMConfigRepository:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def get_by_tenant_provider_for_provider(
+        self,
+        *,
+        session: AsyncSession,
+        tenant_id: str,
+        provider_name: str,
+    ) -> TenantLLMConfig | None:
+        """Fetch a single row by (tenant, provider). Returns None if absent.
+
+        M5.3 — used by the admin wrapper to compute audit diffs in
+        the same transaction. Caller-managed session (no commit).
+        """
+        result = await session.execute(
+            select(TenantLLMConfig).where(
+                TenantLLMConfig.tenant_id == tenant_id,
+                TenantLLMConfig.provider_name == provider_name,
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def upsert(
         self,
         *,

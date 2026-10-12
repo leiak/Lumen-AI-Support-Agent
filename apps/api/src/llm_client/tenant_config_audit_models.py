@@ -167,6 +167,37 @@ class TenantLLMConfigAuditRepository:
             result = await session.execute(stmt)
             return int(result.scalar() or 0)
 
+    async def latest_field_value(
+        self,
+        session: AsyncSession,
+        tenant_id: str,
+        provider_name: str,
+        field: FieldName,
+    ) -> str | None:
+        """Return the ``new_value`` of the most recent audit row for
+        ``(tenant_id, provider_name, field)``, or ``None`` if no prior
+        row exists.
+
+        Used by the admin wrapper's ``upsert`` path to fetch the
+        previous ``api_key`` hash so ``_diff_upsert`` can suppress
+        no-op rotations (same plaintext → same hash → 0 diffs).
+
+        Caller-managed session (no commit).
+        """
+        stmt = (
+            select(TenantLLMConfigAuditLog)
+            .where(
+                TenantLLMConfigAuditLog.tenant_id == tenant_id,
+                TenantLLMConfigAuditLog.provider_name == provider_name,
+                TenantLLMConfigAuditLog.field == field,
+            )
+            .order_by(TenantLLMConfigAuditLog.changed_at.desc())
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        row = result.scalar_one_or_none()
+        return row.new_value if row is not None else None
+
 
 __all__ = [
     "FieldName",
