@@ -37,7 +37,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import UTC, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import delete, func, select
@@ -75,6 +75,10 @@ from admin.schemas.tenant_llm_config import (
     TenantLLMConfigCreate,
     TenantLLMConfigRead,
     TenantLLMConfigUpdate,
+)
+from admin.schemas.tenant_llm_config_audit import (
+    TenantLLMConfigAuditEntry,
+    TenantLLMConfigAuditListResponse,
 )
 from admin.schemas.tenant_settings import (
     TenantSettingsRead,
@@ -121,6 +125,9 @@ from llm_client.provider_registry import build_provider_registry
 from llm_client.runtime_chain import (
     ChainStep,
     get_runtime_chain,
+)
+from llm_client.tenant_config_audit_models import (
+    TenantLLMConfigAuditRepository,
 )
 from tenant.models import User
 from tenant.repository import TenantRepository, UserRepository
@@ -762,6 +769,97 @@ async def list_tenant_llm_configs(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# M5.3 Task 4 — Tenant LLM config audit log GET endpoint.
+#
+# GET /api/v1/admin/tenants/{tenant_id}/llm-configs/audit
+#   Paginated, newest-first read of the audit log written by the
+#   wrapper on POST/PATCH/DELETE. Optional provider_name filter
+#   (Literal-validated so a typo surfaces as 422, not 500). Page
+#   size via limit/offset (defaults match ListTenantTickets).
+#
+# Same anti-enumeration gate as the rest of the admin surface:
+# cross-tenant OR unknown tenant → 404, identical body so an
+# attacker cannot probe tenant IDs.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/tenants/{tenant_id}/llm-configs/audit",
+    response_model=TenantLLMConfigAuditListResponse,
+)
+async def list_tenant_llm_config_audit(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    provider_name: Annotated[
+        Literal["minimax", "anthropic", "openai"] | None,
+        Query(
+            description="Filter audit entries to a single provider "
+            "(must be a registered provider; empty string rejected)",
+        ),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> TenantLLMConfigAuditListResponse:
+    """Read the M5.3 audit log for a tenant's LLM config mutations.
+
+    Newest-first. Optional ``provider_name`` filter. Pagination via
+    ``limit`` / ``offset``. ``total`` reflects the full filtered
+    count (NOT just the page size) so the SPA can render a paginator
+    without a second round-trip.
+
+    Tenant existence + anti-enumeration mirror the rest of the
+    admin surface: a caller whose JWT tenant_id does not match the
+    path tenant gets 404 (same as unknown tenant). The audit
+    endpoint is read-only.
+
+    Status codes
+    ------------
+    * 200 — list (possibly empty) of entries + total.
+    * 401 — missing / invalid bearer (require_admin).
+    * 403 — non-admin role (require_admin).
+    * 404 — cross-tenant OR unknown tenant (anti-enumeration).
+    * 422 — ``provider_name`` not in allowlist, or ``limit`` /
+      ``offset`` out of range.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        # Anti-enumeration: same rationale as the rest of this module.
+        raise HTTPException(status_code=404, detail="not found")
+    # Touch the admin wrapper purely to enforce the existence check;
+    # we never call its list() because we don't need the current
+    # state, just confirmation the tenant exists.
+    try:
+        await AdminTenantLLMConfigRepository().list(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    audit_repo = TenantLLMConfigAuditRepository()
+    rows = await audit_repo.list_by_tenant(
+        tenant_id,
+        provider_name=provider_name,
+        limit=limit,
+        offset=offset,
+    )
+    total = await audit_repo.count_by_tenant(
+        tenant_id, provider_name=provider_name,
+    )
+    return TenantLLMConfigAuditListResponse(
+        entries=[
+            TenantLLMConfigAuditEntry(
+                id=r.id,
+                provider_name=r.provider_name,
+                field=r.field,
+                old_value=r.old_value,
+                new_value=r.new_value,
+                changed_by=r.changed_by,
+                changed_at=r.changed_at,
+            )
+            for r in rows
+        ],
+        total=total,
+    )
 
 
 # ---------------------------------------------------------------------------
