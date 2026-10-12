@@ -187,8 +187,10 @@ class TenantLLMConfigCache:
         providers = self._build_providers(rows)
         # Sync test path: derive the env chain inline (test fixtures
         # don't await ``_resolve_chain_steps``). Production always
-        # calls ``build_tenant_resolver`` which awaits it.
-        return self._raise_or_return(tenant_id, providers)
+        # calls ``build_tenant_resolver`` which awaits it. We pass
+        # ``rows`` through so M5.2 can build the per-tenant model
+        # override dict (see ``_raise_or_return``).
+        return self._raise_or_return(tenant_id, providers, rows=rows)
 
     def _build_providers(self, rows: list[Any]) -> dict[str, Any]:
         """Decrypt each row's API key and instantiate the matching provider.
@@ -355,6 +357,7 @@ class TenantLLMConfigCache:
         known_providers: list[str] | None = None,
         *,
         chain_steps: list[tuple[str, str]] | None = None,
+        rows: list[Any] | None = None,
     ) -> Resolver:
         """Build the inner gateway; raise TenantLlmNotConfigured if empty.
 
@@ -364,6 +367,21 @@ class TenantLLMConfigCache:
         computed inline via the same logic; production callers
         always pass a pre-resolved value so the chain policy (per-tenant
         → env → strict-mode raise) is honoured.
+
+        ``rows`` is the (already-fetched) list of ``TenantLLMConfig``
+        rows for this tenant. M5.2 uses it to build the per-tenant
+        model-override dict so the wrap can rewrite ``request.model``
+        to the tenant preference (see below). Re-fetching would
+        double the DB hit, so callers pass the list they already
+        iterated over to build ``providers``.
+
+        M5.2: when any enabled row in ``rows`` has a non-null ``model``
+        column, the gateway resolver is wrapped with
+        :class:`TenantModelOverrideResolver` to rewrite ``request.model``
+        to the tenant override before the provider receives it. The
+        wrap is conditional — empty ``overrides`` dict (no row had a
+        non-null ``model``) preserves the pre-M5.2 behavior, so
+        existing tenants see zero overhead.
 
         The ``known_providers`` argument is used only for exception
         construction; the build proceeds whenever ``providers`` has
@@ -412,6 +430,27 @@ class TenantLLMConfigCache:
             ),
         )
         resolver = gateway.default_resolver
+        # M5.2 — wrap the gateway resolver with TenantModelOverrideResolver
+        # when any enabled row has a non-null ``model`` column. The wrapper
+        # rewrites ``request.model`` AFTER the inner resolver picks the
+        # provider (so prefix-match routing still works) but BEFORE the
+        # provider receives the request (so the provider's request.model
+        # line sees the override). Empty ``overrides`` → no wrap,
+        # preserving back-compat for tenants that never set a model.
+        if rows is not None:
+            overrides: dict[str, str | None] = {
+                row.provider_name: row.model
+                for row in rows
+                if row.enabled and row.model is not None
+            }
+            if overrides:
+                from llm_client.tenant_model_override_resolver import (
+                    TenantModelOverrideResolver,
+                )
+                resolver = TenantModelOverrideResolver(
+                    inner=resolver,
+                    overrides=overrides,
+                )
         self.put(tenant_id, resolver)
         return resolver
 
@@ -450,6 +489,7 @@ async def build_tenant_resolver(
         tenant_id,
         providers,
         chain_steps=chain_steps,
+        rows=rows,
     )
 
 
