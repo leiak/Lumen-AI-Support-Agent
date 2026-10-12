@@ -31,6 +31,7 @@ encryption layer — just the existence check + delegation to the inner
 from __future__ import annotations
 
 from admin.schemas.budget import TenantBudgetCreate
+from admin.schemas.fallback_chain import TenantFallbackChainUpsert
 from admin.schemas.tenant_llm_config import TenantLLMConfigCreate, TenantLLMConfigUpdate
 from budget.models import TenantBudget
 from budget.repository import TenantBudgetRepository
@@ -39,6 +40,10 @@ from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import (
     TenantLLMConfig,
     TenantLLMConfigRepository,
+)
+from llm_client.tenant_fallback_chain_models import (
+    TenantFallbackChain,
+    TenantFallbackChainRepository,
 )
 from tenant.repository import TenantRepository
 
@@ -183,4 +188,67 @@ class AdminTenantBudgetRepository:
         return await self._inner.get_by_tenant(tenant_id)
 
 
-__all__ = ["AdminTenantBudgetRepository", "AdminTenantLLMConfigRepository"]
+class AdminTenantFallbackChainRepository:
+    """Admin-facing wrapper around :class:`TenantFallbackChainRepository`.
+
+    Mirrors :class:`AdminTenantBudgetRepository`'s tenant-existence
+    check + delegation pattern. The chain carries no secrets
+    (just provider/model/enabled tuples + master ``enabled`` flag) so
+    there is no encryption layer.
+    """
+
+    def __init__(self) -> None:
+        self._inner = TenantFallbackChainRepository()
+        self._tenants = TenantRepository()
+
+    async def upsert(
+        self,
+        *,
+        tenant_id: str,
+        payload: TenantFallbackChainUpsert,
+    ) -> TenantFallbackChain:
+        """Upsert a tenant's PRIMARY fallback chain (M5.1).
+
+        Raises:
+            ValueError: tenant does not exist. Caller (API layer)
+                translates to ``HTTPException(404)``. Anti-enumeration:
+                the same 404 is returned whether the tenant doesn't
+                exist OR the caller can't see it.
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.upsert(
+            tenant_id=tenant_id,
+            steps=[s.model_dump() for s in payload.steps],
+            enabled=payload.enabled,
+        )
+
+    async def get(self, tenant_id: str) -> TenantFallbackChain | None:
+        """Return the chain row for a tenant (or ``None`` if not set).
+
+        Raises:
+            ValueError: tenant does not exist (see :meth:`upsert`).
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.get(tenant_id)
+
+    async def delete(self, tenant_id: str) -> bool:
+        """Remove the tenant's chain. Idempotent.
+
+        Returns ``True`` if a row was deleted, ``False`` if there was
+        nothing to delete. The API layer treats both as 204.
+        """
+        tenant = await self._tenants.get_by_id(tenant_id)
+        if tenant is None:
+            raise ValueError(f"unknown tenant: {tenant_id!r}")
+        return await self._inner.delete(tenant_id)
+
+
+__all__ = [
+    "AdminTenantBudgetRepository",
+    "AdminTenantFallbackChainRepository",
+    "AdminTenantLLMConfigRepository",
+]

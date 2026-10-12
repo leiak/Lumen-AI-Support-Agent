@@ -7,6 +7,12 @@ from admin.schemas.budget import (
     TenantBudgetUsageRead,
 )
 from admin.schemas.dashboard import DashboardRead, StatusCount
+from admin.schemas.fallback_chain import (
+    ChainStepIn,
+    ChainStepOut,
+    TenantFallbackChainOut,
+    TenantFallbackChainUpsert,
+)
 from admin.schemas.llm_chain import (
     LLMChainRead,
     LLMChainStep,
@@ -36,6 +42,8 @@ from admin.schemas.widget_config import (
 )
 
 __all__ = [
+    "ChainStepIn",
+    "ChainStepOut",
     "DashboardRead",
     "LLMChainRead",
     "LLMChainStep",
@@ -47,6 +55,8 @@ __all__ = [
     "TenantBudgetCreate",
     "TenantBudgetRead",
     "TenantBudgetUsageRead",
+    "TenantFallbackChainOut",
+    "TenantFallbackChainUpsert",
     "TenantLLMConfigCreate",
     "TenantLLMConfigRead",
     "TenantLLMConfigUpdate",

@@ -29,6 +29,8 @@ from llm_client.exceptions import TenantLlmNotConfigured
 from llm_client.http_pool import HttpClientPool
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_config_models import TenantLLMConfigRepository
+from llm_client.tenant_fallback_chain_cache import TenantFallbackChainCache
+from llm_client.tenant_fallback_chain_models import TenantFallbackChainRepository
 from llm_client.tenant_resolver import (
     TenantLLMConfigCache,
     build_tenant_resolver,
@@ -42,6 +44,7 @@ from llm_client.usage import UsageRecorder
 _tenant_cache: TenantLLMConfigCache | None = None
 _budget_snapshot_cache: TenantBudgetSnapshotCache | None = None
 _precheck_cache: PrecheckCache | None = None
+_fallback_chain_cache: TenantFallbackChainCache | None = None
 
 # Process-wide HTTP pool (nitpick S4 / tech-debt #24). Shared across
 # all LLM provider instances so the HTTPS connection pool + TLS
@@ -58,17 +61,28 @@ def _build_tenant_cache() -> TenantLLMConfigCache:
     dev / CI environment that never hits the LLM path. The first
     :func:`_default_llm_client_factory` call pays the construction
     cost; subsequent calls reuse the cached instance.
+
+    M5.1 — also constructs the :class:`TenantFallbackChainCache`
+    singleton first and threads it through to the resolver so the
+    resolver's per-tenant chain lookup hits the SAME cache the admin
+    API invalidates on writes.
     """
     global _tenant_cache
     if _tenant_cache is None:
         settings = get_settings()
         cipher = TenantLLMConfigCipher(settings.tenant_llm_fernet_key)
+        # Build the fallback chain cache singleton first so the
+        # resolver's ``self._fallback_chain_cache`` field and the
+        # admin API's Depends get the SAME instance — admin writes
+        # call ``cache.invalidate()`` to bust the resolver's view.
+        chain_cache = _build_fallback_chain_cache()
         _tenant_cache = TenantLLMConfigCache(
             ttl_s=settings.tenant_llm_cache_ttl_s,
             maxsize=settings.tenant_llm_cache_maxsize,
             repo=TenantLLMConfigRepository(),
             cipher=cipher,
             settings=settings,
+            fallback_chain_cache=chain_cache,
         )
     return _tenant_cache
 
@@ -106,6 +120,30 @@ def _build_precheck_cache() -> PrecheckCache:
             ttl_seconds=settings.tenant_budget_precheck_cache_ttl_seconds,
         )
     return _precheck_cache
+
+
+def _build_fallback_chain_cache() -> TenantFallbackChainCache:
+    """Construct the per-process :class:`TenantFallbackChainCache` singleton.
+
+    M5.1 — caches per-tenant ``tenant_fallback_chains`` rows so the
+    resolver lookup stays off the DB hot path. The same singleton is
+    used by ``_build_tenant_cache`` (so the resolver's chain lookup
+    hits the same cache the admin API invalidates after writes).
+
+    Mirrors :func:`_build_budget_snapshot_cache` lazy-init pattern:
+    settings-driven TTL / maxsize, no Fernet key required (chain
+    rows carry no secrets).
+    """
+    global _fallback_chain_cache
+    if _fallback_chain_cache is None:
+        settings = get_settings()
+        _fallback_chain_cache = TenantFallbackChainCache(
+            ttl_s=settings.llm_tenant_fallback_chain_ttl_s,
+            maxsize=settings.llm_tenant_fallback_chain_cache_maxsize,
+            repo=TenantFallbackChainRepository(),
+            settings=settings,
+        )
+    return _fallback_chain_cache
 
 
 async def _default_llm_client_factory(tenant_id: str) -> LLMClient:
@@ -224,6 +262,7 @@ def reset_http_pool() -> None:
 
 __all__ = [
     "_build_budget_snapshot_cache",
+    "_build_fallback_chain_cache",
     "_build_http_pool",
     "_build_precheck_cache",
     "_build_tenant_cache",

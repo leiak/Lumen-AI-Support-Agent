@@ -45,6 +45,7 @@ from sqlalchemy.exc import IntegrityError
 
 from admin.repository import (
     AdminTenantBudgetRepository,
+    AdminTenantFallbackChainRepository,
     AdminTenantLLMConfigRepository,
 )
 from admin.schemas.budget import (
@@ -58,6 +59,11 @@ from admin.schemas.budget import (
     TenantBudgetUsageRead,
 )
 from admin.schemas.dashboard import DashboardRead, StatusCount
+from admin.schemas.fallback_chain import (
+    ChainStepOut,
+    TenantFallbackChainOut,
+    TenantFallbackChainUpsert,
+)
 from admin.schemas.llm_chain import (
     LLMChainRead,
     LLMChainStep,
@@ -86,6 +92,7 @@ from admin.schemas.widget_config import (
     WidgetConfigUpdate,
 )
 from admin.search import AdminSearchService
+from agent.llm_factory import _build_fallback_chain_cache
 from auth.dependencies import require_admin
 from auth.password import hash_password
 from budget.cleanup import run_budget_cleanup
@@ -848,6 +855,157 @@ async def delete_tenant_llm_config(
         raise HTTPException(status_code=404, detail=str(e)) from e
     # Idempotent: True (deleted) and False (nothing to delete) both
     # return 204. Only tenant-existence failures surface as 404.
+    return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# M5.1 — Tenant fallback chain admin endpoints.
+#
+# POST /api/v1/admin/tenants/{tenant_id}/fallback-chain
+#   upsert the tenant's PRIMARY fallback chain (replaces the env
+#   ``LLM_FALLBACK_CHAIN`` for this tenant; falls back to env when no
+#   row exists). Invalidates the per-process cache after write so the
+#   resolver picks up the change without waiting for TTL.
+#
+# GET /api/v1/admin/tenants/{tenant_id}/fallback-chain
+#   read the chain row; 404 when none exists.
+#
+# DELETE /api/v1/admin/tenants/{tenant_id}/fallback-chain
+#   remove the row. Idempotent — falling back to the env chain is
+#   the desired "off" state.
+#
+# All three follow the same anti-enumeration + 404 pattern as the
+# LLM-config endpoints above.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tenants/{tenant_id}/fallback-chain",
+    response_model=TenantFallbackChainOut,
+    status_code=200,
+)
+async def upsert_tenant_fallback_chain(
+    tenant_id: str,
+    payload: TenantFallbackChainUpsert,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantFallbackChainOut:
+    """Upsert a tenant's PRIMARY LLM fallback chain (M5.1).
+
+    One PRIMARY chain per tenant (UNIQUE on tenant_id). Replaces the
+    env ``LLM_FALLBACK_CHAIN`` for this tenant — the resolver
+    consults the per-tenant row first, then falls back to the env
+    chain when no row exists (back-compat).
+
+    Cache invalidation: the per-process
+    :class:`TenantFallbackChainCache` singleton is busted after the
+    write so the next resolver call for this tenant hits the DB
+    rather than waiting up to ``LLM_TENANT_FALLBACK_CHAIN_TTL_S``
+    seconds.
+
+    Auth: requires admin JWT. Cross-tenant access returns 404
+    (anti-enumeration) — mirrors LLM config pattern above.
+
+    Status codes
+    ------------
+    * 200 — created or updated.
+    * 401/403 — JWT errors (raised by require_admin).
+    * 404 — tenant does not exist OR claims['tenant_id'] != path.
+    * 422 — ``provider`` not in allowlist, ``model`` empty/too long,
+      or no step has ``enabled=True``.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        row = await AdminTenantFallbackChainRepository().upsert(
+            tenant_id=tenant_id, payload=payload,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    # Bust the per-process cache so the next resolver call hits the DB.
+    _build_fallback_chain_cache().invalidate(tenant_id)
+    return TenantFallbackChainOut(
+        tenant_id=row.tenant_id,
+        steps=[
+            ChainStepOut(provider=s["provider"], model=s["model"], enabled=s.get("enabled", True))
+            for s in (row.steps or [])
+        ],
+        enabled=row.enabled,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.get(
+    "/tenants/{tenant_id}/fallback-chain",
+    response_model=TenantFallbackChainOut,
+)
+async def get_tenant_fallback_chain(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> TenantFallbackChainOut:
+    """Read a tenant's PRIMARY fallback chain (M5.1).
+
+    Returns 404 when no chain is configured (distinct from the env
+    chain, which is process-global and not exposed here). Auth +
+    anti-enumeration mirrors POST above.
+
+    Status codes
+    ------------
+    * 200 — chain row present.
+    * 401/403 — JWT errors (raised by require_admin).
+    * 404 — tenant does not exist, cross-tenant, OR no chain row.
+      Same code for all three (anti-enumeration).
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        row = await AdminTenantFallbackChainRepository().get(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    if row is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return TenantFallbackChainOut(
+        tenant_id=row.tenant_id,
+        steps=[
+            ChainStepOut(provider=s["provider"], model=s["model"], enabled=s.get("enabled", True))
+            for s in (row.steps or [])
+        ],
+        enabled=row.enabled,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@router.delete(
+    "/tenants/{tenant_id}/fallback-chain",
+    status_code=204,
+)
+async def delete_tenant_fallback_chain(
+    tenant_id: str,
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+) -> Response:
+    """Remove a tenant's PRIMARY fallback chain (M5.1).
+
+    Idempotent — ``False`` (no row to delete) is treated the same as
+    ``True`` (success) and returns 204. After deletion the resolver
+    falls back to the env chain for this tenant.
+
+    Cache invalidation: the per-process cache singleton is busted
+    after the write (same rationale as POST above).
+
+    Status codes
+    ------------
+    * 204 — deleted (or nothing to delete — still 204).
+    * 401/403 — JWT errors (raised by require_admin).
+    * 404 — tenant does not exist OR cross-tenant.
+    """
+    if claims.get("tenant_id") != tenant_id:
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        await AdminTenantFallbackChainRepository().delete(tenant_id=tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    _build_fallback_chain_cache().invalidate(tenant_id)
     return Response(status_code=204)
 
 
