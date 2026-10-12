@@ -35,13 +35,21 @@ async def _broadcast_agent_message(
     conversation_id: str,
     message_id: str,
     sender_id: str | None,
+    content_text: str,
 ) -> None:
     """Best-effort WS broadcast of an agent ``message.created`` event.
 
     Mirrors the Stage 5.3 ``message.complete`` fan-out used by the
-    customer-inbound path. Wrapped in try/except so a dead socket
-    never aborts the agent-reply hot path — the message is already
-    durably persisted and the client can refetch via REST.
+    customer-inbound path. The ``content`` field carries the actual
+    reply text — without it the widget's message handler falls back to
+    a generic placeholder ("[客服回复]") because the SPA deliberately
+    avoids a REST refetch on every push. Keep the payload shape
+    aligned with :func:`channel.inbound._broadcast_ai_complete` so the
+    widget can treat both events uniformly.
+
+    Wrapped in try/except so a dead socket never aborts the agent-
+    reply hot path — the message is already durably persisted and the
+    client can refetch via REST.
     """
     try:
         await _ws_manager.broadcast_to_channel(
@@ -52,6 +60,7 @@ async def _broadcast_agent_message(
                 "message_id": message_id,
                 "role": MessageRole.AGENT.value,
                 "sender_id": sender_id,
+                "content": content_text,
             },
         )
     except Exception as exc:
@@ -282,6 +291,7 @@ async def post_agent_message(
             conversation_id=conversation_id,
             message_id=msg.id,
             sender_id=sender_id,
+            content_text=stripped,
         )
     log.info(
         "agent message recorded",

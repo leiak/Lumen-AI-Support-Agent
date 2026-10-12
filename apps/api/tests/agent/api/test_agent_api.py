@@ -346,6 +346,90 @@ async def test_post_agent_message_persists_agent_reply(
 
 
 @pytest.mark.asyncio
+async def test_post_agent_message_broadcasts_payload_with_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WS ``message.created`` event must carry the reply ``content`` field.
+
+    Regression: the widget's message handler uses the ``content`` field
+    to render the agent bubble. Without it, the SPA falls back to a
+    generic "[客服回复]" placeholder and the real reply is invisible to
+    the customer. This test pins the contract.
+    """
+    from widget.ws import manager as widget_ws_manager
+
+    captured: dict[str, Any] = {}
+
+    async def fake_broadcast(
+        self: Any,
+        *,
+        channel_id: str,
+        payload: dict[str, Any],
+        exclude: str | None = None,
+    ) -> int:
+        captured["channel_id"] = channel_id
+        captured["payload"] = payload
+        return 0
+
+    monkeypatch.setattr(
+        widget_ws_manager.ConnectionManager,
+        "broadcast_to_channel",
+        fake_broadcast,
+    )
+
+    _stub_agent_auth(monkeypatch, claims=AGENT_CLAIMS)
+    conv = _conv(channel_id="chan_broadcast_1", assigned_agent_id="u_agent_1")
+    persisted_msg = _msg(
+        conversation_id=conv.id,
+        role=MessageRole.AGENT,
+        content_text="hi, looking into it",
+        sender_id="u_agent_1",
+    )
+
+    async def fake_get(self: Any, *, tenant_id: str, conversation_id: str) -> Conversation | None:
+        return conv
+
+    async def fake_record(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        role: MessageRole,
+        content_text: str,
+        sender_id: str | None,
+        content_blocks: dict[str, Any] | None = None,
+        tool_calls: dict[str, Any] | None = None,
+    ) -> Message:
+        return persisted_msg
+
+    monkeypatch.setattr(service_module.ConversationService, "get", fake_get)
+    monkeypatch.setattr(
+        service_module.ConversationService, "record_message", fake_record
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            f"/api/v1/conversations/{conv.id}/messages",
+            json={"content_text": "hi, looking into it"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert captured["channel_id"] == "chan_broadcast_1"
+    payload = captured["payload"]
+    assert payload["type"] == "message.created"
+    assert payload["conversation_id"] == conv.id
+    assert payload["message_id"] == persisted_msg.id
+    assert payload["role"] == "agent"
+    assert payload["sender_id"] == "u_agent_1"
+    # The whole point of the fix — the widget needs this field to render
+    # the actual reply text instead of the "[客服回复]" placeholder.
+    assert payload["content"] == "hi, looking into it"
+
+
+@pytest.mark.asyncio
 async def test_post_agent_message_rejects_empty_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
