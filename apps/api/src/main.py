@@ -17,7 +17,7 @@ from core.logging import configure_logging, get_logger
 from core.metrics import prometheus_metrics_middleware, render_metrics
 from core.qdrant import close_qdrant_client, get_qdrant_client
 from core.redis import close_redis, get_redis
-from core.request_context import (
+from core.request_context import (  # noqa: F401  — M6.6: kept for back-compat with any downstream callers; was used by the removed request_context_middleware
     bind_request_context,
     clear_request_context,
 )
@@ -148,42 +148,30 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["Content-Type", "Authorization", "X-Tenant-Id"],
-    expose_headers=["Content-Type"],
+    # M6.6 — expose trace correlation headers so the agent SPA /
+    # widget SDK can read them from cross-origin responses.
+    expose_headers=["Content-Type", "X-Trace-Id", "X-Request-ID"],
     max_age=600,
 )
 
 
-@app.middleware("http")
-async def request_context_middleware(
-    request: Request,
-    call_next: Callable[[Request], Awaitable[Response]],
-) -> Response:
-    """Stage 11.2: bind a per-request id into structlog contextvars.
+# M6.6 — replace the M1 request_context_middleware (request_id only)
+# with an OpenTelemetry-aware version. Reads the W3C ``traceparent``
+# header to recover the upstream trace_id (or starts a new trace),
+# opens an ``http.request`` span, binds trace_id into structlog
+# contextvars, and echoes ``X-Trace-Id`` (plus the back-compat
+# ``X-Request-ID``) on the response. Health + /metrics routes are
+# excluded.
+#
+# Added AFTER CORS so it runs BEFORE CORS in the LIFO middleware stack
+# (the trace context wraps the CORS preflight so OPTIONS responses
+# also carry X-Trace-Id when relevant). The metrics_middleware
+# decorator below is registered LAST and therefore runs FIRST; that's
+# fine — Prometheus only needs to measure the request duration and
+# doesn't care about the trace_id.
+from observability.middleware import TraceContextMiddleware
 
-    Reads ``X-Request-ID`` from the inbound request (clients / upstream
-    proxies use it for end-to-end tracing) or generates a ULID. The id
-    is bound via ``bind_request_context`` which both stores it in the
-    module-level ``ContextVar`` AND calls
-    ``structlog.contextvars.bind_contextvars`` so every log line emitted
-    during the request inherits it automatically (the
-    ``merge_contextvars`` processor is the first link in the structlog
-    chain configured by :func:`core.logging.configure_logging`).
-
-    The id is echoed back in ``X-Request-ID`` so the client can correlate
-    a 5xx response with the server-side log search.
-
-    Order: this middleware runs **before** ``metrics_middleware`` so the
-    request id is available for log lines emitted from inside the metrics
-    middleware (none today, but cheap insurance against future additions).
-    """
-    inbound = request.headers.get("x-request-id")
-    rid = bind_request_context(request_id=inbound)
-    try:
-        response = await call_next(request)
-    finally:
-        clear_request_context()
-    response.headers["X-Request-ID"] = rid
-    return response
+app.add_middleware(TraceContextMiddleware)
 
 
 @app.middleware("http")

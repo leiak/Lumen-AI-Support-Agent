@@ -22,8 +22,26 @@ apiClient.interceptors.request.use((config) => {
 });
 
 apiClient.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // M6.6 — surface the server-side trace_id so support engineers
+    // can grep Tempo by this id when a customer reports a bug. Cheap
+    // single-line log; never throws.
+    const traceId = response.headers['x-trace-id'] ?? response.headers['X-Trace-Id'];
+    if (traceId) {
+      // eslint-disable-next-line no-console
+      console.info('Trace:', traceId);
+    }
+    return response;
+  },
   (error: AxiosError) => {
+    // Same on the error path: log the trace_id for cross-system
+    // correlation when a 4xx/5xx surfaces to the SPA.
+    const traceId =
+      error.response?.headers['x-trace-id'] ?? error.response?.headers['X-Trace-Id'];
+    if (traceId) {
+      // eslint-disable-next-line no-console
+      console.warn('Trace (error):', traceId);
+    }
     if (error.response?.status === 401) {
       window.localStorage.removeItem(JWT_STORAGE_KEY);
       if (window.location.pathname !== '/login') {

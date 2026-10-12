@@ -48,6 +48,7 @@ PII_WHITELIST: frozenset[str] = frozenset({
     "http.method",
     "http.route",
     "http.status_code",
+    "http.latency_ms",
     "channel.name",
     "agent.id",
     "conversation.id",

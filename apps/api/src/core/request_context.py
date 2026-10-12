@@ -89,8 +89,30 @@ def clear_request_context() -> None:
     _current_request_id.set(None)
 
 
+def bind_trace_context(*, trace_id: str, span_id: str | None = None) -> str:
+    """Bind ``trace_id`` (and optionally ``span_id``) into structlog contextvars.
+
+    Returns the effective trace_id (always equal to the input). The
+    existing ``request_id`` field is also set to ``trace_id`` so log
+    lines keep their familiar structure — M6.6 promotes ``trace_id``
+    to the primary correlation id; ``request_id`` is kept as a back-compat
+    alias for downstream tooling that still greps logs by ``request_id``.
+
+    Used by :class:`observability.middleware.TraceContextMiddleware` to
+    make every log line emitted during a request carry the same OTel
+    trace_id as the request's span.
+    """
+    payload: dict[str, Any] = {"trace_id": trace_id, "request_id": trace_id}
+    if span_id is not None:
+        payload["span_id"] = span_id
+    structlog.contextvars.bind_contextvars(**payload)
+    _current_request_id.set(trace_id)
+    return trace_id
+
+
 __all__ = [
     "bind_request_context",
+    "bind_trace_context",
     "clear_request_context",
     "get_request_id",
 ]
