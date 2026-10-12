@@ -87,23 +87,46 @@ def test_outbound_httpx_emits_span(memory_exporter) -> None:
 
 
 def test_no_op_when_sdk_disabled_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Setting ``OTEL_SDK_DISABLED=true`` causes the SDK to behave as no-op.
+    """Smoke check: ``OTEL_SDK_DISABLED`` is the documented escape hatch.
 
-    This is the escape hatch for rollback. We just verify the env var is
-    respected; we don't tear down the SDK mid-test.
+    The actual no-op behavior is the OTel SDK's contract — when this
+    env var is true at SDK init time, the SDK installs a no-op
+    provider and ``tracer`` becomes a ``ProxyTracer``. We can't
+    exercise that path in-process because the conftest installs our
+    own ``TracerProvider`` before ``observability`` is imported
+    (see conftest.py module-load setup). This test just confirms the
+    env var is settable so a future operator who sets it can rely
+    on it being recognized. Full behavioral verification would need
+    a subprocess test (out of scope for the unit test layer).
     """
     monkeypatch.setenv("OTEL_SDK_DISABLED", "true")
-    # When disabled, tracer is still importable but spans are not recorded.
-    # Just verify the env var took effect (smoke check).
     import os
 
     assert os.environ["OTEL_SDK_DISABLED"] == "true"
 
 
-def test_observability_module_import_is_idempotent() -> None:
-    """Importing the module twice doesn't double-instrument httpx."""
-    import observability  # noqa: F401
+def test_observability_module_import_is_idempotent(memory_exporter) -> None:
+    """Importing ``observability`` twice doesn't double-instrument httpx.
 
-    # If double-instrumented, httpx would emit 2 spans per call. We just
-    # check the instrumentor is still in a single-instrumented state.
-    assert HTTPXClientInstrumentor().is_instrumented_by_opentelemetry is True
+    A double-instrumented httpx would emit 2 spans per request (one
+    per wrap). We verify by re-importing the module and making a
+    real httpx call — the new span count must be exactly 1.
+    """
+    import importlib
+    import observability  # noqa: F401
+    importlib.reload(observability)
+
+    spans_before = len(memory_exporter.get_finished_spans())
+    with httpx.Client(transport=httpx.HTTPTransport()) as client:
+        try:
+            client.get("http://127.0.0.1:1/test", timeout=0.5)
+        except Exception:
+            # Connection refused — irrelevant; we only care that
+            # exactly one span was emitted (not 0, not 2).
+            pass
+    spans_after = memory_exporter.get_finished_spans()
+    new_spans = spans_after[spans_before:]
+    assert len(new_spans) == 1, (
+        f"idempotent import should emit exactly 1 span per call; "
+        f"got {len(new_spans)}: {[s.name for s in new_spans]}"
+    )
