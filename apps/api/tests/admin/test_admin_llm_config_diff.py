@@ -8,8 +8,8 @@ from admin.repository import _diff_upsert
 from llm_client.tenant_config_models import TenantLLMConfig
 
 
-def _row(**kw: object) -> TenantLLMConfig:
-    """Build a TenantLLMConfig stub (no DB) with the given fields set."""
+def _old(**kw: object):
+    """Build a TenantLLMConfig stub (no DB) for the OLD pre-mutation snapshot."""
     base: dict[str, object] = {
         "id": "x", "tenant_id": "t", "provider_name": "anthropic",
         "encrypted_api_key": b"ct", "base_url": None, "model": None,
@@ -19,8 +19,35 @@ def _row(**kw: object) -> TenantLLMConfig:
     return TenantLLMConfig(**base)  # type: ignore[arg-type]
 
 
+def _call(
+    *,
+    is_insert: bool,
+    old: TenantLLMConfig | None,
+    payload_model_fields_set: set[str] | None,
+    new_base_url: str | None,
+    new_model: str | None,
+    new_enabled: bool,
+    new_api_key_sha256: str | None,
+    old_api_key_sha256: str | None = None,
+) -> list[tuple[str, str | None, str | None]]:
+    """Ingest an OLD snapshot and pass its attrs into ``_diff_upsert``."""
+    return _diff_upsert(
+        is_insert=is_insert,
+        payload_model_fields_set=payload_model_fields_set,
+        old_base_url=old.base_url if old else None,
+        old_model=old.model if old else None,
+        old_enabled=old.enabled if old else None,
+        new_base_url=new_base_url,
+        new_model=new_model,
+        new_enabled=new_enabled,
+        new_api_key_sha256=new_api_key_sha256,
+        old_api_key_sha256=old_api_key_sha256,
+    )
+
+
 def test_post_insert_returns_four_rows() -> None:
-    diffs = _diff_upsert(
+    diffs = _call(
+        is_insert=True,
         old=None,
         payload_model_fields_set=None,
         new_base_url="https://proxy",
@@ -32,14 +59,15 @@ def test_post_insert_returns_four_rows() -> None:
     assert fields == {"api_key", "base_url", "model", "enabled"}
     api_key_diff = next(d for d in diffs if d[0] == "api_key")
     assert api_key_diff[1] == "sha256:initial"
-    assert api_key_diff[2] == "abc123..."
+    assert api_key_diff[2] == "sha256:abc123..."
 
 
 def test_post_update_changes_all_returns_four() -> None:
-    old = _row(
+    old = _old(
         base_url="https://old", model="claude-3-5-sonnet-20241022", enabled=False,
     )
-    diffs = _diff_upsert(
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set=None,
         new_base_url="https://new",
@@ -51,10 +79,11 @@ def test_post_update_changes_all_returns_four() -> None:
 
 
 def test_post_update_one_field_changed_returns_one() -> None:
-    old = _row(
+    old = _old(
         base_url="https://same", model="claude-3-5-sonnet-20241022", enabled=True,
     )
-    diffs = _diff_upsert(
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set=None,
         new_base_url="https://same",  # unchanged
@@ -67,24 +96,26 @@ def test_post_update_one_field_changed_returns_one() -> None:
 
 
 def test_post_identical_body_returns_zero() -> None:
-    old = _row(
+    old = _old(
         base_url="https://same", model="claude-3-5-sonnet-20241022", enabled=True,
     )
-    diffs = _diff_upsert(
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set=None,
         new_base_url="https://same",
         new_model="claude-3-5-sonnet-20241022",
         new_enabled=True,
-        new_api_key_sha256="samehash",  # Even identical plaintext → same hash → no diff
-        old_api_key_sha256="samehash",  # wrapper fetched prior hash from latest audit row
+        new_api_key_sha256="samehash",  # wrapper fetched prior hash, suppress no-op
+        old_api_key_sha256="samehash",
     )
     assert diffs == []
 
 
 def test_patch_two_fields_changed_returns_two() -> None:
-    old = _row(model="claude-3-5-sonnet-20241022", enabled=True)
-    diffs = _diff_upsert(
+    old = _old(model="claude-3-5-sonnet-20241022", enabled=True)
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set={"model", "enabled"},
         new_base_url=None,  # ignored (not in fields_set)
@@ -97,8 +128,9 @@ def test_patch_two_fields_changed_returns_two() -> None:
 
 
 def test_patch_no_actual_change_returns_zero() -> None:
-    old = _row(model="claude-haiku-4-5", enabled=False)
-    diffs = _diff_upsert(
+    old = _old(model="claude-haiku-4-5", enabled=False)
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set={"model", "enabled"},
         new_base_url=None,
@@ -110,8 +142,9 @@ def test_patch_no_actual_change_returns_zero() -> None:
 
 
 def test_patch_field_not_in_set_skipped() -> None:
-    old = _row(base_url="https://old", model="claude-3-5-sonnet-20241022", enabled=True)
-    diffs = _diff_upsert(
+    old = _old(base_url="https://old", model="claude-3-5-sonnet-20241022", enabled=True)
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set={"model"},  # base_url NOT in set
         new_base_url="https://new",  # but value changed
@@ -124,8 +157,9 @@ def test_patch_field_not_in_set_skipped() -> None:
 
 
 def test_patch_clears_to_null_returns_one() -> None:
-    old = _row(model="claude-haiku-4-5", enabled=True)
-    diffs = _diff_upsert(
+    old = _old(model="claude-haiku-4-5", enabled=True)
+    diffs = _call(
+        is_insert=False,
         old=old,
         payload_model_fields_set={"model"},
         new_base_url=None,
@@ -141,12 +175,14 @@ def test_delete_path_does_not_use_helper() -> None:
     """DELETE is not handled by _diff_upsert — the wrapper writes the
     ``__deleted__`` row directly. This test is a smoke check that
     the helper does not produce a ``__deleted__`` row on its own."""
-    diffs = _diff_upsert(
-        old=_row(provider_name="anthropic"),
+    old = _old(provider_name="anthropic")
+    diffs = _call(
+        is_insert=False,
+        old=old,
         payload_model_fields_set=set(),  # PATCH with no fields (unusual but valid)
         new_base_url=None,
         new_model=None,
-        new_enabled=None,
+        new_enabled=False,
         new_api_key_sha256=None,
     )
     assert not any(d[0] == "__deleted__" for d in diffs)
