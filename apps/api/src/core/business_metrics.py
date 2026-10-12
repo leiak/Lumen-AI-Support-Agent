@@ -115,6 +115,20 @@ LLM_BUDGET_GATE_TOTAL = Counter(
     "Number of times BudgetResolver raised TenantBudgetRateLimited after observing 429",
 )
 
+# M5.1 — per-tenant fallback chain resolution outcomes.
+#
+# Zero-label by design; tenant_id stays in logs only to keep cardinality
+# bounded. outcome ∈ {hit, miss, disabled, unconfigured} where:
+#   hit          — per-tenant row found, enabled, and yielded >=1 enabled step
+#   miss         — no per-tenant row; fell through to env chain
+#   disabled     — row found but row.enabled = False; fell through to env chain
+#   unconfigured — strict mode on, no chain available from any source
+LLM_TENANT_FALLBACK_CHAIN_TOTAL = Counter(
+    "lumen_llm_tenant_fallback_chain_total",
+    "Per-tenant fallback chain resolution outcomes.",
+    ("outcome",),
+)
+
 
 # Nitpick S2 — rate-limit fail-open observability.
 #
@@ -185,6 +199,7 @@ __all__ = [
     "LLM_FALLBACK_ATTEMPTS_TOTAL",
     "LLM_TENANT_BUDGET_EXCEEDED_TOTAL",
     "LLM_TENANT_BUDGET_SOFT_WARN_TOTAL",
+    "LLM_TENANT_FALLBACK_CHAIN_TOTAL",
     "LLM_TENANT_LLM_NOT_CONFIGURED_TOTAL",
     "LLM_TOKENS_TOTAL",
     "LUMEN_QA_FAILURES",

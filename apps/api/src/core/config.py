@@ -137,6 +137,27 @@ class Settings(BaseSettings):
         default=None, alias="LLM_FALLBACK_ATTEMPT_TIMEOUT_S"
     )
 
+    # M5.1 — Per-tenant fallback chain override.
+    #
+    # ``llm_tenant_fallback_chain_required`` — when True, tenants with
+    # LLM configs but no per-tenant chain row raise
+    # ``TenantFallbackChainNotConfigured`` instead of falling back to the
+    # env chain. Default False keeps current behaviour.
+    #
+    # ``llm_tenant_fallback_chain_ttl_s`` controls the in-process
+    # cache TTL (mirrors ``tenant_llm_cache_ttl_s``).
+    #
+    # ``llm_tenant_fallback_chain_cache_maxsize`` caps the LRU eviction.
+    llm_tenant_fallback_chain_required: bool = Field(
+        default=False, alias="LLM_TENANT_FALLBACK_CHAIN_REQUIRED"
+    )
+    llm_tenant_fallback_chain_ttl_s: float = Field(
+        default=60.0, alias="LLM_TENANT_FALLBACK_CHAIN_TTL_S"
+    )
+    llm_tenant_fallback_chain_cache_maxsize: int = Field(
+        default=1024, alias="LLM_TENANT_FALLBACK_CHAIN_CACHE_MAXSIZE"
+    )
+
     # M4.C — Tenant BYOK. ``tenant_llm_fernet_key`` is required at
     # startup; the cipher raises RuntimeError if missing. Generate with:
     # ``python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'``

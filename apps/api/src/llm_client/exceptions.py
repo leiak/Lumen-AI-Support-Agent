@@ -104,6 +104,27 @@ class TenantLlmNotConfigured(ProviderUnavailable):
         )
 
 
+class TenantFallbackChainNotConfigured(ProviderUnavailable):
+    """Raised when a tenant has LLM configs but no fallback chain and strict mode is on.
+
+    Carries ``tenant_id`` for diagnostics. Subclasses
+    :class:`ProviderUnavailable` so existing callers treat this as a
+    5xx-equivalent failure → no retry, metric ``outcome="unavailable"``.
+
+    Mirrors ``TenantLlmNotConfigured`` but for the M5.1 per-tenant
+    chain layer: the tenant has provider configs, but the chain
+    resolution path returns nothing (no per-tenant row, no env chain)
+    AND ``LLM_TENANT_FALLBACK_CHAIN_REQUIRED`` is True.
+    """
+
+    def __init__(self, *, tenant_id: str) -> None:
+        self.tenant_id = tenant_id
+        super().__init__(
+            f"Tenant {tenant_id!r} has no LLM fallback chain configured "
+            f"and LLM_TENANT_FALLBACK_CHAIN_REQUIRED is True"
+        )
+
+
 class TenantBudgetExceeded(ProviderUnavailable):
     """Raised when a tenant's monthly token hard cap has been reached.
 
@@ -142,5 +163,6 @@ __all__ = [
     "ProviderUnavailable",
     "RateLimited",
     "TenantBudgetExceeded",
+    "TenantFallbackChainNotConfigured",
     "TenantLlmNotConfigured",
 ]

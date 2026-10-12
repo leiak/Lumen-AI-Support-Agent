@@ -23,6 +23,13 @@ There are two build paths:
   by tests (and simple admin scripts). It bridges to the async
   repository with :func:`asyncio.run` and is **not** callable from
   inside a running event loop.
+
+M5.1 also threads the per-tenant fallback chain through this cache:
+:TenantLLMConfigCache._fallback_chain_cache` stores per-tenant
+``TenantFallbackChain`` rows with the same LRU+TTL shape; the
+async build path awaits :meth:`_resolve_chain_steps` before
+constructing the inner gateway so the chain honours whichever source
+wins (per-tenant row → env chain → strict-mode raise).
 """
 from __future__ import annotations
 
@@ -31,12 +38,14 @@ import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any
 
+from core.business_metrics import LLM_TENANT_FALLBACK_CHAIN_TOTAL
 from llm_client.exceptions import TenantLlmNotConfigured
 from llm_client.resolvers import Resolver
 from llm_client.tenant_config_models import TenantLLMConfigRepository
 
 if TYPE_CHECKING:
     from llm_client.gateway import LLMGateway
+    from llm_client.tenant_fallback_chain_cache import TenantFallbackChainCache
     from llm_client.types import ChatRequest, ChatResponse
 
 
@@ -65,9 +74,9 @@ class TenantLLMConfigCache:
     """In-process LRU + TTL cache of per-tenant resolvers.
 
     Construction takes ``ttl_s`` + ``maxsize`` from settings (default
-    60s / 1024). ``repo`` / ``cipher`` / ``settings`` are injected so
-    tests can pass fakes without going through the real DB / Fernet /
-    Settings stack.
+    60s / 1024). ``repo`` / ``cipher`` / ``settings`` /
+    ``fallback_chain_cache`` are injected so tests can pass fakes
+    without going through the real DB / Fernet / Settings stack.
     """
 
     def __init__(
@@ -78,6 +87,7 @@ class TenantLLMConfigCache:
         repo: TenantLLMConfigRepository | None = None,
         cipher: Any | None = None,
         settings: Any | None = None,
+        fallback_chain_cache: TenantFallbackChainCache | None = None,
     ) -> None:
         self._ttl_s = ttl_s
         self._maxsize = maxsize
@@ -88,6 +98,30 @@ class TenantLLMConfigCache:
         # any DB or Fernet state. ``_build_providers`` uses them.
         self._cipher = cipher
         self._settings = settings
+        # Lazy import inside the constructor body is unnecessary here —
+        # the cache module is a thin leaf that imports only the models
+        # file, no circular-dep risk at import time. We still defer the
+        # *construction* so callers can pass a fully-configured cache
+        # (with their own repo/settings) via ``fallback_chain_cache``.
+        if fallback_chain_cache is None:
+            from llm_client.tenant_fallback_chain_cache import (
+                TenantFallbackChainCache,
+            )
+
+            fallback_chain_cache = TenantFallbackChainCache(
+                ttl_s=(
+                    settings.llm_tenant_fallback_chain_ttl_s
+                    if settings is not None
+                    else 60.0
+                ),
+                maxsize=(
+                    settings.llm_tenant_fallback_chain_cache_maxsize
+                    if settings is not None
+                    else 1024
+                ),
+                settings=settings,
+            )
+        self._fallback_chain_cache = fallback_chain_cache
 
     # ---- public cache API -------------------------------------------------
 
@@ -151,6 +185,9 @@ class TenantLLMConfigCache:
             self._repo.list_by_tenant(tenant_id, enabled_only=True)
         )
         providers = self._build_providers(rows)
+        # Sync test path: derive the env chain inline (test fixtures
+        # don't await ``_resolve_chain_steps``). Production always
+        # calls ``build_tenant_resolver`` which awaits it.
         return self._raise_or_return(tenant_id, providers)
 
     def _build_providers(self, rows: list[Any]) -> dict[str, Any]:
@@ -224,13 +261,109 @@ class TenantLLMConfigCache:
             # Unknown provider_name: silently skip — surfaces in admin API tests
         return out
 
+    async def _resolve_chain_steps(
+        self,
+        tenant_id: str,
+    ) -> list[tuple[str, str]]:
+        """Return the fallback chain steps for this tenant.
+
+        Order of precedence:
+          1. Per-tenant row from cache (or repo on miss), if enabled
+             and has at least one enabled step.
+          2. Env chain (``RuntimeChain`` singleton — seeded lazily from
+             ``settings.llm_fallback_chain`` on first read).
+          3. Strict mode raises ``TenantFallbackChainNotConfigured``
+             when both sources are empty AND
+             ``LLM_TENANT_FALLBACK_CHAIN_REQUIRED`` is True.
+
+        Increments ``LLM_TENANT_FALLBACK_CHAIN_TOTAL{outcome}`` based
+        on the outcome so a dashboard can split "tenant explicitly
+        configured" from "fell back to env" without per-tenant labels.
+        """
+        from llm_client.provider_registry import parse_fallback_chain_env
+        from llm_client.runtime_chain import get_runtime_chain
+
+        # 1. Per-tenant row.
+        chain_row = self._fallback_chain_cache.get(tenant_id)
+        if chain_row is None:
+            # Cache miss — fetch from repo. Tolerate transient DB
+            # errors by treating them as "no row" rather than
+            # 500-ing the call site; the env chain below covers the
+            # gap.
+            try:
+                chain_row = await self._fallback_chain_cache._repo.get(
+                    tenant_id,
+                )
+            except Exception:
+                chain_row = None
+            # Cache the result (None included) so subsequent lookups
+            # within the TTL skip the DB round-trip. Admin writes
+            # call ``fallback_chain_cache.invalidate``.
+            self._fallback_chain_cache.put(tenant_id, chain_row)
+
+        tenant_steps: list[tuple[str, str]] | None = None
+        if chain_row is not None and chain_row.enabled:
+            enabled_steps = [
+                s for s in (chain_row.steps or []) if s.get("enabled", True)
+            ]
+            if enabled_steps:
+                tenant_steps = [
+                    (s["provider"], s["model"]) for s in enabled_steps
+                ]
+                LLM_TENANT_FALLBACK_CHAIN_TOTAL.labels(outcome="hit").inc()
+            else:
+                LLM_TENANT_FALLBACK_CHAIN_TOTAL.labels(outcome="disabled").inc()
+        elif chain_row is not None:
+            LLM_TENANT_FALLBACK_CHAIN_TOTAL.labels(outcome="disabled").inc()
+        else:
+            LLM_TENANT_FALLBACK_CHAIN_TOTAL.labels(outcome="miss").inc()
+
+        if tenant_steps is not None:
+            return tenant_steps
+
+        # 2. Env chain fallback.
+        runtime = get_runtime_chain()
+        if self._settings is not None and not runtime.snapshot():
+            env_steps = parse_fallback_chain_env(
+                getattr(self._settings, "llm_fallback_chain", None),
+            )
+            if env_steps:
+                runtime.initial_steps(env_steps)
+        env_chain_steps = runtime.active_chain() or None
+        if env_chain_steps:
+            return env_chain_steps
+
+        # 3. Strict mode.
+        if self._settings is not None and getattr(
+            self._settings,
+            "llm_tenant_fallback_chain_required",
+            False,
+        ):
+            from llm_client.exceptions import TenantFallbackChainNotConfigured
+
+            LLM_TENANT_FALLBACK_CHAIN_TOTAL.labels(
+                outcome="unconfigured",
+            ).inc()
+            raise TenantFallbackChainNotConfigured(tenant_id=tenant_id)
+
+        return []
+
     def _raise_or_return(
         self,
         tenant_id: str,
         providers: dict[str, Any],
         known_providers: list[str] | None = None,
+        *,
+        chain_steps: list[tuple[str, str]] | None = None,
     ) -> Resolver:
         """Build the inner gateway; raise TenantLlmNotConfigured if empty.
+
+        ``chain_steps`` is the pre-computed fallback chain from
+        :meth:`_resolve_chain_steps`. When ``None`` (the default,
+        used by the synchronous test path), the env chain is
+        computed inline via the same logic; production callers
+        always pass a pre-resolved value so the chain policy (per-tenant
+        → env → strict-mode raise) is honoured.
 
         The ``known_providers`` argument is used only for exception
         construction; the build proceeds whenever ``providers`` has
@@ -264,7 +397,11 @@ class TenantLLMConfigCache:
             )
             if env_steps:
                 runtime.initial_steps(env_steps)
-        chain = runtime.active_chain() or None
+        chain = (
+            chain_steps
+            if chain_steps is not None
+            else (runtime.active_chain() or None)
+        )
         gateway = LLMGateway(
             providers=providers,
             default_fallback_chain=chain,
@@ -293,15 +430,27 @@ async def build_tenant_resolver(
     (Task 3) — awaits the repository call and reuses the cache for
     subsequent calls in the same tenant.
 
+    On cache miss the per-tenant chain is awaited via
+    :meth:`TenantLLMConfigCache._resolve_chain_steps` BEFORE the inner
+    gateway is built, so the chain honours whichever source wins
+    (per-tenant row → env chain → strict-mode raise).
+
     Raises:
         TenantLlmNotConfigured: tenant has no enabled provider configs.
+        TenantFallbackChainNotConfigured: strict mode on, no chain
+            available from any source (per-tenant row or env).
     """
     cached = cache.get(tenant_id)
     if cached is not None:
         return cached
     rows = await cache._repo.list_by_tenant(tenant_id, enabled_only=True)
     providers = cache._build_providers(rows)
-    return cache._raise_or_return(tenant_id, providers)
+    chain_steps = await cache._resolve_chain_steps(tenant_id)
+    return cache._raise_or_return(
+        tenant_id,
+        providers,
+        chain_steps=chain_steps,
+    )
 
 
 class TenantResolver:
