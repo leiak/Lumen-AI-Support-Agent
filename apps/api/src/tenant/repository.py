@@ -81,6 +81,60 @@ class TenantRepository:
             await session.refresh(tenant)
             return tenant
 
+    async def update_settings(
+        self,
+        tenant_id: str,
+        *,
+        settings: dict[str, Any],
+    ) -> Tenant | None:
+        """Replace the JSONB ``settings`` column wholesale.
+
+        Used by per-tenant config editors (e.g. assignment policy).
+        Callers that want a partial update should ``read → merge →
+        write`` at the call site. Returns the refreshed Tenant or
+        ``None`` if the row was deleted concurrently.
+        """
+        async with get_session() as session:
+            tenant = await session.get(Tenant, tenant_id)
+            if tenant is None:
+                return None
+            tenant.settings = settings
+            await session.commit()
+            await session.refresh(tenant)
+            return tenant
+
+    async def get_settings(self, tenant_id: str) -> dict[str, Any] | None:
+        """Read the JSONB ``settings`` column.
+
+        Returns ``None`` when the tenant does not exist (vs. an empty
+        dict when the row exists but no settings were ever written).
+        Callers that want a specific subkey should read the whole dict
+        and look up the key — settings payloads are tiny.
+        """
+        async with get_session() as session:
+            tenant = await session.get(Tenant, tenant_id)
+            if tenant is None:
+                return None
+            return dict(tenant.settings or {})
+
+    async def get_assignment_policy(
+        self, tenant_id: str
+    ) -> dict[str, Any] | None:
+        """Return the ``settings['assignment_policy']`` sub-dict, or ``None``.
+
+        Centralised here so callers don't need to know the storage
+        shape. ``None`` means either the tenant doesn't exist or the
+        policy key has never been set — both should fall back to
+        default (disabled) behaviour at the strategy layer.
+        """
+        async with get_session() as session:
+            tenant = await session.get(Tenant, tenant_id)
+            if tenant is None:
+                return None
+            raw = tenant.settings or {}
+            policy = raw.get("assignment_policy")
+            return dict(policy) if policy else None
+
 
 class UserRepository:
     """CRUD for User rows."""
