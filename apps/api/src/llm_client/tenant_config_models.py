@@ -1,8 +1,10 @@
-"""ORM model + repository for ``tenant_llm_configs`` (M4.C BYOK).
+"""ORM model + repository for ``tenant_llm_configs`` (M4.C BYOK + M5.2).
 
 Schema per M4.C spec §6.1: per-(tenant, provider) row with Fernet-
 encrypted API key, optional base_url override, and an enabled flag
-for ops-level disable without row deletion.
+for ops-level disable without row deletion. M5.2 adds an optional
+``model`` column for per-tenant LLM model override (NULL = use
+project default).
 """
 from __future__ import annotations
 
@@ -27,10 +29,10 @@ from core.database import Base, get_sessionmaker
 from core.id_gen import new_id
 
 # Sentinel for ``update()``: distinguishes "argument omitted" from "argument
-# explicitly passed as None". Used by ``base_url`` so callers can clear the
-# column by passing ``None`` (Pydantic-friendly) without us treating it as
-# "field not provided". Mark as ``object`` so mypy stops complaining about
-# the union type leaking into the public API.
+# explicitly passed as None". Used by ``base_url`` and ``model`` so callers
+# can clear those columns by passing ``None`` (Pydantic-friendly) without us
+# treating it as "field not provided". Mark as ``object`` so mypy stops
+# complaining about the union type leaking into the public API.
 _UNSET: object = object()
 
 
@@ -54,6 +56,7 @@ class TenantLLMConfig(Base):
     provider_name: Mapped[str] = mapped_column(String(64), nullable=False)
     encrypted_api_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     base_url: Mapped[str | None] = mapped_column(String(512))
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False,
@@ -89,11 +92,17 @@ class TenantLLMConfigRepository:
         encrypted_api_key: bytes,
         base_url: str | None,
         enabled: bool = True,
+        model: str | None = None,
     ) -> TenantLLMConfig:
         """Insert or update a (tenant_id, provider_name) row.
 
         Uses INSERT ... ON CONFLICT (Postgres-specific) for atomicity.
         The unique constraint enforces one row per pair.
+
+        ``model`` is the M5.2 per-tenant model override. ``None`` (the
+        default) means "no override; project default applies". Existing
+        callers that don't pass ``model`` keep their current behavior
+        (NULL column = no override).
         """
         sm = get_sessionmaker()
         async with sm() as session:
@@ -105,6 +114,7 @@ class TenantLLMConfigRepository:
                     provider_name=provider_name,
                     encrypted_api_key=encrypted_api_key,
                     base_url=base_url,
+                    model=model,
                     enabled=enabled,
                 )
                 .on_conflict_do_update(
@@ -112,6 +122,7 @@ class TenantLLMConfigRepository:
                     set_={
                         "encrypted_api_key": encrypted_api_key,
                         "base_url": base_url,
+                        "model": model,
                         "enabled": enabled,
                         "updated_at": func.now(),
                     },
@@ -131,14 +142,18 @@ class TenantLLMConfigRepository:
         provider_name: str,
         enabled: bool | None = None,
         base_url: str | object | None = _UNSET,
+        model: str | object | None = _UNSET,
     ) -> TenantLLMConfig | None:
         """Update mutable sidecar fields without rotating the API key.
 
         Tier 1 Task 1.3: enables the admin SPA to flip ``enabled`` or
         change ``base_url`` without re-submitting the plaintext key
-        (which would re-encrypt it under Fernet). Either field can be
-        omitted by passing ``None`` (``enabled``) or the sentinel
-        ``_UNSET`` (``base_url``). Returns ``None`` if no row matches.
+        (which would re-encrypt it under Fernet). M5.2 adds ``model``
+        (per-tenant model override). Fields can be omitted by passing
+        ``None`` (``enabled``) or the sentinel ``_UNSET`` (``base_url``
+        / ``model``). Omitting a field is a no-op; passing ``None`` for
+        ``base_url`` / ``model`` clears it. Returns ``None`` if no row
+        matches.
         """
         sm = get_sessionmaker()
         async with sm() as session:
@@ -147,6 +162,8 @@ class TenantLLMConfigRepository:
                 values["enabled"] = enabled
             if base_url is not _UNSET:
                 values["base_url"] = base_url  # may be None to clear
+            if model is not _UNSET:
+                values["model"] = model  # may be None to clear
             stmt = (
                 update(TenantLLMConfig)
                 .where(
