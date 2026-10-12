@@ -40,7 +40,7 @@
 | 27 (M5.1) | LLM Gateway per-tenant fallback chain — `tenant_fallback_chains` (JSONB steps, GIN index) + `TenantFallbackChainCache` (LRU+TTL singleton in `_build_fallback_chain_cache()`) + admin POST/GET/DELETE `/api/v1/admin/tenants/{id}/fallback-chain` (cache invalidation on write) + strict-mode `TenantFallbackChainNotConfigured` + `lumen_llm_tenant_fallback_chain_total{outcome}` zero-label counter + 3 settings (`LLM_TENANT_FALLBACK_CHAIN_REQUIRED` / `_TTL_S` / `_CACHE_MAXSIZE`) | ✅ | 11 repo + 10 cache + 9 resolver + 16 admin + 1 e2e = **47 new tests** |
 | 28 (M5.2) | LLM Gateway per-tenant model override — `tenant_llm_configs.model` (nullable) + `TenantModelOverrideResolver` (rewrites `request.model` at resolver seam after provider pick) + admin POST/PATCH schema extension + `lumen_llm_tenant_model_override_total{provider,outcome}` zero-label counter | ✅ | 5 ORM + 8 resolver + 4 integration + 6 admin = **23 new tests** |
 | 29 (AI 失败 handoff) | 当 LLM 返回 `FALLBACK_MESSAGE` (budget / provider / output / graph / empty) 时,后端在 `record_message` 落库后**自动**调 `ConversationService.escalate_to_human_queue(...)` 把会话翻成 `status=PENDING, ai_handling=False, assigned_agent_id=NULL` — 客户看到兜底回复,人工可在 agent `/inbox` 队列接手。Widget (`channel.inbound`) + Email (`channel.inbound_email`) 两个 inbound 路径同时修。配套: SPA `/inbox` 用 `useIsAdmin()` 切 queryFn — admin 调 `GET /api/v1/conversations`(全租户,后端 `require_admin` 已存在),agent 继续调 `GET /api/v1/conversations/inbox`(assigned-to-me) | ✅ | 5 backend (escalate fires / normal no-op / escalate failure no-abort × widget+email) + 3 frontend (admin calls /conversations / agent still /inbox / admin title+empty) = **8 new tests** |
-| 30 (Auto-assignment policy) | per-tenant 自动分配策略 — 存在 `tenants.settings['assignment_policy']` (JSONB,0 migration);`AssignmentPolicyService.least_busy` 在 `ConversationService.escalate_to_human_queue` 之后**best-effort** 调 `assign_to_agent` — 选当前 open+pending 最少的 active agent+supervisor(lex tiebreak);失败 swallow 跟 FALLBACK_MESSAGE 走 escalate 一致。Admin SPA `/admin/tenant-settings` 新增 "自动分配策略" 卡片:strategy `manual` / `least_busy` + enabled toggle + 保存(读-merge-写,其它 settings key 不动)。Admin API `GET/PATCH /api/v1/admin/tenants/{tid}/assignment-policy`(anti-enumeration 404,strategy enum 422)。manual 是 explicit opt-out sentinel;`least_busy` 是当前唯一自动策略。新增策略 = 新 enum value + 新 service method(50 行内)。 | ✅ | 2 repo (settings round-trip) + 6 assignment (single/tiebreak/exclude/none + enabled_for + default_resolver) + 5 service (no-policy/with-policy/no-candidates/resolver-failure/default-wired) + 5 admin API (defaults/merge/422/cross-tenant × 2) + 2 frontend (renders + save PATCH) = **20 new tests + 7 commit** (live verified: enabled → 01HZDEMO…001 自动认领;disabled → 保留 NULL) |
+| 30 (Auto-assignment policy) | per-tenant 自动分配策略 — 存在 `tenants.settings['assignment_policy']` (JSONB,0 migration);`AssignmentPolicyService.least_busy` 在 `ConversationService.escalate_to_human_queue` 之后**best-effort** 调 `assign_to_agent` — 选当前 open+pending 最少的 active agent+supervisor(lex tiebreak);失败 swallow 跟 FALLBACK_MESSAGE 走 escalate 一致。Admin SPA `/admin/tenant-settings` 新增 "自动分配策略" 卡片:strategy `manual` / `least_busy` + enabled toggle + 保存(读-merge-写,其它 settings key 不动)。Admin API `GET/PATCH /api/v1/admin/tenants/{tid}/assignment-policy`(anti-enumeration 404,strategy enum 422)。manual 是 explicit opt-out sentinel;`least_busy` 是当前唯一自动策略。新增策略 = 新 enum value + 新 service method(50 行内)。截图:[`images/admin_pages/19_admin_tenant_settings.png`](images/admin_pages/19_admin_tenant_settings.png) + [`images/admin_assignment_policy_card.png`](images/admin_assignment_policy_card.png)。 | ✅ | 2 repo (settings round-trip) + 6 assignment (single/tiebreak/exclude/none + enabled_for + default_resolver) + 5 service (no-policy/with-policy/no-candidates/resolver-failure/default-wired) + 5 admin API (defaults/merge/422/cross-tenant × 2) + 2 frontend (renders + save PATCH) = **20 new tests + 7 commit** (live verified: enabled → 01HZDEMO…001 自动认领;disabled → 保留 NULL) |
 | 31 (M5.3) | Tenant LLM config audit log — `tenant_llm_config_audit_log` (append-only, one row per field change; FK only to `tenants` ON DELETE CASCADE, NOT to `tenant_llm_configs`; `field` is Pydantic `Literal[...]` validated VARCHAR(32)) + `AdminTenantLLMConfigRepository` rewrite to own its session (single-transaction audit + mutation; old_row fetched via `get_by_tenant_provider_for_provider(session=...)`) + inner `TenantLLMConfigRepository.upsert/update/delete_by_tenant_provider` gain `session: AsyncSession \| None = None` for back-compat + `_diff_upsert` helper (POST diff all / PATCH only fields in `payload.model_fields_set` AND with changed value / DELETE bypass) + `GET /api/v1/admin/tenants/{id}/llm-configs/audit?provider_name=&limit=&offset=` (paginated, `{entries, total}` envelope, DESC by `changed_at`) + `audit.llm_config.changed` python INFO structlog event per mutation (one line per request, not per audit row) | ✅ | 9 ORM + repo (`test_tenant_config_audit_models.py`) + 9 diff (`test_admin_llm_config_diff.py` via `_call` snapshot adapter — `_diff_upsert` takes `old_base_url/old_model/old_enabled` scalars not an ORM object, snapshot BEFORE inner mutation so SQLAlchemy identity map doesn't bite) + 13 wrapper integration (`test_admin_llm_config_audit_integration.py` incl. **3 ⭐ atomicity**: POST/PATCH/DELETE rollback on audit INSERT failure) + 10 GET endpoint (`test_tenant_llm_config_audit_api.py`) = **41 new tests + 5 commit** (4 task commits + 1 docs+test+e2e+round11) |
 | 顺手 bugfixes | `BudgetResolver._PrefixResolver` 单 provider 处理 + `stream_chat` async-context guard (loop-running detect) | ✅ | 2 new tests (prefix resolver + stream_chat loop) |
 | 探索性测试 (2026-10-11) | 8 轮端到端探索 (`tests/e2e/scripts/explore.py`):多轮上下文 / 边界输入 / 并发与隔离 / Budget / KB RAG / suggest-reply / Ticket / 流式稳定性 — 发现 **3 个产品级 bug**(已修 2:#1 widget external_user_id / #2 KB seed 缺 indexing pipeline) | ✅ | 28 OK / 2 WARN / 0 FAIL / 13 INSIGHT |
@@ -260,6 +260,33 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 详细演示流程见 [`docs/demo-script.md`](docs/demo-script.md)。自动化截图见
 [`tests/e2e/scripts/record-demo.sh`](tests/e2e/scripts/record-demo.sh)(或 Windows 的
 `record-demo.ps1`)—— 产 11 张 PNG 到 `images/demo-act{N}-{step}.png`。
+
+### Admin 工作台截图 (M5.3)
+
+`images/admin_pages/` 下 17 张 SPA 截图,以 admin (`admin@example.com` / `Demo123!`) 登录后抓取,
+覆盖全部 12 个 admin 页面 + 5 个通用页面。Playwright 脚本:[`images/shot_all_admin_pages.py`](images/shot_all_admin_pages.py)。
+
+| 截图 | 说明 |
+|---|---|
+| [`admin_pages/01_inbox.png`](images/admin_pages/01_inbox.png) | 收件箱 — 6 条会话,3 条 "未分配"(auto-assign 策略待启用) |
+| [`admin_pages/02_inbox_detail.png`](images/admin_pages/02_inbox_detail.png) | 会话详情 — 历史消息 / 建议回复 / assign 按钮 |
+| [`admin_pages/03_kb.png`](images/admin_pages/03_kb.png) | 知识库列表 |
+| [`admin_pages/04_kb_detail.png`](images/admin_pages/04_kb_detail.png) | KB 详情 — 文章列表 |
+| [`admin_pages/05_settings.png`](images/admin_pages/05_settings.png) | 个人设置 |
+| [`admin_pages/10_admin_dashboard.png`](images/admin_pages/10_admin_dashboard.png) | 仪表盘 — 业务指标 |
+| [`admin_pages/11_admin_sla_policies.png`](images/admin_pages/11_admin_sla_policies.png) | SLA 策略 — 4 条策略 (P0/P1/P2) |
+| [`admin_pages/12_admin_budget.png`](images/admin_pages/12_admin_budget.png) | 预算 — 20000 hard cap / 10000 soft warn |
+| [`admin_pages/13_admin_tickets.png`](images/admin_pages/13_admin_tickets.png) | 工单列表 — in_progress / waiting_customer / resolved |
+| [`admin_pages/14_admin_ticket_detail.png`](images/admin_pages/14_admin_ticket_detail.png) | 工单详情 — SLA timer / 状态机 |
+| [`admin_pages/15_admin_kb_drafts.png`](images/admin_pages/15_admin_kb_drafts.png) | KB 草稿 (history mining 输出) |
+| [`admin_pages/16_admin_llm_chain.png`](images/admin_pages/16_admin_llm_chain.png) | LLM 链路 — per-tenant fallback chain (M5.1) |
+| [`admin_pages/17_admin_llm_configs.png`](images/admin_pages/17_admin_llm_configs.png) | LLM 配置 — per-tenant model override (M5.2) + audit log |
+| [`admin_pages/18_admin_users.png`](images/admin_pages/18_admin_users.png) | 用户管理 — admin / agent / supervisor / viewer |
+| [`admin_pages/19_admin_tenant_settings.png`](images/admin_pages/19_admin_tenant_settings.png) | **租户设置** — 含「自动分配策略」卡片(见 Row 30) |
+| [`admin_pages/20_admin_widget_config.png`](images/admin_pages/20_admin_widget_config.png) | Widget 配置 — 颜色 / CORS / 浮窗位置 |
+| [`admin_pages/21_admin_search.png`](images/admin_pages/21_admin_search.png) | 跨租户搜索 — 全文检索 KB / 工单 / 会话 |
+
+复现:登录后跑 `python images/shot_all_admin_pages.py` 即可重新生成全部 17 张。
 
 ## 关键设计
 
