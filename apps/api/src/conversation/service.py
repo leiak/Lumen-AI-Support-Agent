@@ -44,6 +44,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Type alias for the auto-assign resolver seam. The escalation path
+# passes the tenant_id and expects back an agent id (or None to fall
+# back to the current PENDING+NULL behaviour). Imported as a
+# TYPE_CHECKING alias in production code to avoid a circular import
+# with the assignment module.
+PolicyResolver = Callable[[str], "Any"]
+
 
 async def _try_auto_create_ticket(
     *,
@@ -160,6 +167,7 @@ class ConversationService:
         *,
         clock: Callable[[], datetime] | None = None,
         ticket_service_factory: Callable[[AsyncSession], TicketService] | None = None,
+        policy_resolver: Callable[[str], "Any"] | None = None,
     ) -> None:
         self._repo = repo or ConversationRepository()
         self._message_repo = message_repo or MessageRepository()
@@ -176,6 +184,19 @@ class ConversationService:
         # ticket transaction silently rolled back at GC. ``channel.inbound``
         # wires this up; agent-reply / escalation paths leave it None.
         self._ticket_service_factory = ticket_service_factory
+        # Optional auto-assign hook invoked from ``escalate_to_human_queue``.
+        # When set, an async callable that accepts ``tenant_id`` and
+        # returns an agent id (or None to skip auto-assign). Lazy
+        # defaulting delegates to ``assignment.service.default_resolver``,
+        # the production per-tenant policy engine (least-busy). Tests
+        # inject fakes to pin behaviour without touching the real
+        # strategy layer.
+        if policy_resolver is None:
+            from assignment.service import default_resolver as _default_resolver
+
+            self._policy_resolver: Callable[[str], "Any"] | None = _default_resolver
+        else:
+            self._policy_resolver = policy_resolver
 
     # ---- Inbound / lookup ----
 
@@ -462,6 +483,14 @@ class ConversationService:
         AI auto-reply's ``escalate_to_human`` tool. The conversation
         sits in the human queue waiting to be claimed by an agent.
 
+        If the tenant has an auto-assignment policy enabled
+        (``tenants.settings['assignment_policy']``), the resolver
+        passed at construction time picks an agent and the
+        conversation is auto-assigned in the same escalation.
+        Otherwise the conversation lands PENDING+NULL exactly as
+        before — current behaviour preserved for tenants that
+        haven't opted in.
+
         Returns ``None`` on cross-tenant / missing. Updates
         ``last_activity_at`` so the conversation sorts to the top of
         the queue. Tenant isolation is re-validated by the inner
@@ -486,7 +515,75 @@ class ConversationService:
                     "tenant_id": tenant_id,
                 },
             )
+        # Best-effort auto-assign via the policy resolver. Failure
+        # here is a soft miss on routing — the conversation is
+        # already durably in PENDING, so we don't re-raise. Matches
+        # the swallow-and-warn shape of inbound's escalate path.
+        if updated is not None:
+            await self._auto_assign_after_escalate(
+                tenant_id=tenant_id, conversation_id=conversation_id
+            )
         return updated
+
+    async def _auto_assign_after_escalate(
+        self, *, tenant_id: str, conversation_id: str
+    ) -> None:
+        """Best-effort auto-assign after a successful escalation.
+
+        Resolves an agent id via the injected policy_resolver and,
+        if one is returned, calls :meth:`assign_to_agent` to move
+        the conversation from PENDING+NULL to PENDING+agent. Every
+        step is wrapped in ``try/except`` so a policy-engine blip
+        or assign failure cannot poison the escalation path —
+        the customer-facing inbound flow must always finish
+        durable.
+
+        No-ops when:
+        * no resolver was injected and the default resolver is None
+        * the resolver returns None (policy disabled, no candidates,
+          unknown strategy)
+        """
+        if self._policy_resolver is None:
+            return
+        try:
+            agent_id = await self._policy_resolver(tenant_id)
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "conversation policy_resolver raised",
+                extra={
+                    "conversation_id": conversation_id,
+                    "tenant_id": tenant_id,
+                },
+                exc_info=True,
+            )
+            return
+        if agent_id is None:
+            return
+        try:
+            assigned = await self.assign_to_agent(
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                agent_id=agent_id,
+            )
+            if assigned is not None:
+                logger.info(
+                    "conversation auto-assigned by policy",
+                    extra={
+                        "conversation_id": conversation_id,
+                        "tenant_id": tenant_id,
+                        "agent_id": agent_id,
+                    },
+                )
+        except Exception:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "conversation policy auto-assign failed",
+                extra={
+                    "conversation_id": conversation_id,
+                    "tenant_id": tenant_id,
+                    "agent_id": agent_id,
+                },
+                exc_info=True,
+            )
 
     async def return_to_ai(
         self, *, tenant_id: str, conversation_id: str

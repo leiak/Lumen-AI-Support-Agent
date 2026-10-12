@@ -985,3 +985,154 @@ def test_conversation_service_accepts_ticket_service_factory_kwarg():
         return None
     svc = ConversationService(ticket_service_factory=factory)
     assert svc._ticket_service_factory is factory
+
+
+# ---- escalate_to_human_queue + policy_resolver seam ----
+
+
+@pytest.mark.asyncio
+async def test_escalate_no_policy_leaves_agent_none() -> None:
+    """Resolver returns None → conversation stays PENDING+NULL (current behaviour).
+
+    The policy engine is opt-in. When the resolver says "no decision"
+    (policy disabled / no candidates), the conversation lands in
+    the human queue exactly as it did before this feature shipped.
+    """
+    conv = _conv(tenant_id="t1", ai_handling=False, assigned_agent_id=None)
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.update = AsyncMock(side_effect=lambda c: c)
+    policy_resolver = AsyncMock(return_value=None)
+    svc = ConversationService(
+        repo=conv_repo,
+        clock=lambda: FROZEN_NOW,
+        policy_resolver=policy_resolver,
+    )
+
+    result = await svc.escalate_to_human_queue(
+        tenant_id="t1", conversation_id=conv.id
+    )
+
+    assert result is not None
+    assert result.status == ConversationStatus.PENDING
+    assert result.assigned_agent_id is None
+    assert result.ai_handling is False
+    # Resolver was consulted; assign_to_agent was NOT called.
+    policy_resolver.assert_awaited_once_with("t1")
+    conv_repo.update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_escalate_with_policy_picks_least_busy_agent() -> None:
+    """Resolver returns an agent id → assign_to_agent runs after escalate.
+
+    The escalation write happens FIRST (PENDING+NULL), then the
+    auto-assign call moves it to PENDING+agent. Two conv_repo.update
+    calls in total — one from escalate, one from assign_to_agent's
+    internal write.
+    """
+    conv = _conv(tenant_id="t1", ai_handling=False, assigned_agent_id=None)
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.update = AsyncMock(side_effect=lambda c: c)
+    policy_resolver = AsyncMock(return_value="u_agent_1")
+    svc = ConversationService(
+        repo=conv_repo,
+        clock=lambda: FROZEN_NOW,
+        policy_resolver=policy_resolver,
+    )
+
+    result = await svc.escalate_to_human_queue(
+        tenant_id="t1", conversation_id=conv.id
+    )
+
+    assert result is not None
+    assert result.status == ConversationStatus.PENDING
+    assert result.assigned_agent_id == "u_agent_1"
+    # Two writes: escalate (PENDING+NULL) then assign (PENDING+agent).
+    assert conv_repo.update.await_count == 2
+    policy_resolver.assert_awaited_once_with("t1")
+
+
+@pytest.mark.asyncio
+async def test_escalate_policy_no_candidates_falls_back_to_unassigned() -> None:
+    """Resolver returns None on a policy-enabled tenant → no assign call.
+
+    This is the "least_busy picked no candidates" case — the
+    tenant opted in but no active agent+supervisor users exist.
+    The conversation still escalates, but stays unassigned for an
+    agent to claim manually.
+    """
+    conv = _conv(tenant_id="t1", ai_handling=False, assigned_agent_id=None)
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.update = AsyncMock(side_effect=lambda c: c)
+    policy_resolver = AsyncMock(return_value=None)
+    svc = ConversationService(
+        repo=conv_repo,
+        clock=lambda: FROZEN_NOW,
+        policy_resolver=policy_resolver,
+    )
+
+    result = await svc.escalate_to_human_queue(
+        tenant_id="t1", conversation_id=conv.id
+    )
+
+    assert result is not None
+    assert result.assigned_agent_id is None
+    assert conv_repo.update.await_count == 1  # escalate only
+    policy_resolver.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_escalate_policy_failure_does_not_abort_escalate() -> None:
+    """Resolver raises → escalation still completes with PENDING+NULL.
+
+    The auto-assign path is best-effort. A policy-engine blip
+    (DB connection drop / JSON parse error / future strategy
+    failure) must NOT bubble up and undo the customer-facing
+    escalation. The conversation lands PENDING+NULL exactly as it
+    would without a policy.
+    """
+    conv = _conv(tenant_id="t1", ai_handling=False, assigned_agent_id=None)
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.update = AsyncMock(side_effect=lambda c: c)
+    policy_resolver = AsyncMock(side_effect=RuntimeError("policy db blip"))
+    svc = ConversationService(
+        repo=conv_repo,
+        clock=lambda: FROZEN_NOW,
+        policy_resolver=policy_resolver,
+    )
+
+    # Must NOT raise.
+    result = await svc.escalate_to_human_queue(
+        tenant_id="t1", conversation_id=conv.id
+    )
+
+    assert result is not None
+    assert result.status == ConversationStatus.PENDING
+    assert result.assigned_agent_id is None
+    # Single write (escalate). The resolver's exception is swallowed.
+    assert conv_repo.update.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_escalate_default_resolver_is_assignment_policy() -> None:
+    """No resolver injected → the default_resolver (AssignmentPolicyService) is used.
+
+    Locks the production wiring so a future refactor that drops the
+    default doesn't silently bypass the policy engine.
+    """
+    conv = _conv(tenant_id="t1", ai_handling=False, assigned_agent_id=None)
+    conv_repo = MagicMock()
+    conv_repo.get_by_id = AsyncMock(return_value=conv)
+    conv_repo.update = AsyncMock(side_effect=lambda c: c)
+    svc = ConversationService(repo=conv_repo, clock=lambda: FROZEN_NOW)
+
+    assert svc._policy_resolver is not None
+    # The default resolver is the module-level default_resolver from
+    # assignment.service — confirm by identity.
+    from assignment.service import default_resolver
+
+    assert svc._policy_resolver is default_resolver
