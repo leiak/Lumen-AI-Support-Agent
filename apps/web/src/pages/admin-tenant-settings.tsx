@@ -1,10 +1,17 @@
 import { useEffect, useState } from 'react';
-import { Building2 } from 'lucide-react';
+import { Building2, UserCheck } from 'lucide-react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  ASSIGNMENT_STRATEGIES,
+  fetchAssignmentPolicy,
+  patchAssignmentPolicy,
+  type AssignmentPolicy,
+  type AssignmentStrategy,
+} from '@/lib/assignment-policy';
 import {
   fetchTenantSettings,
   patchTenantSettings,
@@ -195,6 +202,118 @@ function TenantSettingsEditor({
   );
 }
 
+const ASSIGNMENT_POLICY_QUERY_KEY = ['admin', 'assignment-policy'] as const;
+
+function AssignmentPolicyEditor({
+  initial,
+  tenantId,
+}: {
+  initial: AssignmentPolicy;
+  tenantId: string;
+}): JSX.Element {
+  const qc = useQueryClient();
+  const [enabled, setEnabled] = useState(initial.enabled);
+  const [strategy, setStrategy] = useState<AssignmentStrategy>(initial.strategy);
+
+  // Re-sync local state when the underlying query refetches (e.g.
+  // after a successful PATCH followed by invalidation).
+  useEffect(() => {
+    setEnabled(initial.enabled);
+    setStrategy(initial.strategy);
+  }, [initial.enabled, initial.strategy]);
+
+  const dirty = enabled !== initial.enabled || strategy !== initial.strategy;
+
+  const patchMut = useMutation({
+    mutationFn: () => patchAssignmentPolicy(tenantId, { enabled, strategy }),
+    onSuccess: (next) => {
+      void qc.setQueryData(
+        [...ASSIGNMENT_POLICY_QUERY_KEY, tenantId],
+        next,
+      );
+    },
+  });
+
+  return (
+    <Card data-testid="assignment-policy-card">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <UserCheck className="h-4 w-4" />
+          自动分配策略
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">策略</span>
+            <select
+              className="rounded border px-2 py-1.5"
+              data-testid="assignment-policy-strategy"
+              value={strategy}
+              onChange={(e) =>
+                setStrategy(e.target.value as AssignmentStrategy)
+              }
+            >
+              {ASSIGNMENT_STRATEGIES.map((s) => (
+                <option key={s.value} value={s.value}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+            <span
+              className="text-xs text-muted-foreground"
+              data-testid="assignment-policy-hint"
+            >
+              {ASSIGNMENT_STRATEGIES.find((s) => s.value === strategy)?.hint}
+            </span>
+          </label>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-muted-foreground">启用</span>
+            <label
+              className="flex items-center gap-2 rounded border px-2 py-1.5"
+              data-testid="assignment-policy-enabled-row"
+            >
+              <input
+                type="checkbox"
+                data-testid="assignment-policy-enabled"
+                checked={enabled}
+                onChange={(e) => setEnabled(e.target.checked)}
+              />
+              <span>{enabled ? '已启用' : '未启用'}</span>
+            </label>
+            <span className="text-xs text-muted-foreground">
+              未启用时 escalate 后保留 PENDING+NULL,坐席手动认领
+            </span>
+          </label>
+        </div>
+        <div className="mt-3 flex justify-end">
+          <Button
+            type="button"
+            size="sm"
+            data-testid="assignment-policy-save"
+            onClick={() => patchMut.mutate()}
+            disabled={!dirty || patchMut.isPending}
+          >
+            {patchMut.isPending ? '保存中…' : '保存'}
+          </Button>
+        </div>
+        {patchMut.isError && (
+          <p
+            className="mt-2 text-xs text-destructive"
+            role="alert"
+            data-testid="assignment-policy-error"
+          >
+            保存失败:{' '}
+            {patchMut.error instanceof Error
+              ? patchMut.error.message
+              : '未知错误'}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function AdminTenantSettingsPage(): JSX.Element {
   const { user } = useCurrentUser();
   const tenantId = user?.tenant_id ?? '';
@@ -202,6 +321,12 @@ export function AdminTenantSettingsPage(): JSX.Element {
   const settingsQuery = useQuery({
     queryKey: [...TENANT_SETTINGS_QUERY_KEY, tenantId],
     queryFn: () => fetchTenantSettings(tenantId),
+    enabled: Boolean(tenantId),
+  });
+
+  const policyQuery = useQuery({
+    queryKey: [...ASSIGNMENT_POLICY_QUERY_KEY, tenantId],
+    queryFn: () => fetchAssignmentPolicy(tenantId),
     enabled: Boolean(tenantId),
   });
 
@@ -213,7 +338,7 @@ export function AdminTenantSettingsPage(): JSX.Element {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">租户设置</h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          查看 / 编辑当前租户的展示名称、套餐与状态。
+          查看 / 编辑当前租户的展示名称、套餐、状态与自动分配策略。
         </p>
       </div>
 
@@ -258,6 +383,19 @@ export function AdminTenantSettingsPage(): JSX.Element {
             initial={settingsQuery.data}
             tenantId={tenantId}
           />
+          {policyQuery.data ? (
+            <AssignmentPolicyEditor
+              initial={policyQuery.data}
+              tenantId={tenantId}
+            />
+          ) : policyQuery.isError ? (
+            <p
+              className="text-xs text-muted-foreground"
+              data-testid="assignment-policy-load-error"
+            >
+              自动分配策略加载失败,继续编辑租户设置即可。
+            </p>
+          ) : null}
         </>
       ) : null}
     </div>
