@@ -252,13 +252,25 @@ class TenantLLMConfigCache:
                     **({"base_url": row.base_url} if row.base_url else {}),
                 )
             elif row.provider_name == "openai":
+                # M5.2 — the ``OpenAIProvider.model`` attribute is dead
+                # code on the chat path (``openai_provider.chat`` uses
+                # ``request.model``, not ``self.model``). But the
+                # constructor still requires a non-None value, so we
+                # thread the project default for back-compat with
+                # ``anthropic`` branch above — and to keep OpenAI
+                # compatible providers (Doubao Ark, etc.) constructing
+                # without a TypeError even when ``Settings`` doesn't
+                # expose an ``openai_*`` field. The actual wire model
+                # is rewritten by ``TenantModelOverrideResolver`` at the
+                # resolver seam from ``tenant_llm_configs.model``.
                 out[row.provider_name] = OpenAIProvider(
                     api_key=api_key,
                     model=(
-                        self._settings.openai_model
+                        self._settings.default_llm_model
                         if self._settings is not None
-                        else None
-                    ) or "gpt-4o-mini",
+                        else "gpt-4o-mini"
+                    ),
+                    **({"base_url": row.base_url} if row.base_url else {}),
                 )
             # Unknown provider_name: silently skip — surfaces in admin API tests
         return out

@@ -11,7 +11,7 @@ the process).
 """
 from __future__ import annotations
 
-from unittest.mock import create_autospec
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 from prometheus_client import REGISTRY
@@ -215,9 +215,21 @@ async def test_ainvoke_rewrites_model_before_delegation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ainvoke_falls_back_to_sync_when_inner_has_no_ainvoke() -> None:
-    """Inner resolver is plain lambda → ``ainvoke`` returns provider via sync path."""
+async def test_ainvoke_falls_back_to_performing_chat_when_inner_has_no_ainvoke() -> None:
+    """Inner resolver is plain lambda (no ``ainvoke``) → ``ainvoke`` performs the chat itself.
+
+    When the inner resolver has no async path (e.g. plain ``_PrefixResolver``),
+    the wrapper drives ``provider.chat(request)`` itself so the caller
+    (``LLMClient``) always receives a ``ChatResponse``, never a bare
+    ``BaseProvider``. Surfaced as a real bug on 2026-10-13 when the
+    demo tenant pointed at the Doubao Ark endpoint — the previous
+    "return the provider" fallback caused ``LLMClient`` to AttributeError
+    on ``resp.prompt_tokens``. This test pins the new contract.
+    """
     inner_provider = _stub_provider("anthropic")
+    expected_response = object()  # sentinel returned from provider.chat
+    inner_provider.chat = AsyncMock(return_value=expected_response)  # type: ignore[method-assign]
+
     wrapper = TenantModelOverrideResolver(
         inner=lambda req: inner_provider,
         overrides={},
@@ -225,4 +237,5 @@ async def test_ainvoke_falls_back_to_sync_when_inner_has_no_ainvoke() -> None:
 
     result = await wrapper.ainvoke(_request())
 
-    assert result is inner_provider
+    assert result is expected_response
+    inner_provider.chat.assert_awaited_once()

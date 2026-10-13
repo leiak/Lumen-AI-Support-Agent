@@ -60,27 +60,34 @@ class TenantModelOverrideResolver:
         return provider
 
     async def ainvoke(self, request: ChatRequest) -> Any:
-        """Async path used by ``LLMClient`` for FallbackResolver/tenants.
+        """Async path used by ``LLMClient`` for the ainvoke seam.
 
-        Delegates to ``inner.ainvoke`` if the inner resolver has it
-        (typical: FallbackResolver). The model is rewritten BEFORE
-        delegation so the inner resolver sees the overridden model
-        on its first step. If the inner has no ainvoke (e.g. plain
-        ``_PrefixResolver``), falls back to sync ``__call__`` and
-        returns the provider (the caller is expected to use sync
-        semantics).
+        Two cases:
+          1. Inner has its own ``ainvoke`` (e.g. ``FallbackResolver``) —
+             delegate to it so the chain's retry/fallback semantics
+             work. The model is rewritten BEFORE delegation so the
+             inner resolver sees the override on its first step
+             (per-step ``PinnedResolver`` may then rewrite again per
+             its own ``step.model``).
+          2. Inner is a sync resolver (e.g. ``_PrefixResolver``) —
+             perform the chat ourselves so the caller (``LLMClient``)
+             always receives a ``ChatResponse``, never a ``BaseProvider``.
+             Without this fallback, returning the provider here would
+             cause ``LLMClient`` to AttributeError on
+             ``resp.prompt_tokens`` — real bug surfaced 2026-10-13
+             with the demo tenant pointing at the Doubao Ark endpoint,
+             after the embedding model was patched to
+             ``doubao-embedding-vision`` and the chat call finally
+             reached the wire.
         """
         inner = self._inner
-        if hasattr(inner, "ainvoke"):
-            # Rewrite BEFORE delegating so inner sees the override.
-            provider = self._inner(request)
-            self._maybe_rewrite(request, provider)
-            return await inner.ainvoke(request)  # type: ignore[attr-defined]
+        # Rewrite model first regardless of which path we take.
         provider = inner(request)
         self._maybe_rewrite(request, provider)
-        # No async path — return the provider so the caller can use
-        # it via sync ``__call__`` semantics.
-        return provider
+        if hasattr(inner, "ainvoke"):
+            return await inner.ainvoke(request)  # type: ignore[attr-defined]
+        # No async inner path — call the provider's chat directly.
+        return await provider.chat(request)
 
     def _maybe_rewrite(
         self,

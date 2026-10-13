@@ -249,3 +249,63 @@ def test_build_providers_anthropic_omits_base_url_when_row_has_none(
 
     cache._build_providers([row])
     assert "base_url" not in captured
+
+
+def test_build_providers_openai_uses_default_llm_model_not_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the openai branch must read ``default_llm_model``,
+    not ``openai_model``.
+
+    2026-10-13: the live demo tenant pointed at the Doubao Ark endpoint
+    surfaced ``AttributeError: 'Settings' object has no attribute
+    'openai_model'`` in ``TenantLLMConfigCache._build_providers`` when
+    constructing the OpenAI provider. ``Settings`` exposes
+    ``default_llm_model`` (a single project-wide LLM default) but no
+    ``openai_model`` field — the previous code tried to read
+    ``self._settings.openai_model``, which Pydantic rejects as a missing
+    attribute. The mock-based tests passed because ``MagicMock().x``
+    returns another Mock (truthy) instead of raising, so the bug was
+    invisible in CI. This test uses a real ``Settings`` instance to pin
+    the contract.
+    """
+    from llm_client.tenant_config_crypto import TenantLLMConfigCipher
+    from llm_client.tenant_resolver import TenantLLMConfigCache
+
+    cipher = TenantLLMConfigCipher(
+        "nLJ6W1cj0isqEsiRqrg98WJ9EPVB7e-BM1ub1TIRO2Y="  # dev-only; matches docker-compose
+    )
+    from core.config import Settings
+
+    settings = Settings(
+        default_llm_model="claude-3-5-sonnet-20241022",
+    )
+    cache = TenantLLMConfigCache(
+        ttl_s=60.0,
+        maxsize=16,
+        cipher=cipher,
+        settings=settings,
+    )
+
+    captured: dict[str, Any] = {}
+
+    def fake_openai(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return _make_provider("openai")
+
+    monkeypatch.setattr(
+        "llm_client.providers.openai_provider.OpenAIProvider", fake_openai
+    )
+
+    row = MagicMock()
+    row.provider_name = "openai"
+    row.encrypted_api_key = cipher.encrypt("sk-tenant-openai-key")
+    row.base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+
+    cache._build_providers([row])
+
+    # model must come from default_llm_model (the only project-wide
+    # model setting) and the row's base_url must be threaded through
+    # so OpenAI-compatible servers (Doubao Ark, etc.) get routed.
+    assert captured["model"] == "claude-3-5-sonnet-20241022"
+    assert captured["base_url"] == "https://ark.cn-beijing.volces.com/api/plan/v3"
