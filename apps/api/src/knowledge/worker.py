@@ -74,6 +74,7 @@ from typing import Any
 from qdrant_client.http import models as qmodels
 from sqlalchemy import delete, select
 
+from core.config import get_settings
 from core.database import get_session
 from core.id_gen import new_id
 from core.logging import get_logger
@@ -90,7 +91,9 @@ from knowledge.parser import ParsedDocument
 from knowledge.qdrant_client import (
     DEFAULT_COLLECTION,
     delete_points_by_article_version,
+    ensure_collection,
     upsert_chunks,
+    vector_size_for_model,
 )
 from llm_client.embeddings import embed_texts
 
@@ -270,6 +273,24 @@ async def index_article(*, article_id: str) -> IndexResult:
     successful index, but operators MUST see that the article is in
     an inconsistent state so they can investigate.
     """
+    # Step 0. Make sure the Qdrant collection exists. The operator
+    # can drop a collection (or it can vanish during a full reset),
+    # and the rest of the pipeline (delete-then-upsert) would then
+    # 404 every call. ``ensure_collection`` is idempotent: a no-op
+    # when the collection is already there, a single create() when
+    # it's not. The vector size is derived from the configured
+    # embedding model (same as the startup hook in
+    # ``knowledge.startup.ensure_qdrant_collection``) — passing the
+    # wrong dimension would let a stale article point be upserted
+    # and silently corrupt search results, so we look it up instead
+    # of hardcoding.
+    settings = get_settings()
+    vector_size = vector_size_for_model(settings.default_embedding_model)
+    await ensure_collection(
+        name=DEFAULT_COLLECTION,
+        vector_size=vector_size,
+    )
+
     # Step 1. Load article + version + KB.
     async with get_session() as session:
         article = await session.get(Article, article_id)
