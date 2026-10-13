@@ -801,6 +801,87 @@ async def test_retrieve_returns_empty_for_unrelated_query(
 
 
 @pytest.mark.integration
+async def test_retrieve_skips_stale_article_version_chunks(
+    tenant_factory: Tenant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-uploaded article must not surface its stale-version chunks.
+
+    The worker is supposed to delete v1's Chunk rows inside the same
+    transaction that writes v2, so under steady state the chunks
+    table only ever carries the current version. But Qdrant is OUT
+    of that transaction — if a v1 Qdrant point survives, the retriever
+    must filter by ``articles.current_version_id`` so the LLM never
+    sees stale content (and the UI never renders two identical
+    citation cards for the same ``(article_id, chunk_index)``).
+
+    Real bug surfaced 2026-10-13 with the 退换货流程 article: the
+    user re-uploaded the same content, creating v2 alongside v1, and
+    the UI showed two identical "article 01M4SJJY chunk 0" citations
+    because the retriever returned both. This test pins the fix.
+    """
+    await _ensure_collection_ready()
+    _patch_embed_topic_coded(monkeypatch)
+    tenant = tenant_factory
+
+    kb = await _make_kb(tenant_id=tenant.id, slug="kb-stale-version")
+    article, v1 = await _make_article_and_version(
+        tenant_id=tenant.id,
+        knowledge_base_id=kb.id,
+        title="Stale Version",
+        raw_text=WEATHER_TEXT,
+    )
+
+    try:
+        # Index v1 — creates Chunk rows for v1 + Qdrant points.
+        v1_result = await index_article(article_id=article.id)
+        assert v1_result.status == ArticleStatus.INDEXED
+
+        # Manually insert a v2 ArticleVersion + re-point
+        # ``articles.current_version_id`` to v2. We don't re-run
+        # ``index_article`` (the worker's delete-then-insert would
+        # clear v1's Chunk rows) — instead we hand-craft the v2 row
+        # so the v1 chunks become "stale" but still present in the
+        # chunks table. This is the crashy-reindex scenario we
+        # want the retriever to defend against.
+        v2 = ArticleVersion(
+            id=new_id(),
+            article_id=article.id,
+            version_number=2,
+            raw_text=WEATHER_TEXT,
+            content_hash=hashlib.sha256(WEATHER_TEXT.encode()).hexdigest(),
+        )
+        async with get_session() as session:
+            session.add(v2)
+            await session.flush()
+            art_row = await session.get(Article, article.id)
+            assert art_row is not None
+            art_row.current_version_id = v2.id
+            await session.commit()
+
+        # v1 chunks are now stale (article.current_version_id points
+        # at v2). Retriever should drop them.
+        retrieved = await retrieve_chunks(
+            tenant_id=tenant.id,
+            knowledge_base_id=kb.id,
+            query="weather forecast",
+            top_k=5,
+        )
+
+        # All surviving chunks must belong to the current version.
+        # With NO re-indexing, v1 chunks still exist in the DB and
+        # Qdrant still returns their points; the only thing keeping
+        # them out of the result is the current_version_id filter
+        # added to the retriever.
+        assert len(retrieved) == 0, (
+            f"retriever returned {len(retrieved)} stale-version hits; "
+            f"expected 0 after re-pointing current_version_id to v2"
+        )
+    finally:
+        await _delete_qdrant_points_for_article(article_id=article.id)
+
+
+@pytest.mark.integration
 async def test_retrieve_embedding_failure_raises(
     tenant_factory: Tenant,
     monkeypatch: pytest.MonkeyPatch,

@@ -172,16 +172,30 @@ export function AiSuggestionPane({
               <h4 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 引用 ({state.suggestion.citations.length})
               </h4>
-              <div className="flex flex-wrap gap-1.5" data-testid="suggestion-citations">
+              <div className="flex flex-col gap-2" data-testid="suggestion-citations">
                 {state.suggestion.citations.map((c, idx) => (
-                  <Badge
+                  <div
                     key={`${c.article_id}-${c.chunk_index}-${idx}`}
-                    variant="outline"
-                    className="font-mono text-[10px]"
-                    title={c.text}
+                    className="flex flex-col gap-1 rounded-md border border-dashed bg-muted/30 p-2"
+                    data-testid="suggestion-citation"
                   >
-                    article {c.article_id.slice(0, 8)} chunk {c.chunk_index}
-                  </Badge>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="outline" className="font-mono text-[10px]">
+                        article {c.article_id.slice(0, 8)} chunk {c.chunk_index}
+                      </Badge>
+                      <span className="text-[10px] text-muted-foreground">
+                        score {c.score.toFixed(3)}
+                      </span>
+                    </div>
+                    {c.text ? (
+                      <p
+                        className="text-xs leading-relaxed text-foreground/90 whitespace-pre-wrap break-words"
+                        data-testid="suggestion-citation-text"
+                      >
+                        {c.text}
+                      </p>
+                    ) : null}
+                  </div>
                 ))}
               </div>
             </div>

@@ -62,6 +62,14 @@ describe('AiSuggestionPane', () => {
     const citations = screen.getByTestId('suggestion-citations');
     expect(citations.children).toHaveLength(2);
     expect(citations.textContent).toMatch(/article 01ARTCL/);
+    // 2026-10-13: each citation card now renders the chunk text
+    // visibly (not just a title-attribute tooltip) so the agent can
+    // verify the RAG actually surfaced the expected snippet. Each
+    // sample row carries its own text — assert both render.
+    const texts = screen.getAllByTestId('suggestion-citation-text');
+    expect(texts).toHaveLength(2);
+    expect(texts[0]).toHaveTextContent('chunk 0');
+    expect(texts[1]).toHaveTextContent('chunk 2');
   });
 
   it('shows the turn_kind badge for llm_unavailable with a warning', async () => {

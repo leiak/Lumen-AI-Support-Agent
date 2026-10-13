@@ -374,6 +374,32 @@ class ArticleRepository:
             )
             return (await session.execute(stmt)).scalar_one_or_none()
 
+    async def list_current_versions_by_ids(
+        self,
+        *,
+        tenant_id: str,
+        article_ids: list[str],
+    ) -> dict[str, str]:
+        """Return ``{article_id: current_version_id}`` for the given ids.
+
+        Used by the retriever to drop chunks whose
+        ``article_version_id`` is no longer the article's
+        ``current_version_id`` (orphans from a re-upload that
+        superseded them). Empty input returns ``{}`` to dodge the
+        ``IN ()`` quirk some drivers reject. Missing articles are
+        silently absent from the map — the retriever treats them
+        the same as stale-version hits (skip + log).
+        """
+        if not article_ids:
+            return {}
+        async with get_session() as session:
+            stmt = select(Article.id, Article.current_version_id).where(
+                Article.tenant_id == tenant_id,
+                Article.id.in_(article_ids),
+            )
+            rows = (await session.execute(stmt)).all()
+        return {row[0]: row[1] for row in rows if row[1] is not None}
+
     async def get_by_id_for_update(
         self,
         *,

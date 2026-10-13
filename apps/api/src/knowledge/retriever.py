@@ -52,7 +52,11 @@ from dataclasses import dataclass
 from core.logging import get_logger
 from knowledge.models import Chunk, KnowledgeBase
 from knowledge.qdrant_client import DEFAULT_COLLECTION, search_chunks
-from knowledge.repository import ChunkRepository, KnowledgeBaseRepository
+from knowledge.repository import (
+    ArticleRepository,
+    ChunkRepository,
+    KnowledgeBaseRepository,
+)
 from llm_client.embeddings import EmbeddingError, embed_texts
 
 log = get_logger(__name__)
@@ -286,6 +290,31 @@ async def retrieve_chunks(
         point_ids=point_ids,
     )
 
+    # ---- resolve current_version_id per article ---------------------
+    # After a re-upload, the worker (Task 6.10 follow-up) inserts new
+    # Chunk rows for the new ArticleVersion and DELETEs the stale
+    # Chunk rows in the same transaction, so under steady state the
+    # chunks table only ever carries the current version. But Qdrant
+    # is NOT in that transaction — the delete-then-upsert is split,
+    # so a brief window (and any historical point left over from a
+    # crashy reindex) can leave a Qdrant vector whose matching Chunk
+    # row's ``article_version_id`` is no longer the article's
+    # ``current_version_id``. Surfacing those to the LLM would feed it
+    # stale KB content (and a same-text duplicate citation in the
+    # UI when the same content is re-indexed with the same body).
+    # Filter them out by checking ``articles.current_version_id`` in
+    # one query. Real bug surfaced 2026-10-13 with the 退换货流程
+    # article: v1 + v2 both produced Qdrant hits with the same
+    # (article_id, chunk_index, text) — the UI showed 2 identical
+    # citation cards because v1 was never filtered out.
+    article_ids = {c.article_id for c in chunks_by_pid.values()}
+    current_version_by_article = (
+        await ArticleRepository().list_current_versions_by_ids(
+            tenant_id=tenant_id,
+            article_ids=list(article_ids),
+        )
+    )
+
     # ---- assemble final list, preserving Qdrant order ---------------
     # We walk the Qdrant hits in their native order so the result is
     # sorted highest-score-first. We skip hits whose Chunk row is
@@ -294,6 +323,7 @@ async def retrieve_chunks(
     # in score order because we filter (not re-order).
     retrieved: list[RetrievedChunk] = []
     skipped_orphans = 0
+    skipped_stale_version = 0
     for hit in scored_points:
         score = float(hit.score)
         if score_threshold is not None and score < score_threshold:
@@ -302,6 +332,17 @@ async def retrieve_chunks(
         chunk_row = chunks_by_pid.get(pid)
         if chunk_row is None:
             skipped_orphans += 1
+            continue
+        # Drop chunks whose ArticleVersion is no longer current.
+        # Missing entry (article row gone entirely) also treated as
+        # orphan — DB and Qdrant both should reflect deletes, but
+        # the extra check is cheap defense in depth.
+        expected_version = current_version_by_article.get(chunk_row.article_id)
+        if (
+            expected_version is not None
+            and chunk_row.article_version_id != expected_version
+        ):
+            skipped_stale_version += 1
             continue
         retrieved.append(
             RetrievedChunk(
@@ -321,6 +362,7 @@ async def retrieve_chunks(
         hit_count=len(retrieved),
         model=embedding_model,
         skipped_orphans=skipped_orphans,
+        skipped_stale_version=skipped_stale_version,
     )
 
     return retrieved
