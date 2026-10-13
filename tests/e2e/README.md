@@ -1,15 +1,16 @@
-# Lumen AI — Frontend E2E (Playwright)
+# Lumen AI — End-to-End Tests
 
-End-to-end test suite for the M1 customer-facing surface (Task 9.11).
+End-to-end test suite for the Lumen AI Support Agent surface.
 
-Two flows are covered:
+Three flows are covered:
 
-| Flow | Surface | Spec | Count |
+| Flow | Surface | Test | Count |
 | ---- | ------- | ---- | ----- |
-| A    | Agent workspace SPA (`apps/web`)         | `agent-flow.spec.ts`  | 5 tests |
-| B    | Customer web widget SDK (`apps/web-sdk`) | `widget-flow.spec.ts` | 4 tests |
+| A    | Agent workspace SPA (`apps/web`)         | `agent-flow.spec.ts` (Playwright) | 5 tests |
+| B    | Customer web widget SDK (`apps/web-sdk`) | `widget-flow.spec.ts` (Playwright) | 4 tests |
+| C    | OpenTelemetry distributed tracing (M6)   | `scripts/test_otel_e2e.py` (Python) | 6 steps |
 
-Plus a `globalSetup` that runs once before any test:
+Plus a `globalSetup` that runs once before any Playwright test:
 - `alembic upgrade head`
 - `tests/e2e/scripts/seed.py` (idempotent demo data)
 - Backend `/health` probe
@@ -19,7 +20,7 @@ Plus a `globalSetup` that runs once before any test:
 
 ### Prerequisites
 
-Running the suite end-to-end requires **everything below to already be
+Running the Playwright suite end-to-end requires **everything below to already be
 running locally**. The Playwright config does NOT spin up Docker /
 Postgres / Redis / Qdrant — those are environment-managed services.
 
@@ -47,7 +48,7 @@ WIDGET_ALLOWED_ORIGINS_GLOBAL=http://localhost:5173,http://localhost:3000,http:/
 
 Restart the API after editing `.env`.
 
-### Run the suite
+### Run the Playwright suite
 
 ```bash
 # One-time at the repo root:
@@ -75,6 +76,42 @@ To watch locally:
 pnpm e2e:headed
 ```
 
+### Run the OpenTelemetry e2e smoke (M6 / Flow C)
+
+The M6 OTel e2e script (`tests/e2e/scripts/test_otel_e2e.py`) drives a
+real widget chat through the api container, captures the `X-Trace-Id`
+response header, queries Tempo for the trace, and asserts the span
+hierarchy + PII-safe attribute keys.
+
+```bash
+# Prereqs: bring-up must be running (api + otel-collector + tempo)
+scripts/bring-up.sh
+
+# Run the e2e smoke
+cd "D:/work-ai/0401-ai-customer" && python tests/e2e/scripts/test_otel_e2e.py
+
+# Or with custom api base
+python tests/e2e/scripts/test_otel_e2e.py --api-base http://localhost:8000
+
+# Show all flags
+python tests/e2e/scripts/test_otel_e2e.py --help
+```
+
+The script runs 6 steps and prints `[OK|WARN|FAIL|INFO]` per step:
+1. **infra check** — otel-collector:4317 (TCP) + tempo:33000/ready (HTTP)
+2. **send chat** — POST /api/v1/widget/token → captures X-Trace-Id
+3. **query Tempo** — GET http://localhost:33000/api/traces/{trace_id}, polls up to 10s
+4. **span hierarchy** — assert `http.request` + `llm.chat` + outbound httpx child
+5. **PII scan** — whole-key-boundary regex on every attribute key (NOT substring — same as M6.2 static scan)
+6. **no orphan spans** — every non-root span has a parent in the trace
+
+Exit codes: 0 = all pass, 1 = at least one step failed, 130 = Ctrl-C.
+
+The WS path (`/api/v1/widget/ws`) is a separate trace tree from the
+HTTP `/token` POST — the script searches for it via Tempo's
+`/api/search?tags=name=llm.chat` and runs the PII scan against both
+traces.
+
 ## Demo credentials
 
 Created by `tests/e2e/scripts/seed.py` (idempotent — safe to re-run):
@@ -91,24 +128,39 @@ this seed.
 
 ```
 tests/e2e/
-├── README.md                  # this file
-├── playwright.config.ts       # 3 web servers, 1 project, globalSetup
-├── global-setup.ts            # alembic + seed + health + SDK build
-├── agent-flow.spec.ts         # Flow A — 5 tests
-├── widget-flow.spec.ts        # Flow B — 4 tests
+├── README.md                    # this file
+├── playwright.config.ts         # 3 web servers, 1 project, globalSetup
+├── playwright.docker.config.ts  # alternate config (docker network)
+├── global-setup.ts              # alembic + seed + health + SDK build
+├── global.d.ts                  # type defs
+├── agent-flow.spec.ts           # Flow A — 5 tests
+├── widget-flow.spec.ts          # Flow B — 4 tests
+├── demo-act4.spec.ts            # Stage 11.5 demo recording
+├── demo-act4-02.spec.ts         # Stage 13 ticket UI demo
+├── agent-flow.spec.ts
 ├── fixtures/
-│   ├── auth.ts                # loginViaUi / loginViaApi helpers
-│   ├── auth-shared.ts         # JWT_STORAGE_KEY constant
-│   ├── seed.ts                # SEED ids + base URL constants
-│   └── screenshots.ts         # captureFlow(...)
+│   ├── auth.ts                  # loginViaUi / loginViaApi helpers
+│   ├── auth-shared.ts           # JWT_STORAGE_KEY constant
+│   ├── seed.ts                  # SEED ids + base URL constants
+│   └── screenshots.ts           # captureFlow(...)
 ├── scripts/
-│   └── seed.py                # Python seed (uses apps.api domain code)
-└── static/
-    ├── widget-host.html       # the SDK embed page
-    └── lumen-widget.js        # copied here by globalSetup
+│   ├── seed.py                  # Python seed (uses apps.api domain code)
+│   ├── seed_budget.py           # tenant_budgets + llm_usage seed
+│   ├── seed_demo_rich.py        # 4 SLA + 5 conv + 3 tickets + budget usage
+│   ├── explore.py               # 12-round exploratory test harness
+│   ├── test_tenant_*.py         # 7 admin-tenant e2e tests
+│   ├── test_widget_*.py         # 4 widget e2e tests
+│   ├── test_qa_*.py             # 3 QA worker e2e tests
+│   ├── test_otel_e2e.py         # Flow C — M6 OpenTelemetry e2e smoke (537 lines)
+│   ├── record-demo.sh           # 11 PNG capture
+│   └── record-demo.ps1          # Windows variant
+├── artifacts/                   # test artifacts (gitignored)
+├── report/                      # HTML Playwright report
+├── static/                      # widget-host.html + lumen-widget.js
+└── tsconfig.json
 ```
 
-## Known M1 limitations / trade-offs
+## Known limitations / trade-offs
 
 These are documented as CONCERNS in the task handoff:
 
@@ -149,6 +201,19 @@ These are documented as CONCERNS in the task handoff:
    run. The fixtures expose these as the `SEED` constant so tests
    never hard-code them.
 
+6. **OTel e2e (Flow C) requires bring-up** — does NOT auto-spawn
+   `otel-collector` / `tempo` containers. Operator must run
+   `scripts/bring-up.sh` (which now includes the OTel stack since
+   M6) before running the e2e. If the OTel containers are down, the
+   script reports `[FAIL] otel-collector:4317 unreachable` at step 1
+   and exits 1.
+
+7. **OTel e2e gates on `ANTHROPIC_API_KEY` not set** — without a
+   real LLM key, the chat request will fail at the LLM call but
+   still produce an `http.request` span (with `status=ERROR`). The
+   script accepts this — it proves the tracing pipeline is wired
+   even if the LLM call fails.
+
 ## Re-seeding
 
 If you change `tests/e2e/scripts/seed.py` or the demo tenant/user
@@ -179,3 +244,9 @@ In CI, set `CI=1` so:
 
 Pass `WIDGET_ALLOWED_ORIGINS_GLOBAL` (or the equivalent override) so
 Flow B's cross-origin request to `:8080` is allowed.
+
+The OTel e2e (Flow C) is NOT part of the Playwright CI gate — it
+requires the full docker-compose stack including otel-collector +
+tempo. Run it manually with `python tests/e2e/scripts/test_otel_e2e.py`
+against a deployed stack for spot-checks.
+
