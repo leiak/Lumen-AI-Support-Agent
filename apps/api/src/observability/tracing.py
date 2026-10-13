@@ -37,6 +37,16 @@ R = TypeVar("R")
 
 # Whitelist of allowed span attribute keys. Anything outside this set
 # is treated as a PII violation. The static-scan test enforces this.
+#
+# Naming convention: keys mirror the database / API field name where one
+# exists (``provider_name`` is the column on ``tenant_llm_configs`` and
+# the API field on ``/admin/tenants/{id}/llm-configs``; ``tenant_id`` is
+# the primary key column on every domain table). When there is no
+# corresponding DB/API field we use the dotted form (``channel.name``,
+# ``worker.job_name``, ``llm.tokens.input``, ``http.latency_ms``). Both
+# styles are intentional and reflect the source of truth for each
+# concept — renaming a dotted key to underscored or vice versa would
+# require coordinated DB + API + dashboard changes. M6.8 P3 #6.
 PII_WHITELIST: frozenset[str] = frozenset({
     "tenant_id",
     "provider_name",
