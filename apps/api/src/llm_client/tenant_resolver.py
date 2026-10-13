@@ -42,7 +42,6 @@ from core.business_metrics import LLM_TENANT_FALLBACK_CHAIN_TOTAL
 from llm_client.exceptions import TenantLlmNotConfigured
 from llm_client.resolvers import Resolver
 from llm_client.tenant_config_models import TenantLLMConfigRepository
-from observability import tracer
 
 if TYPE_CHECKING:
     from llm_client.gateway import LLMGateway
@@ -508,73 +507,9 @@ async def build_tenant_resolver(
     )
 
 
-class TenantResolver:
-    """DEPRECATED — kept for backward compatibility with callers that
-    construct it directly (e.g. tests). Production goes through
-    :class:`TenantResolverSpan` instead (M6.3 follow-up).
-
-    Per-tenant resolver that satisfies the M4.A Resolver + M4.B ainvoke seam.
-
-    Built by :func:`build_tenant_resolver` once per (tenant, cache-miss)
-    cycle. ``__call__`` returns the inner gateway's primary provider
-    (M4.A protocol); ``ainvoke`` delegates to the inner fallback chain
-    if present, otherwise raises :class:`_NoChainConfigured` so
-    ``LLMClient`` can use its own retry loop on the single provider.
-
-    M6.3 OpenTelemetry tracing: wraps ``__call__`` in a ``llm.resolve``
-    span. The span attributes ``tenant_id`` and ``provider_name`` are on
-    the PII whitelist. ``provider_name`` is set after delegation (we
-    don't know which provider the inner gateway picked until we ask).
-
-    Why this class is not used in production: ``_raise_or_return`` (the
-    method that builds resolvers for tenants) used to return
-    ``TenantResolver(gateway=...)`` but now returns
-    ``TenantResolverSpan(inner=gateway.default_resolver, tenant_id=...)``
-    (M6.3 fix). Direct callers (e.g. ``test_resolve_span_emitted_when_using_tenant_resolver``
-    in ``tests/llm_client/test_llm_gateway_creates_span.py``) still work —
-    this class is structurally equivalent to wrapping the gateway
-    resolver in a span emitter, just done in a heavier class. New code
-    should construct :class:`TenantResolverSpan` directly.
-    """
-
-    def __init__(self, *, gateway: LLMGateway, tenant_id: str | None = None) -> None:
-        self._gateway = gateway
-        self._delegate = gateway.default_resolver
-        # ``tenant_id`` is best-effort — the cache builder doesn't always
-        # thread it through here (it stores by tenant_id in the cache
-        # wrapper), so we accept ``None`` and just skip the attribute.
-        # In production callers (``build_tenant_resolver``) we always set
-        # the attribute via the constructor when wiring TenantResolver.
-        self._tenant_id = tenant_id
-
-    def __call__(self, request: ChatRequest) -> Any:
-        with tracer.start_as_current_span(
-            "llm.resolve",
-            attributes=(
-                {"tenant_id": self._tenant_id} if self._tenant_id else None
-            ),
-        ) as resolve_span:
-            provider = self._delegate(request)
-            # ``provider_name`` is the inner provider's ``.name`` attr
-            # (e.g. ``anthropic`` / ``minimax`` / ``openai``). All
-            # BaseProvider subclasses set this — fall back to
-            # ``<unknown>`` defensively for mocks.
-            resolve_span.set_attribute(
-                "provider_name",
-                getattr(provider, "name", "<unknown>"),
-            )
-            return provider
-
-    async def ainvoke(self, request: ChatRequest) -> ChatResponse:
-        if hasattr(self._delegate, "ainvoke"):
-            return await self._delegate.ainvoke(request)
-        raise _NoChainConfigured()
-
-
 __all__ = [
     "TenantLLMConfigCache",
     "TenantLlmNotConfigured",
-    "TenantResolver",
     "_NoChainConfigured",
     "build_tenant_resolver",
 ]

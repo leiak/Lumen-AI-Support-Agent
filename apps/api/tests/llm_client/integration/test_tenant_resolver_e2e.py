@@ -1,4 +1,4 @@
-"""End-to-end tests for TenantResolver with real HTTP traffic via pytest-httpx.
+"""End-to-end tests for the tenant resolver chain (TenantResolverSpan + LLMGateway) with real HTTP traffic via pytest-httpx.
 
 M4.C Task 5 — exercises the full per-tenant resolver path:
 

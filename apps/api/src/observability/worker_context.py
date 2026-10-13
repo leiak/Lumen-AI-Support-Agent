@@ -31,7 +31,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from opentelemetry import context as otel_context
-from opentelemetry import propagate, trace
+from opentelemetry import propagate
 from opentelemetry.context import Context
 
 from observability import tracer
@@ -121,9 +121,3 @@ __all__ = [
     "extract_trace_from_job",
     "job_span",
 ]
-
-
-# ``trace`` is imported above to silence the unused-import warning
-# if the module is loaded in isolation (no test run yet). The
-# actual injection/extract helpers use ``propagate``, not ``trace``.
-_ = trace

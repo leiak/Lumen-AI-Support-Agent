@@ -1,4 +1,4 @@
-"""Tests for TenantLLMConfigCache + TenantResolver."""
+"""Tests for TenantLLMConfigCache + TenantResolverSpan wrapper."""
 from __future__ import annotations
 
 import time
@@ -7,11 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from llm_client.tenant_resolver import (
-    TenantLLMConfigCache,
-    TenantResolver,
-    _NoChainConfigured,
-)
+from llm_client.tenant_resolver import TenantLLMConfigCache
+from llm_client.tenant_resolver_span import TenantResolverSpan
 
 
 class _FakeRepo:
@@ -118,31 +115,44 @@ def test_tenant_resolver_call_delegates_to_inner_gateway() -> None:
     primary = _make_provider("minimax")
     gateway = MagicMock()
     gateway.default_resolver = MagicMock(return_value=primary)
-    resolver = TenantResolver(gateway=gateway)
+    resolver = TenantResolverSpan(inner=gateway.default_resolver, tenant_id="t1")
     result = resolver(MagicMock())
     assert result is primary
 
 
-def test_single_provider_tenant_ainvoke_raises_no_chain() -> None:
+def test_single_provider_tenant_ainvoke_falls_back_to_sync() -> None:
+    """Single-provider tenants whose inner resolver has no ``ainvoke``
+    (e.g. ``_PrefixResolver``) fall back to sync ``__call__`` per the
+    TenantResolverSpan docstring — the caller still gets a result.
+    M6.8: replaces the legacy ``TenantResolver.ainvoke`` which raised
+    ``_NoChainConfigured`` in this case.
+    """
     primary = _make_provider("minimax")
-    # _PrefixResolver has no ainvoke; simulates single-provider tenant
-    prefix_resolver = MagicMock(spec=["__call__"])
-    prefix_resolver.__call__ = MagicMock(return_value=primary)
-    gateway = MagicMock()
-    gateway.default_resolver = prefix_resolver
-    resolver = TenantResolver(gateway=gateway)
+
+    class _SyncOnlyResolver:
+        """Stand-in for ``_PrefixResolver`` — sync only, no ``ainvoke``."""
+
+        def __call__(self, request: Any) -> Any:  # noqa: ARG002
+            return primary
+
+    sync_resolver = _SyncOnlyResolver()
+    resolver = TenantResolverSpan(inner=sync_resolver, tenant_id="t1")
     import asyncio
-    with pytest.raises(_NoChainConfigured):
-        asyncio.run(resolver.ainvoke(MagicMock()))
+    result = asyncio.run(resolver.ainvoke(MagicMock()))
+    assert result is primary
 
 
 def test_chain_tenant_ainvoke_delegates() -> None:
-    _primary = _make_provider("minimax")
-    fallback = MagicMock(spec=["__call__", "ainvoke"])
-    fallback.ainvoke = AsyncMock(return_value="response")
-    gateway = MagicMock()
-    gateway.default_resolver = fallback
-    resolver = TenantResolver(gateway=gateway)
+    class _AsyncFallback:
+        """Stand-in for ``FallbackResolver`` — has ``ainvoke``."""
+
+        def __call__(self, request: Any) -> Any:  # noqa: ARG002
+            raise NotImplementedError
+
+        async def ainvoke(self, request: Any) -> str:  # noqa: ARG002
+            return "response"
+
+    resolver = TenantResolverSpan(inner=_AsyncFallback(), tenant_id="t1")
     import asyncio
     result = asyncio.run(resolver.ainvoke(MagicMock()))
     assert result == "response"

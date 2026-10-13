@@ -320,11 +320,11 @@ async def test_stream_chat_emits_stream_span(
 async def test_resolve_span_emitted_when_using_tenant_resolver(
     memory_exporter: Any,
 ) -> None:
-    """TenantResolver.__call__ emits a ``llm.resolve`` span."""
+    """TenantResolverSpan.__call__ emits a ``llm.resolve`` span."""
     from unittest.mock import AsyncMock, MagicMock
 
     from llm_client.gateway import LLMGateway
-    from llm_client.tenant_resolver import TenantResolver
+    from llm_client.tenant_resolver_span import TenantResolverSpan
 
     provider = MagicMock()
     provider.name = "anthropic"
@@ -332,10 +332,10 @@ async def test_resolve_span_emitted_when_using_tenant_resolver(
     # a sync MagicMock would TypeError on gather(), so use AsyncMock.
     provider.aclose = AsyncMock()  # type: ignore[attr-defined]
     g = LLMGateway(providers={"anthropic": provider})
-    # Wrap the gateway's default_resolver in a TenantResolver. The
-    # span is added by TenantResolver.__call__.
-    tenant_resolver = TenantResolver(
-        gateway=g, tenant_id="t-resolve-test",
+    # Wrap the gateway's default_resolver in a TenantResolverSpan. The
+    # span is added by TenantResolverSpan.__call__.
+    tenant_resolver = TenantResolverSpan(
+        inner=g.default_resolver, tenant_id="t-resolve-test",
     )
 
     req = _chat_request()
@@ -360,9 +360,7 @@ async def test_resolve_span_emitted_when_using_tenant_resolver(
 # The tests below exercise the production-wiring fix: ``_raise_or_return``
 # now wraps the (possibly model-override-wrapped) resolver in
 # :class:`TenantResolverSpan` so the ``llm.resolve`` span fires on every
-# LLM request in production. The earlier ``TenantResolver`` class above
-# is the historical (now-deprecated) implementation that was never
-# instantiated in production.
+# LLM request in production.
 # ---------------------------------------------------------------------------
 
 

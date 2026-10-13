@@ -10,7 +10,6 @@ from llm_client.resolvers import FallbackResolver
 from llm_client.tenant_config_crypto import TenantLLMConfigCipher
 from llm_client.tenant_resolver import (
     TenantLLMConfigCache,
-    TenantResolver,
     build_tenant_resolver,
 )
 
@@ -23,7 +22,6 @@ __all__ = [
     "TenantLLMConfigCache",
     "TenantLLMConfigCipher",
     "TenantLlmNotConfigured",
-    "TenantResolver",
     "build_tenant_resolver",
     "embed_texts",
 ]

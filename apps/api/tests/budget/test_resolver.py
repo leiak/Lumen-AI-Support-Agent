@@ -233,7 +233,7 @@ def test_current_period_falls_back_to_utc_on_bad_malformed() -> None:
 
 async def test_ainvoke_post_record_runs_for_single_provider_chain() -> None:
     """Single-provider tenant — BudgetResolver.ainvoke must run post_record even
-    when the inner TenantResolver.ainvoke raises _NoChainConfigured.
+    when the inner TenantResolverSpan.ainvoke raises _NoChainConfigured.
 
     Regression: without this fix, cap tracking is silently bypassed for
     tenants with tenant_budgets row + single provider + no fallback chain.

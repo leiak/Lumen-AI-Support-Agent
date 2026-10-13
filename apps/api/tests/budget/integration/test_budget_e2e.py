@@ -2,7 +2,7 @@
 
 M4.D Task 5 — exercises the full resolver chain:
 
-    LLMClient -> BudgetResolver -> TenantResolver -> LLMGateway -> BaseProvider -> httpx
+    LLMClient -> BudgetResolver -> TenantResolverSpan -> LLMGateway -> BaseProvider -> httpx
 
 All tests use ``_default_llm_client_factory`` so the production wiring
 (including the factory's opt-in branch) is exercised end-to-end. HTTP
@@ -215,7 +215,7 @@ async def test_e2e_tenant_without_budget_passes_through(
     Opt-in semantics. Without a budget row, ``_default_llm_client_factory``
     skips the ``BudgetResolver`` wrap (preserves M4.C strict-mode behaviour
     for existing tenants). The mocked Anthropic response returns through
-    the full chain: ``LLMClient`` → ``TenantResolver`` → ``LLMGateway``
+    the full chain: ``LLMClient`` → ``TenantResolverSpan`` → ``LLMGateway``
     → ``AnthropicProvider`` → ``httpx``.
     """
     tenant = await TenantRepository().create(
@@ -255,7 +255,7 @@ async def test_e2e_tenant_without_budget_passes_through(
             )
             # Sanity: the tenant's BYOK plaintext key reaches the
             # Authorization header — confirms the chain did NOT bypass
-            # the TenantResolver (we want full coverage, not a stub).
+            # the TenantResolverSpan (we want full coverage, not a stub).
             assert (
                 requests[0].headers.get("x-api-key") == "sk-tenant-no-budget"
             )
