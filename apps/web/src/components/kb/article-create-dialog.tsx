@@ -47,21 +47,20 @@ export interface ArticleCreateDialogProps {
   onCreated?: (articleId: string) => void;
 }
 
-const SOURCE_OPTIONS: ReadonlyArray<{ value: ArticleSourceType; label: string }> = [
-  { value: 'manual', label: '文本 (直接输入)' },
-  { value: 'upload', label: '文件 (上传)' },
-  { value: 'url', label: 'URL (抓取)' },
-];
+const DEFAULT_SOURCE_TYPE: ArticleSourceType = 'manual';
 
 /**
  * Modal form for creating a new article by typing/pasting raw text.
  * File uploads are handled by the separate ``ArticleUploadDialog`` —
- * this dialog only covers the manual-text path.
+ * this dialog only covers the manual-text path. ``source_type`` is
+ * always ``'manual'`` here; the dropdown was removed because the
+ * other enum values (``upload`` / ``url``) had no matching UI in this
+ * dialog and were silently dropped on submit.
  *
  * Validation: ``title`` is required and must be non-empty after trim;
- * ``raw_text`` is required for ``source_type === 'manual'``. Backend
- * additionally caps raw_text at 10 MiB and title at 500 chars, but we
- * leave that to the server and surface its 422 verbatim.
+ * ``raw_text`` is required. Backend additionally caps raw_text at
+ * 10 MiB and title at 500 chars, but we leave that to the server and
+ * surface its 422 verbatim.
  */
 export function ArticleCreateDialog({
   kbId,
@@ -69,8 +68,12 @@ export function ArticleCreateDialog({
   onOpenChange,
   onCreated,
 }: ArticleCreateDialogProps): JSX.Element {
+  // source_type is fixed to 'manual' for this dialog — the upload path
+  // lives in ArticleUploadDialog (file) and URL ingest lives in a
+  // future dialog. We still send the value so the API contract stays
+  // aligned with the backend enum.
   const [title, setTitle] = useState('');
-  const [sourceType, setSourceType] = useState<ArticleSourceType>('manual');
+  const sourceType: ArticleSourceType = DEFAULT_SOURCE_TYPE;
   const [rawText, setRawText] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -79,7 +82,6 @@ export function ArticleCreateDialog({
   useEffect(() => {
     if (!open) {
       setTitle('');
-      setSourceType('manual');
       setRawText('');
       setSubmitting(false);
       setError(null);
@@ -92,13 +94,9 @@ export function ArticleCreateDialog({
     ? '标题不能为空'
     : null;
   const textError =
-    sourceType === 'manual' && rawText.length > 0 && trimmedText.length === 0
-      ? '正文不能为空'
-      : null;
+    rawText.length > 0 && trimmedText.length === 0 ? '正文不能为空' : null;
   const canSubmit =
-    !submitting &&
-    trimmedTitle.length > 0 &&
-    (sourceType !== 'manual' || trimmedText.length > 0);
+    !submitting && trimmedTitle.length > 0 && trimmedText.length > 0;
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
@@ -127,7 +125,8 @@ export function ArticleCreateDialog({
           <DialogHeader>
             <DialogTitle>新建文章</DialogTitle>
             <DialogDescription>
-              手动输入标题和正文,后端会自动调度索引任务。
+              手动输入标题和正文,后端会自动调度索引任务。如需上传 .txt / .md / .pdf / .html / .json 文件,
+              请改用「上传文档」按钮。
             </DialogDescription>
           </DialogHeader>
 
@@ -146,23 +145,6 @@ export function ArticleCreateDialog({
                 {titleError}
               </p>
             ) : null}
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="article-create-source">来源类型</Label>
-            <select
-              id="article-create-source"
-              value={sourceType}
-              onChange={(e) => setSourceType(e.target.value as ArticleSourceType)}
-              data-testid="article-create-source"
-              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-            >
-              {SOURCE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
           </div>
 
           <div className="space-y-2">

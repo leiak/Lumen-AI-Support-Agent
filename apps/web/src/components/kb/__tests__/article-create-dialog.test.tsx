@@ -39,7 +39,7 @@ const createdArticle = {
 };
 
 describe('ArticleCreateDialog', () => {
-  it('renders the title, source-type and raw-text fields', () => {
+  it('renders the title and raw-text fields', () => {
     render(
       <ArticleCreateDialog
         kbId="kb_x"
@@ -49,7 +49,6 @@ describe('ArticleCreateDialog', () => {
     );
     expect(screen.getByTestId('article-create-dialog')).toBeInTheDocument();
     expect(screen.getByTestId('article-create-title')).toBeInTheDocument();
-    expect(screen.getByTestId('article-create-source')).toBeInTheDocument();
     expect(screen.getByTestId('article-create-text')).toBeInTheDocument();
   });
 
