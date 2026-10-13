@@ -111,3 +111,40 @@ export async function rejectDraft(draftId: string): Promise<RejectResult> {
     status: z.literal('REJECTED'),
   }).parse(data);
 }
+
+// ---------------------------------------------------------------------------
+// "立即执行" — manual history mining trigger (Tier 1)
+//
+// The history-mining worker normally runs as a weekly cron (Sunday
+// 03:00 UTC). Operators want a "run now" button on /admin/kb-drafts
+// for the common case where there are zero DRAFTs because the cron
+// hasn't fired yet. The backend endpoint
+// ``POST /api/v1/admin/kb-drafts/run-mining`` enqueues the same
+// ``history_mining_worker`` job and spawns an arq worker subprocess
+// if one isn't already consuming the queue. 503 means Redis is down
+// — the SPA surfaces that as "队列暂不可达,请稍后重试".
+// ---------------------------------------------------------------------------
+
+export const RunMiningResultSchema = z.object({
+  enqueued: z.boolean(),
+  worker_started: z.boolean(),
+  function: z.literal('history_mining_worker'),
+  job_id: z.string().nullable(),
+});
+export type RunMiningResult = z.infer<typeof RunMiningResultSchema>;
+
+/**
+ * POST /api/v1/admin/kb-drafts/run-mining — trigger history mining on demand.
+ *
+ * @returns the enqueue outcome. ``worker_started=true`` means the
+ *   endpoint had to spawn a new arq worker subprocess because none
+ *   was alive; ``worker_started=false`` means a worker was already
+ *   running and will pick up the job on its next poll.
+ *
+ * @throws on 503 — the user-facing copy should be "队列暂不可达,请稍后重试"
+ *   so the operator doesn't think the click did nothing.
+ */
+export async function triggerHistoryMining(): Promise<RunMiningResult> {
+  const { data } = await apiClient.post('/api/v1/admin/kb-drafts/run-mining');
+  return RunMiningResultSchema.parse(data);
+}

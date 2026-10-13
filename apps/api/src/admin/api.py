@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import subprocess
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
@@ -129,6 +131,7 @@ from llm_client.runtime_chain import (
 from llm_client.tenant_config_audit_models import (
     TenantLLMConfigAuditRepository,
 )
+from qa.worker import build_arq_redis
 from tenant.models import User
 from tenant.repository import TenantRepository, UserRepository
 from ticket.enums import TicketPriority, TicketStatus
@@ -162,6 +165,16 @@ _AUTO_MINED_KB_NAME = "Auto-mined Knowledge"
 # ``knowledge.parser.MAX_PARSE_BYTES`` so the resulting article is
 # parseable by the same ingest path.
 _BODY_PREVIEW_LEN = 200
+# Path to the PID file the on-demand history-mining worker writes when
+# it boots. ``_history_mining_worker_alive()`` consults this to avoid
+# spawning a duplicate worker process when one is already consuming
+# the queue. Lives under ``/tmp`` so it survives container restarts
+# (mounted on tmpfs in compose) without polluting the image.
+_HISTORY_MINING_WORKER_PID_FILE = "/tmp/lumen-history-mining-worker.pid"  # noqa: S108
+# arq CLI target — module:Class form (Python dotted path is the
+# alternate form; the docker entrypoint script also uses the dot
+# form, e.g. ``arq apps.api.src.workers.WorkerSettings``).
+_HISTORY_MINING_WORKER_ARQ_TARGET = "history_mining.worker.WorkerSettings"
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +465,174 @@ async def reject_kb_draft(
         },
     )
     return {"draft_id": draft_id, "status": "REJECTED"}
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 task — "立即执行 history mining" button (admin SPA).
+#
+# The history-mining worker (Stage 18) is normally cron-only: it fires
+# every Sunday 03:00 UTC. Operators want a "run now" button on the
+# /admin/kb-drafts page when there is no weekly output yet (e.g. on a
+# fresh tenant, or after a long lull).
+#
+# Design
+# ------
+# 1. Enqueue ``history_mining_worker`` on the arq queue. The job sits
+#    in Redis until a worker consumes it — the test in
+#    ``test_kb_drafts_api.py::test_run_mining_*`` uses a fake
+#    ArqRedis that records the enqueue call without needing a real
+#    Redis / arq worker.
+# 2. Check ``_history_mining_worker_alive()`` (PID file
+#    ``/tmp/lumen-history-mining-worker.pid``); if no worker is
+#    already consuming the queue, spawn one via ``subprocess.Popen``
+#    so the enqueued job has a consumer.
+# 3. Return ``{enqueued, worker_started, function, job_id}`` so the
+#    SPA can show a useful "已入队" / "已启动 worker" status.
+#
+# Auth: admin JWT (per spec §7.2). 503 (not 500) on Redis
+# ConnectionError so the SPA renders an explicit "queue unreachable"
+# error instead of a generic server-error toast (mirrors
+# [2026-10-12 AI fail escalate] pattern).
+# ---------------------------------------------------------------------------
+
+
+def _history_mining_worker_alive() -> bool:
+    """Return True iff a history-mining arq worker is currently running.
+
+    The worker writes its PID to ``/tmp/lumen-history-mining-worker.pid``
+    on boot. We send signal 0 (no-op) to check the process is still
+    alive; a stale PID file from a crashed worker is detected by
+    ``ProcessLookupError`` and treated as "not alive" so the next
+    "立即执行" click spawns a fresh worker. ``PermissionError`` means
+    the PID belongs to another user (still alive) — we treat that as
+    alive to avoid spawning a duplicate we can't manage.
+
+    Linux-only zombie filter
+    ------------------------
+    On Linux, ``os.kill(pid, 0)`` returns 0 even for a zombie — a
+    process that has exited but whose parent hasn't reaped it. Without
+    the filter, a long-lived container (api server never reaps
+    subprocesses) would forever think a dead arq worker is alive, and
+    the endpoint would silently skip spawning a replacement. We read
+    ``/proc/<pid>/status`` and reject any process whose ``State`` line
+    starts with ``Z`` (zombie) or ``X`` (dead). On non-Linux platforms
+    (CI on macOS) we fall back to the plain ``os.kill`` check.
+    """
+    try:
+        with open(_HISTORY_MINING_WORKER_PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # ``os.kill`` says it's there — but a zombie still reports alive.
+    # /proc/<pid>/status is the only reliable Linux-side check.
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    # State: R (running) / S (sleeping) / D (disk sleep)
+                    # are all OK. Z (zombie) / X (dead) / T (stopped) are not.
+                    state = line.split()[1]
+                    if state in ("Z", "X", "T"):
+                        return False
+                    return True
+    except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
+        # /proc not available (macOS CI) — fall through to the os.kill result.
+        pass
+    return True
+
+
+@router.post("/kb-drafts/run-mining")
+async def run_history_mining(
+    claims: Annotated[dict[str, Any], Depends(require_admin)],
+):
+    """Enqueue a history-mining job and ensure a worker is consuming it.
+
+    Flow
+    ----
+    1. ``build_arq_redis()`` — lazy ArqRedis client (no connect yet).
+    2. ``enqueue_job("history_mining_worker")`` — push to redis.
+    3. If no worker is alive, spawn one as a detached subprocess
+       (``start_new_session=True`` so the API process doesn't reap
+       the child) and write the PID to
+       ``/tmp/lumen-history-mining-worker.pid``.
+    4. Return ``{enqueued, worker_started, function, job_id}``.
+
+    Status codes
+    ------------
+    * 200 — enqueued (worker_started may be false if one was already alive).
+    * 401 / 403 — auth gate (raised by ``require_admin``).
+    * 503 — Redis unreachable. The SPA shows a clear "queue
+      unreachable" error and the operator can retry.
+    """
+    try:
+        arq_redis = build_arq_redis()
+    except (ConnectionError, OSError) as exc:
+        # ArqRedis.from_url() is lazy and won't actually connect here,
+        # but we still surface a clean 503 if a future refactor makes
+        # the helper strict, or if the URL is malformed and arq raises
+        # at parse time.
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis unavailable: {exc}",
+        ) from exc
+
+    try:
+        job = await arq_redis.enqueue_job("history_mining_worker")
+    except (ConnectionError, OSError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"redis unavailable: {exc}",
+        ) from exc
+
+    worker_started = False
+    if not _history_mining_worker_alive():
+        # Spawn a detached arq worker process so the enqueued job has
+        # a consumer. start_new_session=True detaches the child from
+        # our process group so the API server's lifecycle doesn't
+        # cascade-reap it on shutdown.
+        #
+        # env=os.environ.copy() — pass through DATABASE_URL, REDIS_URL,
+        # and LLM API keys so the child can read CLOSED conversations
+        # and call the LLM gateway without the operator having to
+        # duplicate env in the docker entrypoint.
+        child_env = os.environ.copy()
+        proc = subprocess.Popen(  # noqa: S603, ASYNC220
+            [  # noqa: S607
+                "arq",
+                _HISTORY_MINING_WORKER_ARQ_TARGET,
+            ],
+            env=child_env,
+            start_new_session=True,
+        )
+        try:
+            with open(_HISTORY_MINING_WORKER_PID_FILE, "w") as f:  # noqa: ASYNC230
+                f.write(str(proc.pid))
+        except OSError:
+            # Best-effort: if the PID file can't be written (read-only
+            # /tmp), the next click will spawn a duplicate. Logged but
+            # non-fatal — the spawned worker still consumes the job.
+            logger.warning(
+                "admin.run_mining.pid_file_write_failed",
+                extra={"pid": proc.pid},
+            )
+        worker_started = True
+        logger.info(
+            "admin.run_mining.worker_spawned",
+            extra={"pid": proc.pid, "function": "history_mining_worker"},
+        )
+
+    return {
+        "enqueued": True,
+        "worker_started": worker_started,
+        "function": "history_mining_worker",
+        "job_id": job.job_id if job is not None else None,
+    }
 
 
 @router.get(

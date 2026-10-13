@@ -135,4 +135,47 @@ describe('AdminKbDraftsPage', () => {
       expect(screen.getByTestId('drafts-empty')).toBeInTheDocument();
     });
   });
+
+  it('renders the "立即执行" button', async () => {
+    mockedGet.mockResolvedValue({ data: { drafts: [] } });
+    renderPage();
+    expect(screen.getByTestId('run-mining-button')).toBeInTheDocument();
+  });
+
+  it('clicking "立即执行" POSTs to run-mining and shows a success banner', async () => {
+    mockedGet.mockResolvedValue({ data: { drafts: [] } });
+    mockedPost.mockResolvedValue({
+      data: {
+        enqueued: true,
+        worker_started: true,
+        function: 'history_mining_worker',
+        job_id: 'job-42',
+      },
+    });
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId('run-mining-button'));
+
+    await waitFor(() => {
+      expect(mockedPost).toHaveBeenCalledWith(
+        '/api/v1/admin/kb-drafts/run-mining',
+      );
+    });
+    expect(
+      await screen.findByTestId('run-mining-banner-ok'),
+    ).toHaveTextContent('job-42');
+  });
+
+  it('shows a "queue unreachable" banner on 503', async () => {
+    mockedGet.mockResolvedValue({ data: { drafts: [] } });
+    // axios surfaces 503 as a thrown Error whose message contains the status.
+    mockedPost.mockRejectedValueOnce(new Error('Request failed with status 503'));
+    renderPage();
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId('run-mining-button'));
+
+    expect(
+      await screen.findByTestId('run-mining-banner-error'),
+    ).toHaveTextContent(/队列暂不可达|Redis/);
+  });
 });

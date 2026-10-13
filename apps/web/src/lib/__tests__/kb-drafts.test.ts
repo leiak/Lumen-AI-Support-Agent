@@ -6,6 +6,7 @@ import {
   fetchDrafts,
   KbDraftDetailSchema,
   rejectDraft,
+  triggerHistoryMining,
 } from '@/lib/kb-drafts';
 import { apiClient } from '@/lib/api-client';
 
@@ -103,5 +104,50 @@ describe('rejectDraft', () => {
     const result = await rejectDraft('d1');
     expect(result.status).toBe('REJECTED');
     expect(mockedPost).toHaveBeenCalledWith('/api/v1/admin/kb-drafts/d1/reject');
+  });
+});
+
+describe('triggerHistoryMining', () => {
+  it('POSTs to run-mining and parses the result (worker_started=true)', async () => {
+    mockedPost.mockResolvedValueOnce({
+      data: {
+        enqueued: true,
+        worker_started: true,
+        function: 'history_mining_worker',
+        job_id: 'job-1',
+      },
+    });
+    const result = await triggerHistoryMining();
+    expect(result.enqueued).toBe(true);
+    expect(result.worker_started).toBe(true);
+    expect(result.function).toBe('history_mining_worker');
+    expect(result.job_id).toBe('job-1');
+    expect(mockedPost).toHaveBeenCalledWith('/api/v1/admin/kb-drafts/run-mining');
+  });
+
+  it('parses worker_started=false (already running worker)', async () => {
+    mockedPost.mockResolvedValueOnce({
+      data: {
+        enqueued: true,
+        worker_started: false,
+        function: 'history_mining_worker',
+        job_id: 'job-7',
+      },
+    });
+    const result = await triggerHistoryMining();
+    expect(result.worker_started).toBe(false);
+    expect(result.job_id).toBe('job-7');
+  });
+
+  it('rejects malformed payload (wrong function name)', async () => {
+    mockedPost.mockResolvedValueOnce({
+      data: {
+        enqueued: true,
+        worker_started: true,
+        function: 'something_else',
+        job_id: 'job-1',
+      },
+    });
+    await expect(triggerHistoryMining()).rejects.toThrow();
   });
 });

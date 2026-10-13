@@ -58,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from arq import cron
+from arq.connections import RedisSettings
 from sqlalchemy import select
 
 from conversation.enums import ConversationStatus, MessageRole
@@ -346,12 +347,14 @@ class WorkerSettings:
     mining at 03:00 keeps the two crons from firing at the same
     minute and oversubscribing Redis.
 
-    Functions list is empty because ``history_mining_worker`` is
-    only invoked by the cron (no on-demand queue). Arq still
-    requires the attribute; the empty list is correct.
+    ``functions`` includes ``history_mining_worker`` so the on-demand
+    "立即执行" button on /admin/kb-drafts can enqueue the same job
+    onto the queue and have this worker process pick it up. The
+    cron is still the primary scheduler; the queue entry just makes
+    the function reactive to operator clicks between cron fires.
     """
 
-    functions: list = []  # noqa: RUF012
+    functions: list = [history_mining_worker]  # noqa: RUF012
     cron_jobs: list = [  # noqa: RUF012
         cron(
             history_mining_worker,
@@ -360,6 +363,14 @@ class WorkerSettings:
             weekday=WEEKDAY_SUNDAY_UTC,
         ),
     ]
+    # arq does NOT read REDIS_URL from env — only class-level
+    # settings. Without this, the worker (running inside the api
+    # container on the compose network) would try to reach
+    # localhost:6379 and crash on connect with
+    # ``OSError: Errno 111 Connection refused``. Same fix as
+    # ``qa.worker.WorkerSettings`` (see [2026-10-13 arq worker
+    # redis_settings] memory).
+    redis_settings: RedisSettings = RedisSettings.from_dsn(get_settings().redis_url)
 
 
 __all__ = ["WorkerSettings", "history_mining_worker"]
