@@ -64,8 +64,13 @@ export function AppShell(): JSX.Element {
       <header className="flex h-14 shrink-0 items-center justify-between border-b px-6">
         <div className="flex items-center gap-3">
           <span className="text-base font-semibold tracking-tight">Lumen Workspace</span>
-          <span className="rounded-md bg-secondary px-2 py-0.5 text-xs text-secondary-foreground">
-            demo
+          <span
+            className="rounded-md bg-secondary px-2 py-0.5 text-xs text-secondary-foreground"
+            data-testid="tenant-name-badge"
+            data-tenant={user?.tenant_id ?? ''}
+            data-loading={isLoading ? 'true' : 'false'}
+          >
+            {user?.tenant_name ?? (isLoading ? '加载中…' : 'demo')}
           </span>
         </div>
         <div className="flex items-center gap-4">
