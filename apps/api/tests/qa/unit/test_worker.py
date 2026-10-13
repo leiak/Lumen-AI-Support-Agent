@@ -682,6 +682,43 @@ def test_worker_settings_max_jobs_is_io_bound_friendly() -> None:
     assert WorkerSettings.max_jobs == 4
 
 
+def test_worker_settings_redis_settings_resolves_from_settings() -> None:
+    """``redis_settings`` is set from app settings, NOT arq's localhost default.
+
+    Without this, ``arq workers.WorkerSettings`` falls back to
+    arq's hardcoded ``ArqRedis(host='localhost', port=6379)`` which
+    can't reach the compose network's ``redis`` service. Symptom:
+    worker dies on first connect retry with
+    ``OSError: [Errno 111] Connection refused``.
+
+    The contract: ``WorkerSettings.redis_settings`` must equal
+    whatever ``settings.redis_url`` parses to (regardless of host —
+    in the container that resolves to ``redis:6379``; on the host
+    workstation running pytest it may resolve to
+    ``localhost:26379`` — both are correct as long as they come
+    from settings).
+
+    arq does NOT read the ``REDIS_URL`` environment variable; only
+    class-level attributes are honored.
+    """
+    from arq.connections import RedisSettings
+
+    from core.config import get_settings
+    from qa.worker import WorkerSettings
+
+    settings = get_settings()
+    assert isinstance(WorkerSettings.redis_settings, RedisSettings)
+    # The single source of truth — derived from settings, not arq defaults.
+    expected = RedisSettings.from_dsn(settings.redis_url)
+    assert WorkerSettings.redis_settings == expected
+    # Must NOT be the arq built-in default (host=localhost, port=6379).
+    arq_default = RedisSettings()
+    assert WorkerSettings.redis_settings != arq_default, (
+        "redis_settings regressed to arq default — "
+        f"got {WorkerSettings.redis_settings!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

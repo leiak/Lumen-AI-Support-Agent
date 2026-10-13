@@ -50,7 +50,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from arq import cron
-from arq.connections import ArqRedis
+from arq.connections import ArqRedis, RedisSettings
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -519,6 +519,15 @@ class WorkerSettings:
     LLM provider); 4 concurrent jobs is enough headroom without
     saturating the Judge provider's rate limit. Tunable per
     environment in a future iteration.
+
+    ``redis_settings``: explicitly derived from ``settings.redis_url``
+    instead of arq's default ``localhost:6379``. Without this, the
+    worker (running in the same container as the api) would try to
+    reach a local redis daemon that doesn't exist in the compose
+    network and fail on the first connect retry with
+    ``OSError: Errno 111 Connection refused``. arq does NOT read the
+    ``REDIS_URL`` environment variable — it only reads class-level
+    settings.
     """
 
     functions: list = [qa_judge_task]  # noqa: RUF012
@@ -529,6 +538,7 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     max_jobs = 4
+    redis_settings: RedisSettings = RedisSettings.from_dsn(get_settings().redis_url)
 
 
 # ---------------------------------------------------------------------------
