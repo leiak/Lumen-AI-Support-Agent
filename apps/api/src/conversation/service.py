@@ -319,13 +319,29 @@ class ConversationService:
         return [r for r in rows if r.tenant_id == tenant_id]
 
     async def get(
-        self, *, tenant_id: str, conversation_id: str
+        self,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
     ) -> Conversation | None:
         """Return the conversation if it belongs to the tenant; otherwise None.
 
         Returning ``None`` for both "not found" and "wrong tenant" prevents
         tenant enumeration via response timing/status differences — the
         API layer maps both cases to 404.
+
+        ``viewer_role`` / ``viewer_id`` are used to enforce row-level
+        access for non-admin callers (added 2026-10-13 so agents can
+        open a single conversation detail by id without going through
+        the list endpoints — the inbox list only shows rows
+        ``assigned_agent_id == viewer_id``, so an agent could never
+        reach a PENDING unassigned row from the list even though the
+        underlying row is claimable). Admin/owner callers still see
+        every row in their tenant; agents see rows assigned to them
+        plus PENDING unassigned rows (so the "claim" workflow still
+        works from the detail page).
         """
         conv = await self._repo.get_by_id(conversation_id)
         if conv is None:
@@ -339,6 +355,16 @@ class ConversationService:
                 },
             )
             return None
+        if viewer_role is None or viewer_id is None:
+            # Legacy/internal callers (e.g. ``simple_responder``,
+            # ``suggest``, ``ws``) don't pass an auth context. They
+            # already operate on a conversation they've loaded from
+            # some other scope, so don't apply row-level filtering.
+            return conv
+        if viewer_role not in ("admin", "owner"):
+            # Agent — only own + claimable rows.
+            if conv.assigned_agent_id is not None and conv.assigned_agent_id != viewer_id:
+                return None
         return conv
 
     # ---- State transitions ----

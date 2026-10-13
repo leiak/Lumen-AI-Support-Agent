@@ -196,11 +196,23 @@ async def list_inbox(
 @router.get("/{conversation_id}", response_model=ConversationOut)
 async def get_conversation(
     conversation_id: str,
-    claims: Annotated[dict[str, Any], Depends(require_admin)],
+    claims: Annotated[dict[str, Any], Depends(require_agent_or_admin)],
 ) -> ConversationOut:
-    """Fetch a single conversation. 404 if not visible to this tenant."""
+    """Fetch a single conversation. 404 if not visible to this tenant.
+
+    Auth widened from ``require_admin`` to ``require_agent_or_admin``
+    (2026-10-13) so the inbox detail page can hit this endpoint
+    directly without piggy-backing on the list endpoint. The service
+    layer enforces row-level access: agents only see rows assigned to
+    them or PENDING unassigned rows; admins/owners see every row in
+    their tenant. Cross-tenant access still returns 404 (the same
+    status as a truly missing row) to prevent tenant enumeration.
+    """
     conv = await _service().get(
-        tenant_id=claims["tenant_id"], conversation_id=conversation_id
+        tenant_id=claims["tenant_id"],
+        conversation_id=conversation_id,
+        viewer_role=claims.get("role"),
+        viewer_id=claims.get("sub"),
     )
     if conv is None:
         raise HTTPException(status_code=404, detail="conversation not found")

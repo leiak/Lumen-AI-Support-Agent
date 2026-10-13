@@ -11,14 +11,8 @@ import { CustomerInfoPane } from '@/components/conversation/customer-info-pane';
 import { MessageComposer } from '@/components/conversation/message-composer';
 import { MessageStream } from '@/components/conversation/message-stream';
 import { useConversationWebSocket } from '@/hooks/use-conversation-websocket';
-import {
-  ConversationSchema,
-  fetchAllConversations,
-  fetchConversations,
-  type Conversation,
-} from '@/lib/conversations';
+import { fetchConversation } from '@/lib/conversations';
 import { fetchMessages, messagesQueryKey } from '@/lib/messages';
-import { useIsAdmin } from '@/lib/use-is-admin';
 
 interface FetchErrorPayload {
   detail?: string;
@@ -38,55 +32,11 @@ function conversationQueryKey(id: string): readonly unknown[] {
   return ['conversation', id] as const;
 }
 
-/**
- * Fetch a single conversation by id. We piggy-back on the list
- * endpoint because there is no dedicated GET
- * ``/api/v1/conversations/{id}`` access path for non-admin roles —
- * the conversation router's GET is admin-only, but agents need
- * to view their assigned rows. Using the list keeps the auth
- * contract intact and avoids adding a duplicate endpoint.
- *
- * Admin callers must use the tenant-wide list (``/api/v1/conversations``)
- * — otherwise they would only see rows assigned to themselves, which
- * excludes every PENDING/CLAIMABLE row the admin is supposed to be
- * able to open from the all-conversations inbox.
- *
- * If the listing doesn't include the requested id (cross-tenant,
- * unassigned for an agent, or genuinely missing), we surface a
- * 404-style error.
- */
-async function fetchConversation(
-  id: string,
-  isAdmin: boolean,
-): Promise<Conversation> {
-  const list = isAdmin
-    ? await fetchAllConversations({ status: null, search: '' })
-    : await fetchConversations({ status: null, search: '' });
-  const found = list.items.find((item) => item.id === id);
-  if (!found) {
-    throw new AxiosError(
-      'conversation not found',
-      '404',
-      undefined,
-      undefined,
-      {
-        status: 404,
-        data: { detail: 'conversation not found' },
-        statusText: 'Not Found',
-        headers: {},
-        config: {} as never,
-      },
-    );
-  }
-  return ConversationSchema.parse(found);
-}
-
 export function InboxDetailPage(): JSX.Element {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { id } = useParams<{ id: string }>();
   const conversationId = id ?? '';
-  const { isAdmin } = useIsAdmin();
 
   // Imperative handles — the suggestion pane writes into the
   // composer (apply), and the composer triggers the suggestion
@@ -101,9 +51,15 @@ export function InboxDetailPage(): JSX.Element {
     triggerSuggestRef.current = trigger;
   }, []);
 
+  // Direct GET /api/v1/conversations/{id} — works for both agent and
+  // admin roles (the backend enforces row-level access). Replaces the
+  // pre-2026-10-13 list-endpoint fan-out which coupled this query to
+  // ``useIsAdmin()`` and broke whenever the cached current-user role
+  // was stale (switching admin <-> agent inside the 30 s TanStack
+  // staleTime window). The query key no longer encodes the role.
   const conversationQuery = useQuery({
-    queryKey: [...conversationQueryKey(conversationId), isAdmin ? 'admin' : 'agent'],
-    queryFn: () => fetchConversation(conversationId, isAdmin),
+    queryKey: conversationQueryKey(conversationId),
+    queryFn: () => fetchConversation(conversationId),
     enabled: Boolean(conversationId),
   });
 

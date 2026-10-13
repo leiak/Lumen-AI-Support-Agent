@@ -95,8 +95,20 @@ def _build_app() -> FastAPI:
 
 
 def _stub_admin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace require_admin with a bypass that returns ADMIN_CLAIMS."""
+    """Replace require_admin with a bypass that returns ADMIN_CLAIMS.
+
+    Also stubs ``require_agent_or_admin`` with the same admin claims
+    so tests that hit endpoints widened to agent+admin (e.g. the
+    ``GET /conversations/{id}`` single-conversation endpoint after
+    2026-10-13's inbox-detail refactor) don't see a 401 when the
+    real dep runs against an unstubbed header. Admin claims are a
+    valid input for the agent-or-admin dep (admin is in the
+    accepted set), so this is semantically correct.
+    """
     monkeypatch.setattr(api_module, "require_admin", _fake_require_admin)
+    monkeypatch.setattr(
+        api_module, "require_agent_or_admin", _fake_require_admin
+    )
 
 
 def _stub_agent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -345,13 +357,20 @@ async def test_inbox_requires_agent_or_admin_role(
 async def test_get_conversation_returns_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
     conv = _conv()
 
     async def fake_get(
-        self: Any, *, tenant_id: str, conversation_id: str
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
     ) -> Conversation | None:
         assert tenant_id == "tenant_X"
+        assert viewer_role == "admin"
+        assert viewer_id == "u_admin"
         return conv
 
     monkeypatch.setattr(
@@ -377,10 +396,15 @@ async def test_get_conversation_404_for_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Service returns None -> 404 (anti-enumeration)."""
-    _stub_admin(monkeypatch)
+    _stub_agent_auth(monkeypatch, claims=ADMIN_CLAIMS)
 
     async def fake_get(
-        self: Any, *, tenant_id: str, conversation_id: str
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
     ) -> Conversation | None:
         return None
 
@@ -393,6 +417,128 @@ async def test_get_conversation_404_for_unknown(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as client:
         resp = await client.get("/api/v1/conversations/01HX_UNKNOWN")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "conversation not found"
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_as_agent_returns_own_assigned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent GET on a row they own succeeds (200, body returned).
+
+    The single-conversation endpoint was widened from
+    ``require_admin`` to ``require_agent_or_admin`` on 2026-10-13 so
+    the inbox detail page no longer needs to piggy-back on the list
+    endpoint. Row-level access is enforced in the service layer:
+    an agent sees rows assigned to them.
+    """
+    _stub_agent(monkeypatch)
+    conv = _conv(assigned_agent_id="u_agent_1")
+
+    async def fake_get(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
+    ) -> Conversation | None:
+        assert viewer_role == "agent"
+        assert viewer_id == "u_agent_1"
+        return conv
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "get", fake_get
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(f"/api/v1/conversations/{conv.id}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == conv.id
+    assert body["assigned_agent_id"] == "u_agent_1"
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_as_agent_returns_pending_unassigned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent GET on a PENDING unassigned row succeeds (claimable from detail)."""
+    _stub_agent(monkeypatch)
+    conv = _conv(assigned_agent_id=None, status=ConversationStatus.PENDING)
+
+    async def fake_get(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
+    ) -> Conversation | None:
+        assert viewer_role == "agent"
+        return conv
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "get", fake_get
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(f"/api/v1/conversations/{conv.id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "pending"
+    assert resp.json()["assigned_agent_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_as_agent_other_agent_assigned_returns_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent GET on a row assigned to ANOTHER agent returns 404.
+
+    Returning 404 (instead of 403) keeps the response indistinguishable
+    from a genuinely missing row, preventing enumeration of which
+    conversation ids exist in the tenant. The service layer is the
+    single source of truth for this filter.
+    """
+    _stub_agent(monkeypatch)
+    conv = _conv(assigned_agent_id="u_agent_OTHER")
+
+    async def fake_get(
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
+    ) -> Conversation | None:
+        # Service-layer filter rejects: assigned to someone else.
+        if (
+            viewer_role not in ("admin", "owner")
+            and conv.assigned_agent_id is not None
+            and conv.assigned_agent_id != viewer_id
+        ):
+            return None
+        return conv
+
+    monkeypatch.setattr(
+        service_module.ConversationService, "get", fake_get
+    )
+
+    app = _build_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.get(f"/api/v1/conversations/{conv.id}")
 
     assert resp.status_code == 404
     assert resp.json()["detail"] == "conversation not found"
@@ -825,7 +971,12 @@ async def test_full_api_flow_assign_to_agent(
     }
 
     async def fake_get(
-        self: Any, *, tenant_id: str, conversation_id: str
+        self: Any,
+        *,
+        tenant_id: str,
+        conversation_id: str,
+        viewer_role: str | None = None,
+        viewer_id: str | None = None,
     ) -> Conversation | None:
         c = state.get(conversation_id)
         if c is None or c.tenant_id != tenant_id:

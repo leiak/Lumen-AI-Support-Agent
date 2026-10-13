@@ -50,15 +50,6 @@ vi.mock('@/lib/use-current-user', () => ({
 
 import { useCurrentUser } from '@/lib/use-current-user';
 
-// Default to agent role so the legacy tests in this file keep
-// their ``/api/v1/conversations/inbox`` expectation. The
-// admin-routing tests override this in their own setup.
-vi.mock('@/lib/use-is-admin', () => ({
-  useIsAdmin: vi.fn(),
-}));
-import { useIsAdmin } from '@/lib/use-is-admin';
-const mockedUseIsAdmin = vi.mocked(useIsAdmin);
-
 import type * as ReactRouterDom from 'react-router-dom';
 
 vi.mock('react-router-dom', async () => {
@@ -105,14 +96,16 @@ function makeQueryClient(): QueryClient {
   });
 }
 
-function mockCurrentUser(): void {
+function mockCurrentUser(role: 'agent' | 'admin' = 'agent'): void {
+  const userId = role === 'admin' ? 'u_admin' : 'u_agent_1';
+  const email = role === 'admin' ? 'admin@example.com' : 'agent@example.com';
   vi.mocked(useCurrentUser).mockReturnValue({
     user: {
-      user_id: 'u_agent_1',
-      email: 'agent@example.com',
+      user_id: userId,
+      email,
       tenant_id: 'demo',
       tenant_name: 'Demo',
-      role: 'agent',
+      role,
     },
     isLoading: false,
     isError: false,
@@ -139,16 +132,24 @@ function renderPage(conversationId = sampleConversation.id): {
   return { client, navigate };
 }
 
+function stubConversationFetch(conv: object = sampleConversation): void {
+  vi.mocked(apiClient.get).mockImplementation((url) => {
+    if (typeof url === 'string' && url.endsWith('/messages')) {
+      return Promise.resolve({ data: { items: [] } });
+    }
+    // Direct GET /api/v1/conversations/{id} — returns the row
+    // directly (not wrapped in {items: [...]}) after the 2026-10-13
+    // refactor that widened the endpoint to agent+admin.
+    return Promise.resolve({ data: conv });
+  });
+}
+
 beforeEach(() => {
   window.localStorage.setItem(JWT_STORAGE_KEY, 'test-token');
   vi.mocked(apiClient.get).mockReset();
   vi.mocked(apiClient.post).mockReset();
   vi.mocked(useCurrentUser).mockReset();
-  mockCurrentUser();
-  // Default to agent role so the legacy tests' URL expectation
-  // (``/api/v1/conversations/inbox``) is preserved. Admin-routing
-  // tests override this in their own setup.
-  mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
+  mockCurrentUser('agent');
   FakeWebSocket.instances = [];
   // @ts-expect-error -- install fake WS for the hook.
   globalThis.WebSocket = FakeWebSocket;
@@ -171,22 +172,14 @@ describe('InboxDetailPage', () => {
     );
     renderPage();
     expect(screen.getByTestId('inbox-detail-loading')).toBeInTheDocument();
-    resolve({ data: { items: [] } });
-    // After the empty list resolves the page falls through to its
-    // "not found" branch — that's the expected behaviour when the
-    // requested conversation id isn't in the agent's inbox.
+    resolve({ data: sampleConversation });
     await waitFor(() =>
       expect(screen.queryByTestId('inbox-detail-loading')).not.toBeInTheDocument(),
     );
   });
 
   it('renders the header and three panes on success', async () => {
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+    stubConversationFetch();
     renderPage();
 
     expect(await screen.findByTestId('conversation-header')).toBeInTheDocument();
@@ -201,13 +194,30 @@ describe('InboxDetailPage', () => {
     expect(screen.getByTestId('header-status')).toHaveTextContent('待处理');
   });
 
+  it('fetches the conversation via direct GET /api/v1/conversations/{id}', async () => {
+    // 2026-10-13 refactor: the page no longer fans out to the list
+    // endpoint. Both agent and admin hit the single-conversation
+    // endpoint directly; the backend enforces row-level access.
+    stubConversationFetch();
+    renderPage();
+
+    await waitFor(() =>
+      expect(apiClient.get).toHaveBeenCalledWith(
+        `/api/v1/conversations/${sampleConversation.id}`,
+      ),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations/inbox',
+      expect.anything(),
+    );
+    expect(apiClient.get).not.toHaveBeenCalledWith(
+      '/api/v1/conversations',
+      expect.anything(),
+    );
+  });
+
   it('calls POST /claim when the claim button is clicked', async () => {
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+    stubConversationFetch();
     vi.mocked(apiClient.post).mockResolvedValue({
       data: { ...sampleConversation, assigned_agent_id: 'u_agent_1' },
     });
@@ -239,79 +249,38 @@ describe('InboxDetailPage', () => {
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument();
   });
 
-  it('admin role fetches detail from the tenant-wide /api/v1/conversations list', async () => {
-    // Regression: before the fix, InboxDetailPage hard-coded the
-    // agent-only ``/api/v1/conversations/inbox`` endpoint, so an
-    // admin who opened any non-assigned conversation from the
-    // "收件箱(全部)" list hit the 404 "conversation not found"
-    // branch even though the row existed on the server.
-    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+  it('agent role opens the detail page without role-based routing', async () => {
+    // Regression: before the 2026-10-13 refactor, InboxDetailPage
+    // switched between ``/api/v1/conversations/inbox`` and
+    // ``/api/v1/conversations`` based on ``useIsAdmin()``. When the
+    // cached current-user role was stale (e.g. switching between
+    // admin and agent within the 30 s TanStack staleTime), the wrong
+    // list endpoint was called and the response 403'd. The new
+    // single-endpoint design removes that role-coupling entirely.
+    mockCurrentUser('agent');
+    stubConversationFetch();
     renderPage();
 
-    await waitFor(() =>
-      expect(apiClient.get).toHaveBeenCalledWith(
-        '/api/v1/conversations',
-        expect.objectContaining({ params: {} }),
-      ),
-    );
-    expect(apiClient.get).not.toHaveBeenCalledWith(
-      '/api/v1/conversations/inbox',
-      expect.anything(),
-    );
-    // And the detail page actually rendered the conversation.
     expect(await screen.findByTestId('conversation-header')).toBeInTheDocument();
+    expect(apiClient.get).toHaveBeenCalledWith(
+      `/api/v1/conversations/${sampleConversation.id}`,
+    );
   });
 
-  it('agent role still fetches detail from /api/v1/conversations/inbox', async () => {
-    mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+  it('admin role opens the detail page on the same endpoint', async () => {
+    mockCurrentUser('admin');
+    stubConversationFetch();
     renderPage();
 
-    await waitFor(() =>
-      expect(apiClient.get).toHaveBeenCalledWith(
-        '/api/v1/conversations/inbox',
-        expect.objectContaining({ params: {} }),
-      ),
-    );
-    expect(apiClient.get).not.toHaveBeenCalledWith(
-      '/api/v1/conversations',
-      expect.anything(),
+    expect(await screen.findByTestId('conversation-header')).toBeInTheDocument();
+    expect(apiClient.get).toHaveBeenCalledWith(
+      `/api/v1/conversations/${sampleConversation.id}`,
     );
   });
 
   it('admin role sees the reassign control; opening it loads the tenant roster', async () => {
-    // Admin opens the detail page → "分配给…" button is visible.
-    // Clicking it opens the inline select and lazy-loads the tenant
-    // user roster from /admin/tenants/{tid}/users.
-    vi.mocked(useCurrentUser).mockReturnValue({
-      user: {
-        user_id: 'u_admin',
-        email: 'admin@example.com',
-        tenant_id: 'demo',
-        tenant_name: 'Demo',
-        role: 'admin',
-      },
-      isLoading: false,
-      isError: false,
-    });
-    mockedUseIsAdmin.mockReturnValue({ isAdmin: true, isLoading: false });
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+    mockCurrentUser('admin');
+    stubConversationFetch();
     renderPage();
 
     const toggle = await screen.findByTestId('action-reassign-toggle');
@@ -331,14 +300,8 @@ describe('InboxDetailPage', () => {
   });
 
   it('agent role does not see the reassign control', async () => {
-    // Default mockCurrentUser already returns role='agent'.
-    mockedUseIsAdmin.mockReturnValue({ isAdmin: false, isLoading: false });
-    vi.mocked(apiClient.get).mockImplementation((url) => {
-      if (typeof url === 'string' && url.endsWith('/messages')) {
-        return Promise.resolve({ data: { items: [] } });
-      }
-      return Promise.resolve({ data: { items: [sampleConversation] } });
-    });
+    mockCurrentUser('agent');
+    stubConversationFetch();
     renderPage();
 
     // Wait for the detail page to render, then assert the toggle is absent.

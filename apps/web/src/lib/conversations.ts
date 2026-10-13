@@ -113,3 +113,27 @@ export async function fetchAllConversations(
   const parsed = ConversationListSchema.parse(data);
   return { items: parsed.items, total: parsed.items.length };
 }
+
+/**
+ * GET /api/v1/conversations/{id} — fetch a single conversation by id.
+ *
+ * The endpoint accepts both ``agent`` and ``admin`` JWT roles
+ * (widened from admin-only on 2026-10-13 so the inbox detail page
+ * can hit it directly without piggy-backing on the list endpoint).
+ * The backend enforces row-level access: agents only see rows
+ * assigned to them or PENDING unassigned rows; admins/owners see
+ * every row in their tenant. A non-visible id returns 404 (same
+ * status as a genuinely missing row — no enumeration leak).
+ *
+ * Before this helper existed, the inbox detail page fanned out
+ * to the list endpoint based on ``useIsAdmin()`` and looked up
+ * the id in the response. That broke whenever the cached
+ * ``useCurrentUser`` query had a stale role (e.g. switching
+ * between admin and agent within the 30 s TanStack staleTime)
+ * — the wrong list endpoint was called and 403'd. Direct fetch
+ * by id removes the role-coupling on the read path entirely.
+ */
+export async function fetchConversation(id: string): Promise<Conversation> {
+  const { data } = await apiClient.get(`/api/v1/conversations/${id}`);
+  return ConversationSchema.parse(data);
+}
