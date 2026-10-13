@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-import { apiClient } from '@/lib/api-client';
+import { apiClient, JWT_STORAGE_KEY } from '@/lib/api-client';
 
 // Backend shapes (verified against `apps/api/src/knowledge/schemas.py`,
 // `apps/api/src/knowledge/enums.py` and `apps/api/src/knowledge/api.py`).
@@ -239,6 +239,41 @@ export async function updateArticle(
 }
 
 /**
+ * POST a multipart/form-data body to the API. We can't use apiClient
+ * (an axios singleton with a default `Content-Type: application/json`)
+ * for FormData uploads — axios 1.x's transformRequest would either
+ * JSON.stringify the form (when the default JSON header is present)
+ * or set `Content-Type: multipart/form-data` without a boundary
+ * (when overridden, since xhr.setRequestHeader is then called and
+ * the browser stops auto-injecting the boundary). Plain fetch() with
+ * a FormData body sidesteps both traps: the browser sets the
+ * multipart header with the correct boundary itself.
+ */
+async function multipartFetch<T>(path: string, formData: FormData): Promise<T> {
+  const baseURL =
+    (import.meta.env.VITE_API_BASE_URL as string | undefined) ??
+    'http://localhost:8000';
+  const token = window.localStorage.getItem(JWT_STORAGE_KEY);
+  const response = await fetch(`${baseURL}${path}`, {
+    method: 'POST',
+    body: formData,
+    credentials: 'include',
+    ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+  });
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => ({}))) as {
+      detail?: string;
+    };
+    const detail =
+      typeof errorBody.detail === 'string'
+        ? errorBody.detail
+        : `HTTP ${response.status}`;
+    throw new Error(detail);
+  }
+  return (await response.json()) as T;
+}
+
+/**
  * POST /api/v1/knowledge/knowledge-bases/{id}/articles/upload — upload
  * a document and create a new article. Multipart: `file` (required),
  * optional `title`, optional `source_uri`. The backend enforces a 50 MiB
@@ -249,11 +284,14 @@ export async function uploadArticle(
   kbId: string,
   formData: FormData,
 ): Promise<Article> {
-  const { data } = await apiClient.post(
+  // See ``multipartFetch`` docstring — we use plain fetch() so the
+  // browser sets the multipart boundary; apiClient's default JSON
+  // Content-Type would otherwise break FormData.
+  const article = await multipartFetch<Article>(
     `/api/v1/knowledge/knowledge-bases/${kbId}/articles/upload`,
     formData,
   );
-  return ArticleSchema.parse(data);
+  return ArticleSchema.parse(article);
 }
 
 /**
@@ -265,11 +303,12 @@ export async function reuploadArticle(
   articleId: string,
   formData: FormData,
 ): Promise<ReindexResult> {
-  const { data } = await apiClient.post(
+  // See ``multipartFetch`` docstring.
+  const result = await multipartFetch<ReindexResult>(
     `/api/v1/knowledge/articles/${articleId}/upload`,
     formData,
   );
-  return ReindexResultSchema.parse(data);
+  return ReindexResultSchema.parse(result);
 }
 
 /**

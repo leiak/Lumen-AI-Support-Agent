@@ -2,26 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-import { apiClient } from '@/lib/api-client';
-import type * as ApiClient from '@/lib/api-client';
 import { ArticleUploadDialog } from '@/components/kb/article-upload-dialog';
 
-vi.mock('@/lib/api-client', async () => {
-  const actual = await vi.importActual<typeof ApiClient>('@/lib/api-client');
-  return {
-    ...actual,
-    apiClient: {
-      post: vi.fn(),
-    },
-  };
-});
-
+// Multipart uploads go through plain `fetch` (not apiClient) so the
+// browser sets the multipart boundary — see the ``multipartFetch`` helper
+// in ``apps/web/src/lib/knowledge.ts``. Mock ``fetch`` here instead of
+// the axios client.
+const fetchMock = vi.fn();
 beforeEach(() => {
-  vi.mocked(apiClient.post).mockReset();
+  fetchMock.mockReset();
+  vi.stubGlobal('fetch', fetchMock);
 });
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
 });
 
 const createdArticle = {
@@ -59,7 +54,11 @@ describe('ArticleUploadDialog', () => {
   });
 
   it('submits a multipart upload with the chosen file', async () => {
-    vi.mocked(apiClient.post).mockResolvedValue({ data: createdArticle });
+    fetchMock.mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: () => Promise.resolve(createdArticle),
+    });
     const onCreated = vi.fn();
     const user = userEvent.setup();
     render(
@@ -78,21 +77,19 @@ describe('ArticleUploadDialog', () => {
     await user.click(screen.getByTestId('article-upload-submit'));
 
     await waitFor(() => {
-      expect(apiClient.post).toHaveBeenCalledWith(
-        '/api/v1/knowledge/knowledge-bases/kb_x/articles/upload',
-        expect.any(FormData),
-      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
-    const call = vi.mocked(apiClient.post).mock.calls[0];
-    expect(call).toBeDefined();
-    const formData = call![1] as FormData;
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('/api/v1/knowledge/knowledge-bases/kb_x/articles/upload');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBeInstanceOf(FormData);
+    const formData = init.body as FormData;
     expect(formData.get('file')).toBeInstanceOf(File);
     expect((formData.get('file') as File).name).toBe('guide.txt');
     expect(onCreated).toHaveBeenCalledWith(createdArticle.id);
   });
 
   it('rejects oversize files before submitting', async () => {
-    vi.mocked(apiClient.post).mockResolvedValue({ data: createdArticle });
     const user = userEvent.setup();
     render(
       <ArticleUploadDialog kbId="kb_x" open onOpenChange={() => undefined} />,
@@ -107,6 +104,6 @@ describe('ArticleUploadDialog', () => {
     expect(submitButton).toBeDisabled();
 
     await user.click(submitButton);
-    expect(apiClient.post).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
