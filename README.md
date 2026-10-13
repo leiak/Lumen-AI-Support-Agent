@@ -328,6 +328,56 @@ QA worker 通过 `app.metrics_registry` 注册,`GET /metrics` 端点直接暴露
 复现:登录后跑 `python images/shot_all_admin_pages.py` 即可重新生成全部 17 张。
 </details>
 
+## 故障排查
+
+### 登录 401 / "Invalid credentials" — 找不到 admin 用户
+
+多个 Claude session 共用同一个 docker compose stack + 同一个 postgres volume。
+别人跑 BYOK / Pipeline Tenant 测试时会清表,`Acme Demo` (`01HZDEMO00000000000000000`) 跟它的
+admin/agent 也会被一起带走,你这边就登录不上。
+
+**1 行 fix**(只动 demo tenant + 用户,不动其他租户 / BYOK fixture / Pipeline Tenant):
+
+```bash
+bash scripts/reset-demo.sh
+```
+
+它会:
+1. 跑 `bring-up.sh --seed-only` 重灌 4 个 seed(全部 idempotent,固定主键,重复跑安全)
+2. tolerate Windows 的 `python3` vs `python` 差异(`extend-seed.py` 那步 feishu 集成不影响登录)
+3. 跑完 verify 一遍:`SELECT count(*) FROM tenants WHERE id='01HZDEMO...'` + `users WHERE email='admin@example.com'`
+4. 打印 "OK — Acme Demo tenant + admin user are back"
+
+**不要**用以下 fix — 会清掉别人的数据:
+- ❌ `docker compose down -v`(清所有 volume,BYOK / Pipeline tenant 全没)
+- ❌ `TRUNCATE users CASCADE`(同上,级联全清)
+- ❌ `bash scripts/teardown.sh --volumes`(同 down -v)
+
+### `pnpm install --frozen-lockfile` 失败 / web image build 失败
+
+`apps/web/Dockerfile` 把 web 当 standalone project 用,但本仓库是 monorepo — 真 lock 在根目录。
+重生成 web 本地 lock:
+
+```bash
+cd apps/web
+pnpm install --ignore-workspace   # 绕开 monorepo,在 web/ 目录生成本地 lock
+cd ../..
+docker compose -f deploy/docker-compose.yml build web
+docker compose -f deploy/docker-compose.yml up -d web
+```
+
+### `relation "tenants" does not exist` / `seed.py` 直接崩
+
+另一个 session 正在跑 `alembic down` + `alembic upgrade head`(他们的 fixture setup)。
+等 5-10 秒重跑 `bash scripts/reset-demo.sh` 即可,不需要手动 migrate。
+
+### "登录页 lookupTenant 不返回 tenant_id"
+
+SPA 拿不到 tenant_id → 登录按钮一直 disabled。检查:
+1. 输入的 email 是不是 `admin@example.com`(如果换过种子,先看 `tests/e2e/scripts/seed.py` 的 output)
+2. `GET /api/v1/auth/lookup-tenant?email=...` 是否 200
+3. 后端日志: `docker logs aicustomer-api-1 --tail=50 | grep lookup`
+
 ## 关键设计
 
 ### 多租户隔离 (三层防御)
