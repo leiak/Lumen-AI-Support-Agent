@@ -15,24 +15,29 @@ Design
 
 * Picks the first tenant + first WEB channel in the DB (the demo
   tenant + widget channel from ``scripts/extend-seed.py``).
-* Creates 4 CLOSED conversations on that tenant + channel.
-* Inserts 24 customer messages (6 per conversation) all on the same
-  topic — password reset — so HDBSCAN's ``min_cluster_size=10`` and
-  ``min_samples=5`` settings have enough material to form a single
-  cluster. 24 also sits well above the Doubao ``plan/v3`` embeddings
+* Creates 3 CLOSED conversations on that tenant + channel.
+* Inserts ~45 customer messages across 2 dense topics (15 password-
+  reset + 15 invoice/billing + 6 misc one-off questions). Multi-topic
+  data is essential: HDBSCAN is density-based and needs a "sparser"
+  background to identify a cluster — a single homogeneous topic
+  (just 24 password-reset questions) gives no contrast and produces
+  0 clusters regardless of ``min_cluster_size`` / ``min_samples``.
+  45 messages also sits well above the Doubao ``plan/v3`` embeddings
   API input batch cap of 10 (handled internally by ``embed_texts``).
 * The ``seed_tag`` JSONB column on every inserted row lets the cleanup
   helper (``scripts/cleanup_mining_seed.py``) drop them later.
 
-Why 24 not 10
--------------
+Why multi-topic
+---------------
 
-``min_cluster_size=10`` is the minimum cluster size, not the count
-of points HDBSCAN needs to form one — it still needs at least
-``min_samples=5`` core points. With exactly 10 messages HDBSCAN
-collapses everything to noise and emits zero clusters. 24 messages
-across 4 conversations gives HDBSCAN enough slack to form a cluster
-and reliably produces ≥ 1 draft on the demo "立即执行" click.
+HDBSCAN's clustering decisions rely on density contrast: a dense
+region (the topic) must stand out against a sparser background.
+With only one topic, every point is roughly equidistant from every
+other point, and the clusterer (correctly) reports zero clusters.
+The first version of this script seeded 24 password-reset questions
+and the clusterer always returned 0 — see git history. The fix is
+to seed 2 topics + some one-off noise, which is what real tenants
+look like.
 
 Schema notes (verified against ``conversation.models.Conversation``):
 
@@ -94,6 +99,42 @@ PASSWORD_RESET_QUESTIONS = [
     "Can admin reset my password for me?",
 ]
 
+# Second topic — invoice/billing — so HDBSCAN has density contrast
+# against the password-reset topic. With only 1 topic the dataset is
+# one homogeneous dense region; HDBSCAN needs at least one "sparser"
+# neighbor to identify a cluster. Adding a second topic + 6 misc
+# one-off questions simulates a realistic customer-support mix.
+INVOICE_QUESTIONS = [
+    "Where can I download my invoice?",
+    "I was charged twice for the same month, can I get a refund?",
+    "How do I update my billing email address?",
+    "Can I get a W-9 form for my company?",
+    "My invoice is missing tax information, can you reissue it?",
+    "How do I change the credit card on file?",
+    "Cancel my subscription, where do I do that?",
+    "Refund request for duplicate charge",
+    "Annual plan upgrade — prorated cost?",
+    "Need a copy of my receipt for accounting",
+    "VAT number missing on latest invoice",
+    "Subscription auto-renewal — how to disable?",
+    "Invoice currency not matching my account settings",
+    "Pro-rated refund for early cancellation",
+    "Payment failed but my card works elsewhere",
+]
+
+# Miscellaneous one-off questions — simulate the long tail of random
+# one-liners that show up in any real tenant. These become HDBSCAN
+# noise points (the "sparse background" against which dense topics
+# stand out).
+ONE_OFF_QUESTIONS = [
+    "Do you have a mobile app?",
+    "What time zone are your support hours in?",
+    "Can I get a feature roadmap?",
+    "Is there a free trial?",
+    "Where are your servers located?",
+    "How do I contact a human agent?",
+]
+
 SEED_SIGNATURE_TEXT = "[seed-mining-2026-10-14]"
 
 
@@ -139,8 +180,19 @@ async def main() -> None:
         now = datetime.now(UTC)
         base_dt = now - timedelta(days=20)
 
+        # Build a multi-topic mix so HDBSCAN has density contrast.
+        # A single-topic dataset is one homogeneous dense region; the
+        # clusterer can't form a cluster without a "sparser" neighbor
+        # to compare against. Two topics + 6 random one-offs mirror
+        # what a real tenant's customer-message stream looks like.
+        topics: list[tuple[str, list[str]]] = [
+            ("password-reset", PASSWORD_RESET_QUESTIONS),
+            ("invoice-billing", INVOICE_QUESTIONS),
+            ("misc-oneoff", ONE_OFF_QUESTIONS),
+        ]
+
         total_msgs = 0
-        for conv_idx in range(4):
+        for conv_idx, (topic_name, questions) in enumerate(topics):
             conv = Conversation(
                 id=new_id(),
                 tenant_id=t.id,
@@ -152,14 +204,7 @@ async def main() -> None:
                 last_activity_at=base_dt + timedelta(hours=1),
             )
             session.add(conv)
-            # 6 messages per conversation × 4 = 24 total — comfortably
-            # above the HDBSCAN ``min_cluster_size=10`` floor (with
-            # ``min_samples=5`` you need slack to actually form a
-            # cluster) and well above the per-batch embedding limit
-            # of 10 (handled internally by ``embed_texts``).
-            for msg_idx, text in enumerate(
-                PASSWORD_RESET_QUESTIONS[conv_idx * 6 : (conv_idx + 1) * 6]
-            ):
+            for msg_idx, text in enumerate(questions):
                 msg_dt = base_dt + timedelta(minutes=msg_idx * 5)
                 # Prefix every message with the seed signature so the
                 # cleanup helper can find them later. Keep the question
@@ -176,7 +221,7 @@ async def main() -> None:
 
         await session.commit()
         print(
-            f"[seed] inserted 2 CLOSED conversations + {total_msgs} "
+            f"[seed] inserted {len(topics)} CLOSED conversations + {total_msgs} "
             f"CUSTOMER messages on tenant {t.id} (channel {ch.id})"
         )
 
