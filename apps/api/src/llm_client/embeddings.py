@@ -18,7 +18,13 @@ from core.logging import get_logger
 from llm_client.providers.openai_embedding_provider import OpenAIEmbeddingProvider
 from llm_client.types import EmbeddingError, EmbeddingResult
 
-_OPENAI_BATCH_LIMIT = 2048
+_OPENAI_BATCH_LIMIT = 10
+# Per-call input batch cap. The OpenAI /v1/embeddings endpoint
+# accepts up to 2048 inputs per call, but other OpenAI-compatible
+# providers have much tighter limits (Doubao Ark plan/v3 caps at
+# 10). 10 is the safe default for the registered provider set; the
+# perf cost is more API round-trips per embed_texts call, which
+# asyncio.gather amortizes against ``_BATCH_CONCURRENCY``.
 _MAX_RETRIES = 3
 
 # Cap concurrent in-flight embedding batches. OpenAI's per-org rate limit
@@ -107,9 +113,10 @@ async def embed_texts(
 ) -> EmbeddingResult:
     """Embed a batch of texts via the OpenAI-compatible embeddings API.
 
-    Splits `texts` into chunks of ≤ 2048 (OpenAI's per-call limit) and calls
-    the provider concurrently per chunk (bounded by ``_BATCH_CONCURRENCY``).
-    Returns vectors in input order with token usage summed across batches.
+    Splits `texts` into chunks of ≤ ``_OPENAI_BATCH_LIMIT`` (10 — see the
+    constant's docstring) and calls the provider concurrently per chunk
+    (bounded by ``_BATCH_CONCURRENCY``). Returns vectors in input order
+    with token usage summed across batches.
 
     Args:
         texts: Strings to embed.

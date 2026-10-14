@@ -101,10 +101,17 @@ async def test_embed_texts_returns_correct_dimensions() -> None:
         assert len(vec) == dim
 
 
+# Mirrors ``llm_client.embeddings._OPENAI_BATCH_LIMIT`` (10 — see
+# its docstring). Kept as a test-local constant so the unit tests
+# don't import a private symbol but still exercise the real chunk
+# boundary. If you change the limit, change this in lockstep.
+_TEST_BATCH_SIZE = 10
+
+
 async def test_embed_texts_sums_token_usage() -> None:
-    # Build two batches of 2048 — each batch returns its own usage, which
+    # Build two batches of 10 — each batch returns its own usage, which
     # must be aggregated by embed_texts.
-    batch_size = 2048
+    batch_size = _TEST_BATCH_SIZE
     n_batches = 2
     texts = [f"t-{i}" for i in range(batch_size * n_batches)]
 
@@ -163,11 +170,11 @@ async def test_embed_texts_uses_configured_model() -> None:
 async def test_embed_texts_preserves_input_order_across_batches() -> None:
     """Concurrent batch processing must preserve the input ordering of vectors.
 
-    The SDK is invoked in parallel for > 2048 inputs; the returned vectors
+    The SDK is invoked in parallel for > 10 inputs; the returned vectors
     must still line up 1:1 with the original `texts` even though batches may
     complete out of order.
     """
-    batch_size = 2048
+    batch_size = _TEST_BATCH_SIZE
     n_batches = 4
     texts = [f"t-{i}" for i in range(batch_size * n_batches)]
 
@@ -318,6 +325,8 @@ async def test_embed_texts_raises_embedding_error_on_rate_limit_exhausted() -> N
 
 async def test_embed_empty_list_returns_empty_result() -> None:
     """Zero inputs → empty result, no API call."""
+    from core.config import get_settings
+
     client = _mock_client()
 
     result = await embed_texts(
@@ -325,18 +334,25 @@ async def test_embed_empty_list_returns_empty_result() -> None:
         client=client,  # type: ignore[arg-type]
     )
 
+    # The default model comes from settings.default_embedding_model
+    # (overridable per env). Hard-coding "text-embedding-3-small"
+    # here would make the test brittle whenever the demo / CI env
+    # registers a different provider (e.g. doubao-embedding-vision).
     assert result == EmbeddingResult(
-        vectors=[], model="text-embedding-3-small", prompt_tokens=0, total_tokens=0
+        vectors=[],
+        model=get_settings().default_embedding_model,
+        prompt_tokens=0,
+        total_tokens=0,
     )
     client.embeddings.create.assert_not_awaited()
 
 
 async def test_embed_batch_size_limit() -> None:
-    """Inputs > 2048 texts must be split into multiple batches."""
-    batch_size = 2048
+    """Inputs > 10 texts must be split into multiple batches."""
+    batch_size = _TEST_BATCH_SIZE
     n_batches = 3
     texts = [f"t-{i}" for i in range(batch_size * n_batches)]
-    assert len(texts) == 2048 * 3  # 6144
+    assert len(texts) == _TEST_BATCH_SIZE * 3  # 30
 
     side_effects: list[MagicMock] = []
     for _ in range(n_batches):
