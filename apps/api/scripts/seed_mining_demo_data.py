@@ -16,7 +16,7 @@ Design
 * Picks the first tenant + first WEB channel in the DB (the demo
   tenant + widget channel from ``scripts/extend-seed.py``).
 * Creates 3 CLOSED conversations on that tenant + channel.
-* Inserts ~45 customer messages across 2 dense topics (15 password-
+* Inserts 45 customer messages across 2 dense topics (24 password-
   reset + 15 invoice/billing + 6 misc one-off questions). Multi-topic
   data is essential: HDBSCAN is density-based and needs a "sparser"
   background to identify a cluster — a single homogeneous topic
@@ -38,6 +38,15 @@ The first version of this script seeded 24 password-reset questions
 and the clusterer always returned 0 — see git history. The fix is
 to seed 2 topics + some one-off noise, which is what real tenants
 look like.
+
+This multi-topic requirement is one of the things the clusterer
+hardening (commit ``8aaa767``) verified end-to-end: live run with
+the Doubao ``doubao-embedding-vision`` model (2048-dim) produced
+2 clusters (size 26 password-reset + 10 invoice-billing) against
+9 noise points, and 2 KB drafts were inserted. Without the
+one-off "misc" rows, the clusterer would have returned a single
+homogeneous cluster of 39 (above ``max_cluster_size`` if lowered,
+or 1 large topic — no contrast for a second cluster to emerge).
 
 Schema notes (verified against ``conversation.models.Conversation``):
 

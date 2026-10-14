@@ -28,7 +28,7 @@
 | 15 | M2.A — 收尾 (README + demo-act4 + 已知技术债 + memory) | ✅ | 0 new tests, 3 demo screenshots |
 | 16 | M2.B — Email 渠道 (SES webhook 路由 + 纯文本回复 + 自动回信 + thread/dedup) | ✅ | 4 parser + 5 outbound + 1 inbound integration |
 | 17 | M2.B — 多模态 KB (PNG/PDF + Qdrant vision collection + RRF 检索 + 上传 API) | ✅ | ~20 multimodal unit + integration |
-| 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration |
+| 18 | M2.B — 历史会话挖掘 (HDBSCAN clusterer + KBDraftGenerator + Arq Sunday worker + admin approve/reject API) | ✅ | 10 clusterer/draft + 11 admin/worker integration;**clusterer 2026-10-14 二次加固** — L2-normalize + `metric='euclidean'` + `min_samples=1` (commit `8aaa767`),修 Doubao `doubao-embedding-vision` (2048-dim) 必产 0 cluster 阻塞,见 [README §"HDBSCAN 多 embedding-model 注意事项"](#hdbscan-多-embedding-model-注意事项) |
 | 19 | M2.B — 收尾 (README + demo-act5 + 已知技术债 #18-20 + memory) | ✅ | 0 new tests, 3 demo stub PNGs |
 | 20 | M3 — 5 个生产级技术债 (#17 admin JWT auth / #18 PDF text indexing / #16 SES tenant reverse-lookup / #19 multi-vision adapter / #20 admin SPA UI) | ✅ | 17 admin + 9 vision_embedder + 13 web vitest + 4 PDF retrieve |
 | 21 (M4.A) | LLM Gateway core — provider registry + multi-provider routing + `with_config()` per-call pinning (resolver seam: `LLMClient` 只依赖 `provider_resolver`,不感知 provider) | ✅ | 8 resolvers + 12 gateway + 5 registry + 5 llm_factory + 6 worker wiring + 6 client/metrics + 4 integration |
@@ -411,6 +411,19 @@ SPA 拿不到 tenant_id → 登录按钮一直 disabled。检查:
 - Chunk.id 用 `SHA-256(article_version_id || chunk_index)[:26]`
 - 上传 50 MiB 硬上限 + 1 MiB chunked read(溢出 413 BEFORE parser)
 - 并发 reupload `SELECT FOR UPDATE` 防 UNIQUE 撞车
+
+### 历史会话挖掘 (Stage 18 / 2026-10-14 加固)
+- 流程: `Arq Sunday worker → embed_texts → HdbscanClusterer → KBDraftGenerator (LLM) → KbArticleDraft (status=DRAFT) → admin approve/reject`
+- **clusterer 关键不变量** (commit `8aaa767`):
+  - **L2-normalize 每行到单位球 + `metric='euclidean'`** — 单位向量上 `euclidean = sqrt(2(1-cos))` 是 cosine 的严格单调变换,聚类决策数学等价。**为什么不用 `metric='precomputed'`**: sklearn 1.x 删了 BallTree 的 `metric='cosine'`;precomputed 走 pdist 内存 O(n²) ≈ 400MB @ 2048-dim × 1k points,L2-normalize + euclidean O(n·d) ≈ 80MB;且 BallTree 在 2048-dim 本来就退化成 brute-force,两路径速度持平。
+  - **`min_samples=1` 默认** — 旧值 5 是为 OpenAI `text-embedding-3-small` (1536-dim 文本嵌入) raw euclidean 调的,搬到 Doubao `doubao-embedding-vision` (2048-dim 视觉嵌入) 永远找不到 core point → 0 cluster。`min_samples` 故意不暴露成 config setting,提示 operator 调 `min_cluster_size`(行业惯例: `min_samples = min_cluster_size // 2` 或 1)。
+  - **零向量过滤** + **1-point 短路** + **`< min_cluster_size` 短路** — 防 NaN/Inf 污染 BallTree + 防 HDBSCAN kdtree `k must be <= n_points` 崩溃。
+
+#### <a id="hdbscan-多-embedding-model-注意事项"></a>HDBSCAN 多 embedding-model 注意事项
+- **任何 density-based clusterer 的默认参数都跟具体 embedding model 强耦合**,换 embedding 必须重测。`min_samples=5` 在 OpenAI 1536-dim 文本嵌入上能跑,在 Doubao 2048-dim 视觉嵌入上必产 0 cluster,而 0 cluster 不报错只 `processed=N, drafts_created=0` — **silent failure**。
+- **生产端到端 4 步验证** (任何走 embedding 的 worker 都得做): embed 成功(无 batch limit / auth 错) → cluster 形成(HDBSCAN 至少产 1 cluster,看 `tenant_processed` 日志或直接调 clusterer) → draft 入库(LLM 调通) → API 可见。**任何一步 silent 失败都会让 `drafts_created: 0` 出现,但没有 error log**。
+- **demo seed 必须是多主题** — 单主题(24 条 password-reset)是单一均匀 dense 区,HDBSCAN 正确地返回 0 cluster(不是 bug 是算法本质)。`scripts/seed_mining_demo_data.py` 现在写 45 条(15 password-reset + 15 invoice/billing + 6 misc one-off)模拟真实租户长尾。
+- **embedding API batch cap 按 model 校准** — `_OPENAI_BATCH_LIMIT=2048` 对 OpenAI 成立,Doubao Ark `plan/v3` 实际 cap=10 inputs/call,超了 `Embeddings API input limit exceeded: max 10, got N`(commit `4e677b1` 修)。
 
 ## API 端点 (M1)
 

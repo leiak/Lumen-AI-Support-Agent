@@ -1,5 +1,13 @@
 """HDBSCAN clustering over conversation embeddings.
 
+Hardened in commit ``8aaa767`` (2026-10-14): L2-normalize + euclidean +
+``min_samples=1`` to fix the silent "0 clusters on Doubao
+``doubao-embedding-vision`` (2048-dim)" bug that had been breaking the
+Sunday ``history_mining`` cron for every Doubao-using tenant. See
+``README.md`` §"历史会话挖掘 (Stage 18 / 2026-10-14 加固)" for the
+multi-model注意事项; the rest of this docstring is the algorithm
+rationale.
+
 HDBSCAN chosen over K-means because:
 - K-means requires pre-specifying K (unknown for arbitrary support history)
 - HDBSCAN naturally identifies noise points (small groups marked as -1)
