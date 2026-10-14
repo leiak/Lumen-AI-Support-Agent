@@ -386,11 +386,22 @@ class AdminTenantLLMConfigRepository:
         """
         from core.database import get_sessionmaker
 
-        # Translate ``base_url == ""`` (frontend-friendly clear) into
-        # ``None`` (DB NULL). Empty string isn't a valid base URL.
-        base_url = payload.base_url
-        if base_url == "":
-            base_url = None
+        # ``base_url`` — distinguish "omitted from PATCH" from
+        # "explicit null/empty clear". Pydantic exposes ``model_fields_set``
+        # = field names the client actually sent. If ``base_url`` was
+        # omitted entirely, pass the ``_UNSET`` sentinel so the inner
+        # repo skips the column; if it was sent as ``""``, normalise to
+        # ``None`` (DB NULL) — same convention as ``model`` below and as
+        # the POST path's `base_url == ""` translation.
+        # Without this guard, a PATCH that only updates ``enabled`` would
+        # wipe ``base_url`` to NULL (see 2026-10-14 follow-up after the
+        # Doubao Ark onboarding test).
+        if "base_url" in payload.model_fields_set:
+            base_url = payload.base_url
+            if base_url == "":
+                base_url = None
+        else:
+            base_url = _UNSET
         # ``model`` (M5.2) — distinguish "omitted" from "explicit null/empty".
         # Pydantic exposes ``model_fields_set`` = field names the client
         # actually sent. If ``model`` was omitted entirely, pass the

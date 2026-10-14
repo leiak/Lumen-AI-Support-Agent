@@ -194,6 +194,66 @@ async def test_patch_no_actual_change_no_audit(tenant: str, cipher: TenantLLMCon
     assert rows_after == rows_before  # no audit for no-op
 
 
+async def test_patch_enabled_only_preserves_base_url(tenant: str, cipher: TenantLLMConfigCipher) -> None:
+    """Regression (2026-10-14): PATCH that omits ``base_url`` must not clear it.
+
+    Bug found while onboarding the Doubao Ark provider on the demo
+    tenant: ``AdminTenantLLMConfigRepository.update`` was passing
+    ``base_url=None`` to the inner repo even when the PATCH payload
+    never mentioned ``base_url`` (Python default). The inner repo then
+    overwrote the stored base URL with NULL. ``model`` already used the
+    ``_UNSET`` sentinel + ``model_fields_set`` check; ``base_url`` now
+    does the same.
+
+    Before the fix this test would observe ``row.base_url is None`` and
+    fail; after the fix the original base_url must be preserved.
+    """
+    seed_url = "https://api.example.com/anthropic"
+    seed = TenantLLMConfigCreate(
+        provider_name="anthropic",
+        api_key="sk-seed",
+        base_url=seed_url,
+        enabled=True,
+    )
+    seed_sha = hashlib.sha256(b"sk-seed").hexdigest()
+    seeded = await AdminTenantLLMConfigRepository().upsert(
+        tenant_id=tenant, payload=seed, changed_by="admin-1", api_key_sha256=seed_sha,
+    )
+    assert seeded.base_url == seed_url
+
+    # PATCH only flips enabled; base_url is NOT in the payload at all.
+    payload = TenantLLMConfigUpdate(enabled=False)
+    row = await AdminTenantLLMConfigRepository().update(
+        tenant_id=tenant, provider_name="anthropic",
+        payload=payload, changed_by="admin-1",
+    )
+    assert row is not None
+    assert row.enabled is False
+    # The whole point: base_url must be untouched.
+    assert row.base_url == seed_url
+
+    # And no NEW base_url / model / api_key audit rows should have
+    # been written by the PATCH (the upsert seed DID write those —
+    # that's expected). The only PATCH-emitted audit row is the
+    # ``enabled`` toggle.
+    audit = await _list_audit_rows(tenant)
+    # The last audit row is the one written by the PATCH above.
+    latest = max(audit, key=lambda r: r.changed_at)
+    assert latest.field == "enabled"
+    assert latest.new_value == "False"  # stringified bool by _diff_upsert
+    assert latest.old_value == "True"
+    # And no row with field == "base_url" should have been touched
+    # since the seed (the seed did write one, but no PATCH should
+    # have). We verify by checking that the only audit rows with
+    # field=="base_url" are the original seed ones (old_value NULL).
+    base_url_rows = [r for r in audit if r.field == "base_url"]
+    for r in base_url_rows:
+        assert r.new_value == seed_url, (
+            f"PATCH wiped base_url to {r.new_value!r}; expected the "
+            f"seed value {seed_url!r} to be preserved"
+        )
+
+
 async def test_delete_writes_deleted_marker(tenant: str, cipher: TenantLLMConfigCipher) -> None:
     seed = TenantLLMConfigCreate(provider_name="anthropic", api_key="sk-seed")
     seed_sha = hashlib.sha256(b"sk-seed").hexdigest()
