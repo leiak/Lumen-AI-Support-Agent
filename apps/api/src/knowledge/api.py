@@ -400,7 +400,7 @@ async def _read_upload_capped(file: UploadFile, *, cap: int) -> bytes:
         total += len(chunk)
         if total > cap:
             raise HTTPException(
-                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail=f"file exceeds the {cap // (1024 * 1024)} MiB upload limit",
             )
         chunks.append(chunk)

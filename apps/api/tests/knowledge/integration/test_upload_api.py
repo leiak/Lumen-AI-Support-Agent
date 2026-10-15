@@ -160,6 +160,7 @@ async def _ensure_collection_ready() -> None:
     ok = await ensure_collection(
         name=DEFAULT_COLLECTION,
         vector_size=DEFAULT_VECTOR_SIZE,
+        recreate=True,
     )
     assert ok, "Failed to ensure Qdrant collection"
 

@@ -98,3 +98,12 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_conversation_created", "conversation_id", "created_at"),
     )
+
+
+# Register the sibling Ticket model so the ``conversations.ticket_id``
+# ForeignKey resolves at metadata reflection time. Deferred import
+# avoids a circular Ticket -> Conversation cycle (Ticket also has
+# ``ForeignKey("conversations.id")``). Any test or code path that
+# imports ``Conversation`` (or ``Message`` from this module) will
+# now also register ``Ticket`` with SQLAlchemy's ``Base.metadata``.
+from ticket.models import Ticket  # noqa: E402, F401

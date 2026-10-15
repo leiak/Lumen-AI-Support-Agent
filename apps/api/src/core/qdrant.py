@@ -15,6 +15,12 @@ def get_qdrant_client() -> AsyncQdrantClient:
             # REST only — docker-compose exposes 6333, not the gRPC port 6334.
             # Keep prefer_grpc=False so future maintainers don't "optimize" this back.
             prefer_grpc=False,
+            # qdrant-client 1.10+ logs a CompatibilityWarning when its
+            # version doesn't match the server's. Our local stack runs
+            # qdrant 1.x while the client may pin a different minor —
+            # the warning is informational, not actionable. Suppress
+            # so prod logs stay clean.
+            check_compatibility=False,
         )
     return _client
 

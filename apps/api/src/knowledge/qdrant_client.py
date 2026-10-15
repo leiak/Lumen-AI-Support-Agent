@@ -121,19 +121,35 @@ async def ensure_collection(
     name: str,
     vector_size: int,
     distance: str = DEFAULT_DISTANCE,
+    recreate: bool = False,
 ) -> bool:
     """Ensure a Qdrant collection exists with the given schema.
 
+    Args:
+        name: Qdrant collection name.
+        vector_size: Required vector dimensionality.
+        distance: Similarity metric name (default Cosine).
+        recreate: When True, delete the collection if it exists and
+            recreate it at the requested ``vector_size``. Used by
+            integration tests whose mocked embedding dim differs from
+            the on-disk Qdrant schema. Default ``False`` keeps the
+            production startup path strictly idempotent.
+
     Returns:
-        True if the collection already exists, was created by this call,
-        or another process won the create race. False (with a WARNING
-        log) on any other failure — for example, when the Qdrant URL is
-        unreachable, the API key is rejected, or the request times out.
+        True if the collection already exists (recreate=False), was
+        created by this call, or another process won the create race.
+        False (with a WARNING log) on any other failure — for example,
+        when the Qdrant URL is unreachable, the API key is rejected,
+        or the request times out.
 
     The function is idempotent: repeated calls with the same arguments
     are safe and will only contact Qdrant twice (one ``get_collection``,
     one ``create_collection``) on the very first invocation. Subsequent
     calls hit only ``get_collection``.
+
+    The ``recreate=True`` path is INTENTIONALLY destructive — callers
+    must use it only in test fixtures. The default is ``False`` so
+    production startup is still idempotent.
 
     All log payloads are PII-safe: only the collection name, the
     exception class name, and (where relevant) the status code are
@@ -149,6 +165,31 @@ async def ensure_collection(
             error_type=type(exc).__name__,
         )
         return False
+
+    # 0. (recreate only) DELETE the existing collection so the
+    #    requested schema wins on the create below. Used by tests
+    #    whose mocked embedding dim differs from the on-disk Qdrant
+    #    schema. We swallow "not found" so this is safe on a fresh
+    #    Qdrant where the probe would otherwise 404.
+    if recreate:
+        try:
+            await client.delete_collection(collection_name=name)
+            log.info("qdrant.collection.recreated.deleted", collection=name)
+        except UnexpectedResponse as exc:
+            if not _is_not_found(exc):
+                log.warning(
+                    "qdrant.collection.recreate_delete_failed",
+                    collection=name,
+                    status_code=getattr(exc, "status_code", None),
+                )
+                return False
+        except Exception as exc:
+            log.warning(
+                "qdrant.collection.recreate_delete_error",
+                collection=name,
+                error_type=type(exc).__name__,
+            )
+            return False
 
     # 1. Probe: does the collection already exist?
     try:
