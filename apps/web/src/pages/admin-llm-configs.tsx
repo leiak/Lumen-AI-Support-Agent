@@ -31,6 +31,15 @@ export function AdminLLMConfigsPage(): JSX.Element {
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
 
+  // Edit (per-row) state — only one row in edit mode at a time.
+  // ``editingProvider`` holds the provider_name of the row being
+  // edited, or ``null`` when no row is in edit mode. ``editBaseUrl``
+  // is the draft value of the ``base_url`` field; committing runs
+  // the ``editMut`` PATCH with the trimmed value (``null`` when
+  // the operator clears the field, signaling "use provider default").
+  const [editingProvider, setEditingProvider] = useState<string | null>(null);
+  const [editBaseUrl, setEditBaseUrl] = useState('');
+
   const configsQuery = useQuery({
     queryKey: [...LLM_CONFIGS_QUERY_KEY, tenantId],
     queryFn: () => fetchLLMConfigs(tenantId),
@@ -61,6 +70,22 @@ export function AdminLLMConfigsPage(): JSX.Element {
     },
   });
 
+  // Edit base_url (and optionally toggle enabled from the edit form).
+  // The plaintext API key is NEVER editable here — rotation requires
+  // delete + recreate. The backend PATCH endpoint enforces this
+  // (TenantLLMConfigUpdate only declares ``enabled`` + ``base_url``).
+  const editMut = useMutation({
+    mutationFn: (input: { providerName: string; baseUrl: string | null }) =>
+      updateLLMConfig(tenantId, input.providerName, {
+        base_url: input.baseUrl,
+      }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [...LLM_CONFIGS_QUERY_KEY, tenantId] });
+      setEditingProvider(null);
+      setEditBaseUrl('');
+    },
+  });
+
   const deleteMut = useMutation({
     mutationFn: (providerName: string) => deleteLLMConfig(tenantId, providerName),
     onSuccess: () => {
@@ -80,6 +105,24 @@ export function AdminLLMConfigsPage(): JSX.Element {
       return;
     }
     deleteMut.mutate(providerName);
+  }
+
+  function handleStartEdit(c: LLMConfig): void {
+    setEditingProvider(c.provider_name);
+    setEditBaseUrl(c.base_url ?? '');
+  }
+
+  function handleCancelEdit(): void {
+    setEditingProvider(null);
+    setEditBaseUrl('');
+  }
+
+  function handleSubmitEdit(providerName: string): void {
+    const trimmed = editBaseUrl.trim();
+    editMut.mutate({
+      providerName,
+      baseUrl: trimmed === '' ? null : trimmed,
+    });
   }
 
   return (
@@ -199,62 +242,116 @@ export function AdminLLMConfigsPage(): JSX.Element {
                 </tr>
               </thead>
               <tbody>
-                {configs.map((c) => (
-                  <tr
-                    key={c.provider_name}
-                    data-testid={`llm-config-row-${c.provider_name}`}
-                    className="border-b last:border-0"
-                  >
-                    <td className="px-4 py-2 font-medium">{c.provider_name}</td>
-                    <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
-                      {c.base_url ?? '(default)'}
-                    </td>
-                    <td className="px-4 py-2">
-                      <span
-                        data-testid={`llm-config-status-${c.provider_name}`}
-                        className={
-                          c.enabled
-                            ? 'rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700'
-                            : 'rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground'
-                        }
-                      >
-                        {c.enabled ? '启用' : '禁用'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted-foreground">
-                      {c.updated_at}
-                    </td>
-                    <td className="px-4 py-2">
-                      <div className="flex gap-2">
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          data-testid={`llm-config-toggle-${c.provider_name}`}
-                          onClick={() =>
-                            toggleMut.mutate({
-                              providerName: c.provider_name,
-                              enabled: !c.enabled,
-                            })
+                {configs.map((c) => {
+                  const isEditing = editingProvider === c.provider_name;
+                  return (
+                    <tr
+                      key={c.provider_name}
+                      data-testid={`llm-config-row-${c.provider_name}`}
+                      className="border-b last:border-0"
+                    >
+                      <td className="px-4 py-2 font-medium">{c.provider_name}</td>
+                      <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
+                        {isEditing ? (
+                          <input
+                            className="w-full rounded border px-2 py-1 font-mono text-xs"
+                            data-testid={`llm-config-edit-base-url-${c.provider_name}`}
+                            value={editBaseUrl}
+                            onChange={(e) => setEditBaseUrl(e.target.value)}
+                            placeholder="https://api.example.com/v1 (留空 = 走 provider 默认)"
+                            autoFocus
+                          />
+                        ) : c.base_url ? (
+                          c.base_url
+                        ) : (
+                          '(default)'
+                        )}
+                      </td>
+                      <td className="px-4 py-2">
+                        <span
+                          data-testid={`llm-config-status-${c.provider_name}`}
+                          className={
+                            c.enabled
+                              ? 'rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700'
+                              : 'rounded bg-muted px-2 py-0.5 text-xs text-muted-foreground'
                           }
-                          disabled={toggleMut.isPending}
                         >
-                          {c.enabled ? '禁用' : '启用'}
-                        </Button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          data-testid={`llm-config-delete-${c.provider_name}`}
-                          onClick={() => handleDelete(c.provider_name)}
-                          disabled={deleteMut.isPending}
-                        >
-                          删除
-                        </Button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                          {c.enabled ? '启用' : '禁用'}
+                        </span>
+                      </td>
+                      <td className="px-4 py-2 text-xs text-muted-foreground">
+                        {c.updated_at}
+                      </td>
+                      <td className="px-4 py-2">
+                        <div className="flex gap-2">
+                          {isEditing ? (
+                            <>
+                              <Button
+                                type="button"
+                                size="sm"
+                                data-testid={`llm-config-edit-save-${c.provider_name}`}
+                                onClick={() => handleSubmitEdit(c.provider_name)}
+                                disabled={editMut.isPending}
+                              >
+                                {editMut.isPending ? '保存中…' : '保存'}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                data-testid={`llm-config-edit-cancel-${c.provider_name}`}
+                                onClick={handleCancelEdit}
+                                disabled={editMut.isPending}
+                              >
+                                取消
+                              </Button>
+                            </>
+                          ) : (
+                            <>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                data-testid={`llm-config-edit-${c.provider_name}`}
+                                onClick={() => handleStartEdit(c)}
+                                disabled={
+                                  editMut.isPending || editingProvider !== null
+                                }
+                              >
+                                编辑
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                data-testid={`llm-config-toggle-${c.provider_name}`}
+                                onClick={() =>
+                                  toggleMut.mutate({
+                                    providerName: c.provider_name,
+                                    enabled: !c.enabled,
+                                  })
+                                }
+                                disabled={toggleMut.isPending}
+                              >
+                                {c.enabled ? '禁用' : '启用'}
+                              </Button>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                data-testid={`llm-config-delete-${c.provider_name}`}
+                                onClick={() => handleDelete(c.provider_name)}
+                                disabled={deleteMut.isPending}
+                              >
+                                删除
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </CardContent>
