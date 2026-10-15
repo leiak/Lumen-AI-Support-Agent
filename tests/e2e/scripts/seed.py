@@ -152,9 +152,20 @@ async def _seed_channel(session) -> None:
 
 
 async def _seed_conversation(session) -> None:
-    if await session.get(Conversation, DEMO_CONVERSATION_ID) is not None:
-        return
     now = datetime.now(UTC)
+    existing = await session.get(Conversation, DEMO_CONVERSATION_ID)
+    if existing is not None:
+        # Idempotent reset — previous test runs that POSTed /claim
+        # left the row with assigned_agent_id set, which makes it
+        # invisible to GET /queue (unassigned-PENDING filter). The
+        # Flow A agent-flow test depends on the row being in the
+        # queue, so we rewind it on every seed run. Customer text
+        # is preserved so stream-scroll assertions stay stable.
+        existing.status = ConversationStatus.PENDING
+        existing.assigned_agent_id = None
+        existing.last_activity_at = now
+        await session.flush()
+        return
     session.add(
         Conversation(
             id=DEMO_CONVERSATION_ID,

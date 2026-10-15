@@ -87,7 +87,10 @@ export async function loginViaApi(
   // ---- Step 3: persist JWT on the SPA origin ---------------------
   // Visit the origin first so localStorage is bound to the right
   // domain. Using about:blank would silently drop the write.
-  await page.goto('/');
+  // Absolute URL (not baseURL-relative ``/``) to dodge the same
+  // Playwright "Cannot navigate to invalid URL" guard hit by
+  // loginViaUi — see comment there.
+  await page.goto('http://localhost:5173/');
   await page.evaluate(
     ([key, token]) => window.localStorage.setItem(key, token),
     [JWT_STORAGE_KEY, body.access_token],
@@ -113,12 +116,31 @@ export async function loginViaUi(
   email: string = SEED.agentEmail,
   password: string = SEED.password,
 ): Promise<void> {
-  await page.goto('/login');
+  // Use the absolute URL rather than the baseURL-relative '/login' so
+  // we don't trip the Playwright "Cannot navigate to invalid URL"
+  // guard that some versions raise when the navigation is kicked off
+  // from a helper that wasn't directly passed the page's context.
+  await page.goto('http://localhost:5173/login');
   await page.getByLabel('邮箱').fill(email);
-  // Wait long enough for the form's 300ms debounced lookup to land
-  // and the "tenant hint failed" hint to NOT appear (i.e. lookup OK).
-  await expect(page.getByTestId('tenant-hint-failed')).toHaveCount(0);
+  // Wait for the form's debounced /auth/lookup-tenant request to
+  // return BEFORE we click 登录 — the form's submit handler short-
+  // circuits with "邮箱或租户信息无法识别" if ``resolvedTenantId`` is
+  // still null (i.e. the lookup is in flight). The old
+  // ``toHaveCount(0)`` on ``tenant-hint-failed`` raced against the
+  // 300ms debounce because the hint is also absent while the lookup
+  // is in flight.
+  const lookupResponse = await page.waitForResponse(
+    (resp) => resp.url().includes('/api/v1/auth/lookup-tenant') && resp.status() === 200,
+    { timeout: 10_000 },
+  );
+  expect(lookupResponse.status()).toBe(200);
   await page.getByLabel('密码').fill(password);
   await page.getByRole('button', { name: '登录' }).click();
-  await page.waitForURL('**/inbox');
+  // SPA route change doesn't fire a ``load`` event, so the default
+  // ``page.waitForURL`` (which waits for ``load``) would hang.
+  // ``expect(page).toHaveURL(...)`` retries until the regex matches
+  // without depending on a full-page load. The regex (vs. the
+  // ``**/inbox`` glob) also avoids Playwright's "glob requires a
+  // preceding segment" footgun on the root-level ``/inbox`` URL.
+  await expect(page).toHaveURL(/\/inbox(\/|$|\?)/, { timeout: 10_000 });
 }

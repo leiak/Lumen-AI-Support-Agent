@@ -32,6 +32,11 @@ const API = join(REPO, 'apps', 'api');
 const WEB_SDK = join(REPO, 'apps', 'web-sdk');
 const E2E_STATIC = join(HERE, 'static');
 const SEED = join(HERE, 'scripts', 'seed.py');
+// M2.A — rich seed (tickets, SLA policies, audit events) so
+// demo-act4-02.spec.ts has a real row to render instead of
+// "ticket not found". Idempotent — safe to re-run after the base
+// SEED above. Lives in the same scripts/ directory as SEED.
+const SEED_RICH = join(HERE, 'scripts', 'seed_demo_rich.py');
 const SDK_BUNDLE_SRC = join(WEB_SDK, 'dist', 'lumen-widget.js');
 const SDK_BUNDLE_DST = join(E2E_STATIC, 'lumen-widget.js');
 
@@ -83,6 +88,16 @@ export default async function globalSetup(_config: FullConfig): Promise<void> {
   // -- Step 2: seed the deterministic demo data ----------------------
   step('seeding demo tenant/user/channel/conversation');
   run(`uv run python "${SEED}"`, API);
+
+  // -- Step 2b: rich demo seed (tickets, SLA, audit) ---------------
+  // M2.A — demo-act4-02 needs a P1 billing ticket to render the
+  // admin ticket-detail page; the base seed only creates tenant +
+  // users + a single PENDING conversation. The rich seed is
+  // idempotent and additive.
+  if (existsSync(SEED_RICH)) {
+    step('seeding demo tickets + SLA policies (rich)');
+    run(`uv run python "${SEED_RICH}"`, API);
+  }
 
   // -- Step 3: health check the API server ----------------------------
   step('checking backend /health');
