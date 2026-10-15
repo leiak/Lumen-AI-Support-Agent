@@ -110,6 +110,10 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  // multipartFetch (used by uploadArticle / reuploadArticle) calls the
+  // global fetch() directly — vi.stubGlobal in individual tests must
+  // be torn down here so other tests aren't surprised.
+  vi.unstubAllGlobals();
 });
 
 describe('KbDetailPage', () => {
@@ -139,7 +143,18 @@ describe('KbDetailPage', () => {
     });
     mockKbAndArticles([]);
 
-    vi.mocked(apiClient.post).mockResolvedValueOnce({ data: newArticle });
+    // uploadArticle() in src/lib/knowledge.ts uses the internal
+    // ``multipartFetch`` helper (plain ``fetch()``), NOT ``apiClient.post``
+    // — the browser sets the multipart boundary automatically. Mock the
+    // global fetch so the upload returns the new article, then assert on
+    // the fetch call (not on apiClient.post).
+    const fetchSpy = vi.fn().mockResolvedValueOnce(
+      new Response(JSON.stringify(newArticle), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
 
     // After the upload, the articles list should refetch and include
     // the new article.
@@ -173,9 +188,12 @@ describe('KbDetailPage', () => {
     await user.click(screen.getByTestId('article-upload-submit'));
 
     await waitFor(() => {
-      expect(apiClient.post).toHaveBeenCalledWith(
-        '/api/v1/knowledge/knowledge-bases/kb_x/articles/upload',
-        expect.any(FormData),
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'http://localhost:8000/api/v1/knowledge/knowledge-bases/kb_x/articles/upload',
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.any(FormData),
+        }),
       );
     });
     expect(await screen.findByText('guide.txt')).toBeInTheDocument();

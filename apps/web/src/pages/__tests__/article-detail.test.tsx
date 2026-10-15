@@ -93,6 +93,10 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
+  // multipartFetch (used by reuploadArticle) calls global fetch()
+  // directly — vi.stubGlobal in individual tests must be torn down
+  // here so other tests aren't surprised.
+  vi.unstubAllGlobals();
 });
 
 describe('ArticleDetailPage', () => {
@@ -136,15 +140,23 @@ describe('ArticleDetailPage', () => {
 
   it('reupload file input sends a multipart PATCH equivalent', async () => {
     vi.mocked(apiClient.get).mockResolvedValue({ data: sampleArticle });
-    vi.mocked(apiClient.post).mockResolvedValue({
-      data: {
-        article_id: 'art_x',
-        skipped: false,
-        version_number: 2,
-        status: 'indexing',
-        chunks_indexed: 0,
-      },
-    });
+    // reuploadArticle() uses the internal ``multipartFetch`` helper
+    // (plain ``fetch()``), NOT ``apiClient.post``. Mock global fetch
+    // instead — see src/lib/knowledge.ts:302-312 for the production
+    // call site.
+    const fetchSpy = vi.fn().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          article_id: 'art_x',
+          skipped: false,
+          version_number: 2,
+          status: 'indexing',
+          chunks_indexed: 0,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
     const user = userEvent.setup();
     renderPage();
 
@@ -157,14 +169,17 @@ describe('ArticleDetailPage', () => {
     await user.click(screen.getByTestId('article-reupload-submit'));
 
     await waitFor(() => {
-      expect(apiClient.post).toHaveBeenCalledWith(
-        '/api/v1/knowledge/articles/art_x/upload',
-        expect.any(FormData),
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'http://localhost:8000/api/v1/knowledge/articles/art_x/upload',
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.any(FormData),
+        }),
       );
     });
-    const call = vi.mocked(apiClient.post).mock.calls[0];
+    const call = fetchSpy.mock.calls[0];
     expect(call).toBeDefined();
-    const formData = call![1] as FormData;
+    const formData = call![1].body as FormData;
     expect(formData.get('file')).toBeInstanceOf(File);
     expect((formData.get('file') as File).name).toBe('guide.txt');
   });
