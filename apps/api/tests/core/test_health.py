@@ -101,10 +101,15 @@ def test_health_includes_version_and_started_at() -> None:
 def test_health_alias_returns_same_body_as_ready() -> None:
     """``/health`` is a back-compat alias for ``/health/ready``.
 
-    Same status code, same payload (modulo the version/started_at block
-    which is identical on both endpoints because they share
-    :func:`core.health.readiness`).
+    Same status code, same payload. We mock the dep checkers at the
+    same surface as :func:`test_health_ready_returns_503_when_dependencies_down`
+    so the assertion is hermetic — without the mocks, two back-to-back
+    real calls can disagree if a dep flaps between them (the
+    pre-fix failure was a flapping postgres/redis check).
     """
-    live = client.get("/health/ready").json()
-    alias = client.get("/health").json()
-    assert live == alias
+    with patch("core.health.check_postgres", return_value={"status": "ok"}), \
+         patch("core.health.check_redis", return_value={"status": "ok"}), \
+         patch("core.health.check_qdrant", return_value={"status": "ok"}):
+        ready = client.get("/health/ready").json()
+        alias = client.get("/health").json()
+    assert ready == alias

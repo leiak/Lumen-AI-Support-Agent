@@ -126,6 +126,12 @@ async def test_factory_raises_tenant_not_configured() -> None:
     fake_repo = MagicMock()
     fake_repo.list_by_tenant = AsyncMock(return_value=[])
     fake_cache._repo = fake_repo  # type: ignore[attr-defined]
+    # ``build_tenant_resolver`` awaits ``_resolve_chain_steps`` on a
+    # cache miss; the real cache has it as an async method, so the
+    # mock must use AsyncMock too — a plain MagicMock isn't awaitable
+    # and would fail with ``TypeError: object MagicMock can't be used
+    # in 'await' expression`` before we ever reach ``_raise_or_return``.
+    fake_cache._resolve_chain_steps = AsyncMock(return_value=[])  # type: ignore[attr-defined]
     fake_cache._raise_or_return = MagicMock(  # type: ignore[attr-defined]
         side_effect=TenantLlmNotConfigured(
             tenant_id="t-empty", missing_providers=["minimax", "anthropic"]
@@ -157,6 +163,10 @@ async def test_factory_increments_metric_on_not_configured() -> None:
     fake_repo = MagicMock()
     fake_repo.list_by_tenant = AsyncMock(return_value=[])
     fake_cache._repo = fake_repo  # type: ignore[attr-defined]
+    # See note in test_factory_raises_tenant_not_configured — the
+    # resolver awaits ``_resolve_chain_steps`` on a cache miss, so it
+    # must be an AsyncMock.
+    fake_cache._resolve_chain_steps = AsyncMock(return_value=[])  # type: ignore[attr-defined]
     fake_cache._raise_or_return = MagicMock(  # type: ignore[attr-defined]
         side_effect=TenantLlmNotConfigured(
             tenant_id="t-metric", missing_providers=["anthropic"]

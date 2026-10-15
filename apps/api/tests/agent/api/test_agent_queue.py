@@ -852,7 +852,11 @@ async def test_claim_does_not_broadcast_ws(
     )
 
     # Spy on the WS manager — the claim route does not broadcast, so
-    # this AsyncMock must remain untouched.
+    # this AsyncMock must remain untouched. Use monkeypatch.setattr so
+    # the original broadcast is restored at test teardown; bare
+    # attribute assignment would leak the AsyncMock into every later
+    # test that touches the WS manager singleton (the per-instance
+    # attribute shadows class-level patch.object attempts).
     from unittest.mock import AsyncMock
 
     from widget.ws import manager as ws_manager_module
@@ -863,8 +867,10 @@ async def test_claim_does_not_broadcast_ws(
         broadcast_calls.append((args, kwargs))
         return 0
 
-    ws_manager_module.manager.broadcast_to_channel = AsyncMock(
-        side_effect=spy_broadcast
+    monkeypatch.setattr(
+        ws_manager_module.manager,
+        "broadcast_to_channel",
+        AsyncMock(side_effect=spy_broadcast),
     )
 
     app = _build_app()

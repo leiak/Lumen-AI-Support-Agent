@@ -89,6 +89,11 @@ async def test_factory_raises_tenant_not_configured() -> None:
     fake_repo.list_by_tenant = AsyncMock(return_value=[])
     fake_cache._repo = fake_repo
     fake_cache._build_providers = MagicMock(return_value={})
+    # ``build_tenant_resolver`` awaits ``_resolve_chain_steps`` on a
+    # cache miss — must be AsyncMock, not MagicMock, otherwise the
+    # factory raises ``TypeError: object MagicMock can't be used in
+    # 'await' expression`` before reaching ``_raise_or_return``.
+    fake_cache._resolve_chain_steps = AsyncMock(return_value=[])
     # ``_raise_or_return`` MUST raise TenantLlmNotConfigured when the
     # decrypted provider dict is empty — that's the strict-mode
     # boundary per spec §8.4.

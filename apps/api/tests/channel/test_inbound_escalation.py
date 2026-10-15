@@ -301,8 +301,18 @@ async def test_widget_customer_message_triggers_broadcast() -> None:
 
     captured: dict = {}
 
+    # PATCH THE PER-INSTANCE ATTRIBUTE, not the class. ``channel.inbound``
+    # calls ``_wsm.broadcast_to_channel(...)`` where ``_wsm`` is the
+    # process-wide ``manager`` singleton — so the per-instance attribute
+    # lookup wins. Patching the class attribute alone is shadowed by any
+    # per-instance monkey-patch that survived from an earlier test
+    # (``test_agent_suggest`` / ``test_agent_queue`` do bare
+    # ``manager.broadcast_to_channel = AsyncMock(...)`` and didn't always
+    # restore). Patching the instance directly is robust to that leak.
+    # Note: per-instance patches bypass the descriptor protocol, so the
+    # replacement function MUST NOT take ``self`` — Python would call it
+    # as a plain function with the explicit kwargs only.
     async def fake_broadcast(
-        self,
         *,
         channel_id: str,
         payload: dict,
@@ -315,7 +325,7 @@ async def test_widget_customer_message_triggers_broadcast() -> None:
     with patch("channel.inbound.ConversationService") as mock_svc_cls, \
          patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
          patch.object(
-             widget_ws_manager.ConnectionManager,
+             widget_ws_manager.manager,
              "broadcast_to_channel",
              fake_broadcast,
          ):
@@ -369,7 +379,6 @@ async def test_widget_customer_broadcast_failure_does_not_abort_inbound() -> Non
     from widget.ws import manager as widget_ws_manager
 
     async def boom(
-        self,
         *,
         channel_id: str,
         payload: dict,
@@ -380,7 +389,7 @@ async def test_widget_customer_broadcast_failure_does_not_abort_inbound() -> Non
     with patch("channel.inbound.ConversationService") as mock_svc_cls, \
          patch("channel.inbound.SimpleResponder") as mock_resp_cls, \
          patch.object(
-             widget_ws_manager.ConnectionManager,
+             widget_ws_manager.manager,
              "broadcast_to_channel",
              boom,
          ):

@@ -95,14 +95,20 @@ async def test_aclose_all_tolerates_one_failing_client(
     assert len(pool._clients) == 0
 
     # A warning fired with the exception's class name. Look for the
-    # event key + ``error_type=RuntimeError`` substring — we don't
-    # assert the full rendered format because that is structlog's
-    # job, not ours.
-    assert "llm_client.http_pool.aclose_failed" in captured.out + captured.err, (
+    # event key + the error type name. structlog's renderer is set by
+    # ``core.logging.configure_logging()`` and is JSON in production
+    # (so the field is ``"error_type": "RuntimeError"``) but key=value
+    # in isolation (when configure_logging hasn't been called yet).
+    # Accept both formats.
+    combined = captured.out + captured.err
+    assert "llm_client.http_pool.aclose_failed" in combined, (
         f"expected aclose_failed warning, got stdout={captured.out!r} "
         f"stderr={captured.err!r}"
     )
-    assert "error_type=RuntimeError" in captured.out + captured.err
+    assert "error_type" in combined and "RuntimeError" in combined, (
+        f"expected error_type=RuntimeError (or JSON equivalent), "
+        f"got {combined!r}"
+    )
 
     # The healthy client was actually closed (httpx sets is_closed).
     assert healthy.is_closed is True

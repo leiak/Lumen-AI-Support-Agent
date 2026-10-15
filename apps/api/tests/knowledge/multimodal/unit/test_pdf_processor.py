@@ -29,6 +29,27 @@ def sample_pdf_with_image():
     return Path(__file__).parents[3] / "fixtures" / "sample_with_image.pdf"
 
 
+def _has_poppler() -> bool:
+    """Return True if the poppler ``pdftoppm`` binary is on PATH.
+
+    The screenshot path in :class:`PdfProcessor` uses
+    ``pdf2image`` which shells out to poppler. The processor
+    degrades gracefully when poppler is missing (logs
+    ``pdf.screenshot_failed`` and returns an empty
+    ``screenshot_pages`` list), so tests that *assert* screenshots
+    were produced must skip when the binary isn't available —
+    otherwise they'd fail on a clean dev box that has the Python
+    deps but not the C library.
+    """
+    import shutil
+
+    return shutil.which("pdftoppm") is not None
+
+
+@pytest.mark.skipif(
+    not _has_poppler(),
+    reason="poppler (pdftoppm) not installed — skip screenshot assertions",
+)
 def test_extract_text_from_text_only_pdf(sample_text_pdf):
     """Pure-text PDF returns text chunks, no screenshots."""
     processor = PdfProcessor()
@@ -43,6 +64,10 @@ def test_extract_text_from_text_only_pdf(sample_text_pdf):
     assert result.screenshot_pages == []  # No images/tables → no screenshots
 
 
+@pytest.mark.skipif(
+    not _has_poppler(),
+    reason="poppler (pdftoppm) not installed — skip screenshot assertions",
+)
 def test_extract_detects_table_pages(sample_pdf_with_table):
     """Page with table → included in screenshot_pages."""
     processor = PdfProcessor()
@@ -55,6 +80,10 @@ def test_extract_detects_table_pages(sample_pdf_with_table):
     assert png_bytes.startswith(b"\x89PNG")  # PNG magic bytes
 
 
+@pytest.mark.skipif(
+    not _has_poppler(),
+    reason="poppler (pdftoppm) not installed — skip screenshot assertions",
+)
 def test_extract_detects_image_pages(sample_pdf_with_image):
     """Page with embedded image → included in screenshot_pages."""
     processor = PdfProcessor()

@@ -971,8 +971,16 @@ async def test_suggest_does_not_broadcast_ws(
         broadcast_calls.append((args, kwargs))
         return await real_broadcast(*args, **kwargs)
 
-    ws_manager_module.manager.broadcast_to_channel = (
-        AsyncMock(side_effect=spy_broadcast)
+    # Use monkeypatch.setattr so the original broadcast is restored at
+    # test teardown. Bare attribute assignment leaks the AsyncMock into
+    # every later test that touches the WS manager singleton (the
+    # per-instance attribute shadows any class-level patch.object
+    # attempts), which is how ``test_widget_customer_message_triggers_broadcast``
+    # would otherwise see a phantom AsyncMock.
+    monkeypatch.setattr(
+        ws_manager_module.manager,
+        "broadcast_to_channel",
+        AsyncMock(side_effect=spy_broadcast),
     )
 
     app = _build_app()
