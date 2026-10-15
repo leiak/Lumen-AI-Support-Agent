@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { ConversationHeader } from '@/components/conversation/conversation-header';
 import { JWT_STORAGE_KEY } from '@/lib/api-client';
 import type { Conversation } from '@/lib/conversations';
+import { renderWithProviders } from '@/test/setup';
 import type { UseCurrentUserResult } from '@/lib/use-current-user';
 
 vi.mock('@/lib/use-current-user', () => ({
@@ -44,7 +45,7 @@ function renderHeader(
   conversation: Conversation = baseConversation,
   props: Partial<React.ComponentProps<typeof ConversationHeader>> = {},
 ): void {
-  render(
+  renderWithProviders(
     <ConversationHeader
       conversation={conversation}
       onActionComplete={vi.fn()}
@@ -58,10 +59,8 @@ beforeEach(() => {
   vi.mocked(useCurrentUser).mockReset();
 });
 
-afterEach(() => {
-  cleanup();
-  window.localStorage.clear();
-});
+// cleanup() and window.localStorage.clear() are run by the global
+// afterEach in src/test/setup.ts. No local afterEach needed.
 
 describe('ConversationHeader', () => {
   it('renders the conversation id (truncated), status badge, and assignee', () => {
