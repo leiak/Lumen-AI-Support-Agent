@@ -133,7 +133,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       QDRANT_URL: http://qdrant:6333
       JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
-      WIDGET_ALLOWED_ORIGINS_GLOBAL: ${WIDGET_ALLOWED_ORIGINS_GLOBAL:-http://localhost:8080}
+      WIDGET_ALLOWED_ORIGINS_GLOBAL: ${WIDGET_ALLOWED_ORIGINS_GLOBAL:-http://localhost:8080,http://localhost:8181}
       # Embedding model + Doubao (Volcengine Ark) credentials. Setting
       # DOUBAO_API_KEY routes the embedding client to DOUBAO_BASE_URL
       # instead of OpenAI. The vector size is resolved from

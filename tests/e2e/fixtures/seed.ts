@@ -22,4 +22,4 @@ export const SEED = {
 
 export const API_BASE_DIRECT = 'http://localhost:8000';
 export const API_BASE_VIA_PROXY = 'http://localhost:5173';
-export const WIDGET_HOST_URL = 'http://localhost:8080/widget-host.html';
+export const WIDGET_HOST_URL = 'http://localhost:8181/widget-host.html';

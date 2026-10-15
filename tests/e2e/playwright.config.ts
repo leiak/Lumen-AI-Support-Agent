@@ -67,6 +67,9 @@ export default defineConfig({
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
+    // Windows runner: chromium sandbox fails to bind (0x5 Access Denied
+    // via crashpad), so disable it. CI/Linux already run without one.
+    launchOptions: { args: ['--no-sandbox'] },
     // The widget-host static origin needs to be allowed by the API's
     // CORS allowlist (see apps/api/src/core/config.py). We bake the
     // base URL into the static HTML.
@@ -85,36 +88,44 @@ export default defineConfig({
   // Launch all three dev servers in parallel BEFORE the suite. Each
   // ``command`` runs from ``cwd`` and Playwright captures stdout so
   // failures show up in the report.
+  //
+  // We override to reuseExistingServer:true for all three because the
+  // docker stack already provides them (api :8000, web :8080, host :5173).
+  // Spawning pnpm dev via cross-spawn under Git Bash currently fails
+  // (spawn C:\Windows\system32\cmd.exe ENOENT) — once that's fixed
+  // upstream, revert these back to reuseExistingServer:false.
   webServer: [
     {
       name: 'api',
-      command: 'uv run uvicorn main:app --port 8000 --host 127.0.0.1',
-      cwd: `${REPO}apps/api`,
       url: 'http://localhost:8000/health',
       timeout: 60_000,
-      reuseExistingServer: false,
-      stdout: 'pipe',
-      stderr: 'pipe',
+      reuseExistingServer: true,
     },
     {
       name: 'web',
-      command: 'pnpm dev --host 127.0.0.1',
-      cwd: `${REPO}apps/web`,
       url: 'http://localhost:5173',
       timeout: 60_000,
-      reuseExistingServer: false,
-      stdout: 'pipe',
-      stderr: 'pipe',
+      reuseExistingServer: true,
     },
     {
       name: 'host',
-      command: 'python -m http.server 8080 --bind 127.0.0.1',
-      cwd: `${REPO}tests/e2e/static`,
-      url: 'http://localhost:8080/widget-host.html',
+      // The widget host serves tests/e2e/static/ via a tiny Python
+      // http.server. It MUST run on a port that the docker stack
+      // doesn't already bind (the web nginx container occupies :8080
+      // and would otherwise serve its SPA index.html in place of our
+      // widget-host.html, with /lumen-widget.js 404'ing via SPA
+      // fallback). Port :8181 is unused across the compose network.
+      //
+      // The ``command`` is documented here but not executed by
+      // Playwright — ``reuseExistingServer: true`` (see above) means
+      // the operator (or a wrapper script) must start the python
+      // server before invoking the suite. Start it with:
+      //
+      //   cd tests/e2e/static && python -m http.server 8181
+      command: 'python -m http.server 8181 --directory tests/e2e/static',
+      url: 'http://localhost:8181/widget-host.html',
       timeout: 15_000,
-      reuseExistingServer: false,
-      stdout: 'pipe',
-      stderr: 'pipe',
+      reuseExistingServer: true,
     },
   ],
 
