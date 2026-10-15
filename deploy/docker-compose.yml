@@ -193,6 +193,67 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # arq workers — long-running background job consumers.
+  # The api process (uvicorn) only handles HTTP; async jobs (qa_judge,
+  # history_mining on-demand) live in arq.WorkerSettings and need their
+  # own process. Splitting them out keeps the web tier stateless and
+  # matches the production deploy shape (separate worker pods in k8s).
+  arq-qa:
+    image: aicustomer-api
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SERVICE_NAME: ai-customer-api
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@postgres:5432/aicustomer
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      DEFAULT_LLM_MODEL: ${DEFAULT_LLM_MODEL:-claude-3-5-sonnet-20241022}
+      # QA judge overrides: this env uses ANTHROPIC_API_KEY (pointing at
+      # the minimax-anthropic endpoint) so the judge provider must be
+      # 'anthropic'. Setting MINIMAX_API_KEY instead would register a
+      # direct minimax provider and 'minimax' would resolve.
+      QA_JUDGE_PROVIDER: ${QA_JUDGE_PROVIDER:-anthropic}
+      QA_JUDGE_MODEL: ${QA_JUDGE_MODEL:-claude-3-5-sonnet-20241022}
+      PYTHONPATH: /app/src
+    volumes:
+      - ../apps/api/src:/app/src:ro
+    command: ["arq", "src.qa.worker.WorkerSettings"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  arq-history-mining:
+    image: aicustomer-api
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      SERVICE_NAME: ai-customer-api
+      DATABASE_URL: postgresql+asyncpg://aicustomer:aicustomer@postgres:5432/aicustomer
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me-please}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+      DOUBAO_API_KEY: ${DOUBAO_API_KEY:-}
+      DOUBAO_BASE_URL: ${DOUBAO_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}
+      DOUBAO_EMBEDDING_MODEL: ${DOUBAO_EMBEDDING_MODEL:-doubao-embedding-large-text-240915}
+      PYTHONPATH: /app/src
+    volumes:
+      - ../apps/api/src:/app/src:ro
+    command: ["arq", "src.history_mining.worker.WorkerSettings"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   web:
     build:
       context: ../apps/web
