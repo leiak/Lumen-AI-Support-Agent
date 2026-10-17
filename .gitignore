@@ -37,3 +37,8 @@ apps/api/eval_output_real/
 
 # One-off debug screenshots from manual Playwright runs
 images/_debug_*.png
+
+# Playwright e2e widget-host.js — copied from apps/web-sdk/dist/ on
+# every global-setup run; tracking the old copy here just means
+# drift between the demo and the real SDK.
+tests/e2e/static/lumen-widget.js

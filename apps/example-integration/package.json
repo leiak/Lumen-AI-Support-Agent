@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "widget": "vite",
+    "widget:build-sdk": "pnpm --filter @lumen/web-sdk build && vite",
     "api-client:login": "tsx src/api-client/cli.ts login",
     "api-client:queue": "tsx src/api-client/cli.ts queue",
     "api-client:claim": "tsx src/api-client/cli.ts claim",

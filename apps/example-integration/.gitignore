@@ -3,3 +3,13 @@ dist/
 .api-token-cache.json
 .env
 .env.local
+
+# Widget demo SDK drop zone — repopulated by the
+# `widget-demo:sync-sdk` plugin in src/widget-demo/vite.config.ts
+# on every dev/build invocation. Tracking the copies here would
+# mean every SDK rebuild shows up as a git diff on the demo.
+src/widget-demo/public/
+
+# Vite's transient compiled config bundles (created when vite
+# bundles vite.config.ts before evaluating it). Safe to delete.
+src/widget-demo/vite.config.ts.timestamp-*.mjs
